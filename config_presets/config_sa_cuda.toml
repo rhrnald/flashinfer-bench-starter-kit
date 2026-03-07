@@ -1,0 +1,8 @@
+[solution]
+name = "sa"
+definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
+author = "kplc"
+
+[build]
+language = "cuda"
+entry_point = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64.cu::dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"

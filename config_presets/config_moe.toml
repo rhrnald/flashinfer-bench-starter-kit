@@ -1,0 +1,9 @@
+[solution]
+name = "moe"
+definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
+author = "kplc"
+
+[build]
+language = "python"
+entry_point = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.py::run"
+destination_passing_style = false

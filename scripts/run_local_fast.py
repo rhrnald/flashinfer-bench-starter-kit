@@ -1,7 +1,8 @@
 """
-FlashInfer-Bench Local Benchmark Runner.
+FlashInfer-Bench Local Fast Benchmark Runner.
 
-Automatically packs the solution from source files and runs benchmarks locally.
+Packs solution from source and runs a quick local benchmark with reduced
+iterations/workloads for rapid iteration.
 """
 
 import os
@@ -43,10 +44,10 @@ def get_trace_set_path() -> str:
     return path
 
 
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
-    """Run benchmark locally and return results."""
-    if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+def run_benchmark(solution: Solution) -> dict:
+    """Run benchmark locally in fast mode and return results."""
+    config = BenchmarkConfig(warmup_runs=1, iterations=10, num_trials=1)
+    max_workloads = 3
 
     trace_set_path = get_trace_set_path()
     trace_set = TraceSet.from_path(trace_set_path)
@@ -55,7 +56,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
         raise ValueError(f"Definition '{solution.definition}' not found in trace set")
 
     definition = trace_set.definitions[solution.definition]
-    workloads = trace_set.workloads.get(solution.definition, [])
+    workloads = trace_set.workloads.get(solution.definition, [])[:max_workloads]
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
@@ -115,7 +116,7 @@ def print_results(results: dict):
 
 
 def main():
-    """Pack solution and run benchmark."""
+    """Pack solution and run fast benchmark."""
     print("Packing solution from source files...")
     solution_path = pack_solution()
 
@@ -124,7 +125,7 @@ def main():
     print(f"Loaded: {solution.name} ({solution.definition})")
     ensure_tvm_ffi_cuda_arch(solution)
 
-    print("\nRunning benchmark...")
+    print("\nRunning benchmark (fast mode: warmup=1, iter=10, trials=1, workloads=3)...")
     results = run_benchmark(solution)
 
     if not results:

@@ -1,0 +1,8 @@
+[solution]
+name = "gdn_decode"
+definition = "gdn_decode_qk4_v8_d128_k_last"
+author = "kplc"
+
+[build]
+language = "cuda"
+entry_point = "gdn_decode_qk4_v8_d128_k_last.cu::gdn_decode_qk4_v8_d128_k_last"
