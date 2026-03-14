@@ -4,6 +4,63 @@
  *
  * Goal: provide a compilable/runnable TVM-FFI entry point.
  * TODO: replace with real kernel.
+ *
+ * Pseudocode:
+ *
+ * // Axes / constants
+ * // num_tokens     : variable
+ * // num_qo_heads   : 16
+ * // head_dim_ckv   : 512
+ * // head_dim_kpe   : 64
+ * // page_size      : 64
+ * // topk           : 2048
+ * // num_pages      : variable
+ *
+ * // Shapes
+ * // q_nope         : [num_tokens, num_qo_heads, head_dim_ckv]   , dtype = bfloat16
+ * // q_pe           : [num_tokens, num_qo_heads, head_dim_kpe]   , dtype = bfloat16
+ * // ckv_cache      : [num_pages, page_size, head_dim_ckv]       , dtype = bfloat16
+ * // kpe_cache      : [num_pages, page_size, head_dim_kpe]       , dtype = bfloat16
+ * // sparse_indices : [num_tokens, topk]                         , dtype = int32
+ * // sm_scale       : scalar                                     , dtype = float32
+ * // output         : [num_tokens, num_qo_heads, head_dim_ckv]   , dtype = bfloat16
+ * // lse            : [num_tokens, num_qo_heads]                 , dtype = float32
+ *
+ * Kc_all = reshape(ckv_cache, [num_pages * page_size, head_dim_ckv]);
+ * Kp_all = reshape(kpe_cache, [num_pages * page_size, head_dim_kpe]);
+ *
+ * for (int t = 0; t < num_tokens; ++t) {
+ *   int indices[topk] = sparse_indices[t];
+ *   valid_indices = filter(indices != -1);
+ *
+ *   if (valid_indices.size() == 0) {
+ *     output[t, :, :] = 0;
+ *     lse[t, :] = -inf;
+ *     continue;
+ *   }
+ *
+ *   Kc = Kc_all[valid_indices, :];
+ *   Kp = Kp_all[valid_indices, :];
+ *   qn = q_nope[t, :, :];
+ *   qp = q_pe[t, :, :];
+ *
+ *   for (int h = 0; h < num_qo_heads; ++h) {
+ *     for (int j = 0; j < num_valid; ++j) {
+ *       logits[h, j] = dot(qn[h, :], Kc[j, :]) + dot(qp[h, :], Kp[j, :]);
+ *       logits_scaled[h, j] = sm_scale * logits[h, j];
+ *     }
+ *
+ *     lse[t, h] = logsumexp(logits_scaled[h, :]) / log(2.0);
+ *     attn[h, :] = softmax(logits_scaled[h, :]);
+ *
+ *     output_fp32[h, :] = 0;
+ *     for (int j = 0; j < num_valid; ++j) {
+ *       output_fp32[h, :] += attn[h, j] * Kc[j, :];
+ *     }
+ *
+ *     output[t, h, :] = cast_bfloat16(output_fp32[h, :]);
+ *   }
+ * }
  */
 
 #include <cuda_bf16.h>

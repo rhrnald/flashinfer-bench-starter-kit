@@ -1,8 +1,0 @@
-[solution]
-name = "gdn_prefill"
-definition = "gdn_prefill_qk4_v8_d128_k_last"
-author = "kplc"
-
-[build]
-language = "cuda"
-entry_point = "gdn_prefill_qk4_v8_d128_k_last.cu::gdn_prefill_qk4_v8_d128_k_last"

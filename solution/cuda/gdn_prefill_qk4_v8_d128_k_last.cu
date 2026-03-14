@@ -3,6 +3,49 @@
  *   gdn_prefill_qk4_v8_d128_k_last
  *
  * Correctness-first naive recurrence kernel for k-last state layout.
+ *
+ * Pseudocode:
+ *
+ * // Shapes
+ * // Q         : [total_seq_len, QH, H]   , dtype = bfloat16
+ * // K         : [total_seq_len, KH, H]   , dtype = bfloat16
+ * // V         : [total_seq_len, VH, H]   , dtype = bfloat16
+ * // state     : [num_seqs, VH, H, H]     , dtype = float32
+ * // A_log     : [VH]                     , dtype = float32
+ * // a         : [total_seq_len, VH]      , dtype = bfloat16
+ * // dt_bias   : [VH]                     , dtype = float32
+ * // b         : [total_seq_len, VH]      , dtype = bfloat16
+ * // cu_seqlens: [num_seqs + 1]           , dtype = int32/int64
+ * // output    : [total_seq_len, VH, H]   , dtype = bfloat16
+ * // new_state : [num_seqs, VH, H, H]     , dtype = float32
+ *
+ * for (int seq = 0; seq < num_seqs; ++seq) {
+ *   int start = cu_seqlens[seq];
+ *   int end = cu_seqlens[seq + 1];
+ *
+ *   for (int vh = 0; vh < VH; ++vh) {
+ *     int kh = vh / (VH / KH);
+ *     int qh = vh / (VH / QH);
+ *     S[vh, :, :] = state[seq, vh, :, :];
+ *
+ *     for (int tok = start; tok < end; ++tok) {
+ *       float x = float(a[tok, vh]) + dt_bias[vh];
+ *       float g = exp(-exp(A_log[vh]) * softplus(x));
+ *       float beta = sigmoid(float(b[tok, vh]));
+ *
+ *       for (int i = 0; i < H; ++i) {
+ *         S[vh, i, :] = g * S[vh, i, :];
+ *         float old_v = dot(S[vh, i, :], K[tok, kh, :]);
+ *         S[vh, i, :] =
+ *             S[vh, i, :] +
+ *             K[tok, kh, :] * (beta * (V[tok, vh, i] - old_v));
+ *         output[tok, vh, i] = scale * dot(S[vh, i, :], Q[tok, qh, :]);
+ *       }
+ *     }
+ *
+ *     new_state[seq, vh, :, :] = S[vh, :, :];
+ *   }
+ * }
  */
 
 #include <cuda_bf16.h>
@@ -28,7 +71,7 @@ __global__ void gdn_prefill_naive_kernel(
   constexpr int QH = 4;
   constexpr int KH = 4;
   constexpr int VH = 8;
-  constexpr int D = 128;
+  constexpr int H = 128;
 
   int seq_head = blockIdx.x;
   int seq_idx = seq_head / VH;
@@ -42,22 +85,22 @@ __global__ void gdn_prefill_naive_kernel(
   int64_t seq_end = cu_seqlens[seq_idx + 1];
   if (seq_end <= seq_start) return;
 
-  __shared__ float q_sh[D];
-  __shared__ float k_sh[D];
+  __shared__ float q_sh[H];
+  __shared__ float k_sh[H];
 
   // Initialize new_state from provided state (or zeros).
-  for (int vi = threadIdx.x; vi < D; vi += blockDim.x) {
-    for (int ki = 0; ki < D; ++ki) {
-      int64_t idx = ((static_cast<int64_t>(seq_idx) * VH + vh) * D + vi) * D + ki;
+  for (int h_idx = threadIdx.x; h_idx < H; h_idx += blockDim.x) {
+    for (int ki = 0; ki < H; ++ki) {
+      int64_t idx = ((static_cast<int64_t>(seq_idx) * VH + vh) * H + h_idx) * H + ki;
       new_state[idx] = has_state ? state[idx] : 0.f;
     }
   }
   __syncthreads();
 
   for (int64_t t = seq_start; t < seq_end; ++t) {
-    if (threadIdx.x < D) {
-      q_sh[threadIdx.x] = __bfloat162float(q[(t * QH + qh) * D + threadIdx.x]);
-      k_sh[threadIdx.x] = __bfloat162float(k[(t * KH + kh) * D + threadIdx.x]);
+    if (threadIdx.x < H) {
+      q_sh[threadIdx.x] = __bfloat162float(q[(t * QH + qh) * H + threadIdx.x]);
+      k_sh[threadIdx.x] = __bfloat162float(k[(t * KH + kh) * H + threadIdx.x]);
     }
     __syncthreads();
 
@@ -65,30 +108,30 @@ __global__ void gdn_prefill_naive_kernel(
     float g = expf(-expf(A_log[vh]) * softplusf(x));
     float beta = sigmoidf(__bfloat162float(b[t * VH + vh]));
 
-    for (int vi = threadIdx.x; vi < D; vi += blockDim.x) {
+    for (int h_idx = threadIdx.x; h_idx < H; h_idx += blockDim.x) {
       // old_v = k @ (g * state)
       double old_v = 0.0;
-      for (int ki = 0; ki < D; ++ki) {
-        int64_t s_idx = ((static_cast<int64_t>(seq_idx) * VH + vh) * D + vi) * D + ki;
+      for (int ki = 0; ki < H; ++ki) {
+        int64_t s_idx = ((static_cast<int64_t>(seq_idx) * VH + vh) * H + h_idx) * H + ki;
         old_v += static_cast<double>(k_sh[ki]) * static_cast<double>(g * new_state[s_idx]);
       }
 
-      float vv = __bfloat162float(v[(t * VH + vh) * D + vi]);
+      float vv = __bfloat162float(v[(t * VH + vh) * H + h_idx]);
       float delta = beta * (vv - static_cast<float>(old_v));
 
       // state <- g * state + k^T * delta
-      for (int ki = 0; ki < D; ++ki) {
-        int64_t s_idx = ((static_cast<int64_t>(seq_idx) * VH + vh) * D + vi) * D + ki;
+      for (int ki = 0; ki < H; ++ki) {
+        int64_t s_idx = ((static_cast<int64_t>(seq_idx) * VH + vh) * H + h_idx) * H + ki;
         new_state[s_idx] = g * new_state[s_idx] + k_sh[ki] * delta;
       }
 
       // output = scale * (q @ state)
       double acc = 0.0;
-      for (int ki = 0; ki < D; ++ki) {
-        int64_t s_idx = ((static_cast<int64_t>(seq_idx) * VH + vh) * D + vi) * D + ki;
+      for (int ki = 0; ki < H; ++ki) {
+        int64_t s_idx = ((static_cast<int64_t>(seq_idx) * VH + vh) * H + h_idx) * H + ki;
         acc += static_cast<double>(q_sh[ki]) * static_cast<double>(new_state[s_idx]);
       }
-      output[(t * VH + vh) * D + vi] = __float2bfloat16(scale * static_cast<float>(acc));
+      output[(t * VH + vh) * H + h_idx] = __float2bfloat16(scale * static_cast<float>(acc));
     }
     __syncthreads();
   }
