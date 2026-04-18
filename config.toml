@@ -1,8 +1,8 @@
 [solution]
-name = "gdn_decode"
-definition = "gdn_decode_qk4_v8_d128_k_last"
+name = "moe_fp8_cpu_ref_cuda"
+definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
 author = "kplc"
 
 [build]
 language = "cuda"
-entry_point = "gdn_decode_qk4_v8_d128_k_last.cu::gdn_decode_qk4_v8_d128_k_last"
+entry_point = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.cu::moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
