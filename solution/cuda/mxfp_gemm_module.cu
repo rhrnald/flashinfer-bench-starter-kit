@@ -48,6 +48,15 @@ __device__ __forceinline__ float bf16_to_float_device(uint16_t bits) {
   return __uint_as_float(u32);
 }
 
+__device__ __forceinline__ float f16_to_float_device(uint16_t bits) {
+  union {
+    uint16_t u;
+    __half h;
+  } v;
+  v.u = bits;
+  return __half2float(v.h);
+}
+
 __device__ __forceinline__ uint8_t float_to_e4m3_device(float x) {
 #if FIB_HAS_FLASHINFER_FP8_GROUP_GEMM_SM100
   __nv_fp8_e4m3 y(x);
@@ -455,6 +464,42 @@ __global__ void swiglu_quantize_bf16_to_fp8_kernel(const uint16_t* __restrict__ 
   }
 }
 
+__global__ void swiglu_quantize_f16_to_fp8_kernel(const uint16_t* __restrict__ g1_f16,
+                                                  int intermediate, int n_rows, int padded_rows,
+                                                  uint8_t* __restrict__ c_fp8,
+                                                  float* __restrict__ c_scale) {
+  int row = blockIdx.x;
+  int ib = blockIdx.y;
+  int tid = threadIdx.x;
+  if (row >= padded_rows) return;
+
+  extern __shared__ float smem[];
+  float v = 0.0f;
+  int i = ib * 128 + tid;
+  if (tid < 128 && i < intermediate && row < n_rows) {
+    const uint16_t* g1_row = g1_f16 + static_cast<int64_t>(row) * (2 * intermediate);
+    float x1 = f16_to_float_device(g1_row[i]);
+    float x2 = f16_to_float_device(g1_row[i + intermediate]);
+    v = x1 * siluf_device(x2);
+  }
+  smem[tid] = fabsf(v);
+  __syncthreads();
+
+  for (int offset = 64; offset > 0; offset >>= 1) {
+    if (tid < offset) smem[tid] = fmaxf(smem[tid], smem[tid + offset]);
+    __syncthreads();
+  }
+
+  float scale = fmaxf(smem[0] / 448.0f, 1.0e-8f);
+  if (tid == 0) {
+    c_scale[static_cast<int64_t>(ib) * padded_rows + row] = scale;
+  }
+  if (tid < 128 && i < intermediate) {
+    c_fp8[static_cast<int64_t>(row) * intermediate + i] =
+        (row < n_rows) ? float_to_e4m3_device(v / scale) : 0;
+  }
+}
+
 __global__ void scatter_bf16_weighted_kernel(const uint16_t* __restrict__ d_bf16, int hidden,
                                              int n_rows, const int* __restrict__ permuted_tok,
                                              const float* __restrict__ permuted_w,
@@ -475,6 +520,13 @@ __global__ void bf16_matrix_to_float_kernel(const uint16_t* __restrict__ in, int
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= n) return;
   out[idx] = bf16_to_float_device(in[idx]);
+}
+
+__global__ void f16_matrix_to_float_kernel(const uint16_t* __restrict__ in, int64_t n,
+                                          float* __restrict__ out) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= n) return;
+  out[idx] = f16_to_float_device(in[idx]);
 }
 
 }  // namespace
@@ -739,8 +791,6 @@ void DeviceMxfpGemmModule::RunExpert(const float* a_dev, int64_t t, const float*
   const float* s13_e = gemm1_s_dev + static_cast<size_t>(local_expert_idx) * w13s_elems;
   const uint8_t* w2_e = gemm2_w_dev + static_cast<size_t>(local_expert_idx) * w2_elems;
   const float* s2_e = gemm2_s_dev + static_cast<size_t>(local_expert_idx) * w2s_elems;
-  const bool transpose_b = std::getenv("FIB_MOE_TC_NO_TRANSPOSE_B") == nullptr;
-
   constexpr int kThreads = 128;
   int64_t n_g1 = t * gemm1_out_;
   int64_t n_c = t * intermediate_;
@@ -830,9 +880,12 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
   const float* s13_e = gemm1_s_dev + static_cast<size_t>(local_expert_idx) * w13s_elems;
   const uint8_t* w2_e = gemm2_w_dev + static_cast<size_t>(local_expert_idx) * w2_elems;
   const float* s2_e = gemm2_s_dev + static_cast<size_t>(local_expert_idx) * w2s_elems;
-  const bool transpose_b = std::getenv("FIB_MOE_TC_NO_TRANSPOSE_B") == nullptr;
+  // The B200 contract probe matches unchanged [N,K] physical storage for this
+  // FlashInfer groupwise GEMM path.
+  const bool transpose_b = std::getenv("FIB_MOE_TC_TRANSPOSE_B") != nullptr;
 
   using FP8 = cutlass::float_e4m3_t;
+  using F16 = cutlass::half_t;
   using BF16 = cutlass::bfloat16_t;
 
   constexpr int kThreads = 256;
@@ -853,6 +906,8 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
   }
   FP8* w13_tc = transpose_b ? reinterpret_cast<FP8*>(tc_b_col_dev_)
                             : const_cast<FP8*>(reinterpret_cast<const FP8*>(w13_e));
+  // Use the MN-major scale contract validated by scripts/probe_gemm1_contract.py:
+  // A scale [Kblk,M], B scale [Kblk,Nblk], raw [N,K] B storage.
   int w13_scale_elems = gemm1_out_blocks_ * hidden_blocks_;
   transpose_scale_nblock_kblock_to_kblock_nblock_kernel<<<
       (w13_scale_elems + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
@@ -864,7 +919,7 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
         tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
         32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
         w13_tc, tc_a_scale_dev_,
-        tc_b_scale_dev_, reinterpret_cast<BF16*>(tc_g1_bf16_dev_), tc_m_indptr_dev_,
+        tc_b_scale_dev_, reinterpret_cast<F16*>(tc_g1_bf16_dev_), tc_m_indptr_dev_,
         padded_rows, gemm1_out_, hidden_, 1, stream);
   };
   auto run_gemm1_2sm = [&]() {
@@ -873,7 +928,7 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
         tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
         32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
         w13_tc, tc_a_scale_dev_,
-        tc_b_scale_dev_, reinterpret_cast<BF16*>(tc_g1_bf16_dev_), tc_m_indptr_dev_,
+        tc_b_scale_dev_, reinterpret_cast<F16*>(tc_g1_bf16_dev_), tc_m_indptr_dev_,
         padded_rows, gemm1_out_, hidden_, 1, stream);
   };
   cudaError_t st1 = (padded_rows >= 256) ? run_gemm1_2sm() : run_gemm1_1sm();
@@ -882,8 +937,8 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
   if (std::getenv("FIB_MOE_TC_GEMM1_ONLY") != nullptr) {
     EnsureWorkspace(n_rows, stream);
     int64_t g1_elems = static_cast<int64_t>(n_rows) * gemm1_out_;
-    bf16_matrix_to_float_kernel<<<static_cast<int>((g1_elems + kThreads - 1) / kThreads),
-                                  kThreads, 0, stream>>>(
+    f16_matrix_to_float_kernel<<<static_cast<int>((g1_elems + kThreads - 1) / kThreads),
+                                 kThreads, 0, stream>>>(
         tc_g1_bf16_dev_, g1_elems, g1_dev_);
     int64_t c_elems = static_cast<int64_t>(n_rows) * intermediate_;
     int64_t out_elems = static_cast<int64_t>(n_rows) * hidden_;
@@ -899,7 +954,7 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
   }
 
   dim3 qgrid(padded_rows, intermediate_blocks_);
-  swiglu_quantize_bf16_to_fp8_kernel<<<qgrid, 128, 128 * sizeof(float), stream>>>(
+  swiglu_quantize_f16_to_fp8_kernel<<<qgrid, 128, 128 * sizeof(float), stream>>>(
       tc_g1_bf16_dev_, intermediate_, n_rows, padded_rows, tc_c_fp8_dev_, tc_c_scale_dev_);
   int64_t w2_transpose_elems = static_cast<int64_t>(hidden_) * intermediate_;
   if (transpose_b) {
