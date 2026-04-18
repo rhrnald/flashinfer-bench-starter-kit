@@ -351,6 +351,8 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   // it's already the default).
   const bool kLegacy = std::getenv("FIB_MOE_LEGACY") != nullptr;
   const bool kGrouped = !kLegacy;
+  static mxfp::DeviceMxfpGemmModule gemm_mod(kHidden, kIntermediate, kBlock);
+  const bool kTc = kGrouped && gemm_mod.SupportsTcPath();
 
   const auto t0_total =
       kProfile ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
@@ -399,13 +401,15 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
     t1_routing = std::chrono::high_resolution_clock::now();
   }
 
-  if (kProfile) t0_dequant = std::chrono::high_resolution_clock::now();
-  constexpr int kDequantThreads = 256;
   int64_t n_hidden = t * kHidden;
-  int dequant_blocks = static_cast<int>((n_hidden + kDequantThreads - 1) / kDequantThreads);
-  dequant_hidden_kernel<<<dequant_blocks, kDequantThreads, 0, stream>>>(
-      static_cast<const uint8_t*>(hidden_states.data_ptr()),
-      static_cast<const float*>(hidden_states_scale.data_ptr()), t, a_dev);
+  if (kProfile) t0_dequant = std::chrono::high_resolution_clock::now();
+  if (!kTc) {
+    constexpr int kDequantThreads = 256;
+    int dequant_blocks = static_cast<int>((n_hidden + kDequantThreads - 1) / kDequantThreads);
+    dequant_hidden_kernel<<<dequant_blocks, kDequantThreads, 0, stream>>>(
+        static_cast<const uint8_t*>(hidden_states.data_ptr()),
+        static_cast<const float*>(hidden_states_scale.data_ptr()), t, a_dev);
+  }
   if (kProfile) {
     cudaStreamSynchronize(stream);
     t1_dequant = std::chrono::high_resolution_clock::now();
@@ -413,8 +417,9 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
 
   if (kProfile) t0_expert = std::chrono::high_resolution_clock::now();
 
-  static mxfp::DeviceMxfpGemmModule gemm_mod(kHidden, kIntermediate, kBlock);
-  gemm_mod.EnsureWorkspace(t, stream);
+  if (!kTc) {
+    gemm_mod.EnsureWorkspace(t, stream);
+  }
 
   std::vector<uint8_t> expert_used_host(kNumLocalExperts, 0);
   std::vector<int> expert_counts_host(kNumLocalExperts, 0);
@@ -441,12 +446,23 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
       int n_rows = expert_counts_host[le];
       if (n_rows == 0) continue;
       int start = expert_offsets_host[le];
-      gemm_mod.RunExpertPermuted(
-          a_dev, t, n_rows, permuted_token_ids_dev + start, permuted_weights_dev + start, le,
-          static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
-          static_cast<const float*>(gemm1_weights_scale.data_ptr()),
-          static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
-          static_cast<const float*>(gemm2_weights_scale.data_ptr()), out_acc_dev, stream);
+      if (kTc) {
+        gemm_mod.RunExpertPermutedTc(
+            static_cast<const uint8_t*>(hidden_states.data_ptr()),
+            static_cast<const float*>(hidden_states_scale.data_ptr()), t, n_rows,
+            permuted_token_ids_dev + start, permuted_weights_dev + start, le,
+            static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
+            static_cast<const float*>(gemm1_weights_scale.data_ptr()),
+            static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
+            static_cast<const float*>(gemm2_weights_scale.data_ptr()), out_acc_dev, stream);
+      } else {
+        gemm_mod.RunExpertPermuted(
+            a_dev, t, n_rows, permuted_token_ids_dev + start, permuted_weights_dev + start, le,
+            static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
+            static_cast<const float*>(gemm1_weights_scale.data_ptr()),
+            static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
+            static_cast<const float*>(gemm2_weights_scale.data_ptr()), out_acc_dev, stream);
+      }
     }
   } else {
     // Legacy dense-mask path.

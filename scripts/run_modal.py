@@ -62,8 +62,76 @@ def _ensure_cuda_arch() -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
         return
     major, minor = torch.cuda.get_device_capability(0)
-    os.environ["TVM_FFI_CUDA_ARCH_LIST"] = f"{major}.{minor}"
-    print(f"[run_modal] TVM_FFI_CUDA_ARCH_LIST={major}.{minor}")
+    # Blackwell TCGEN05/CUTLASS SM100 kernels require the family-specific
+    # "a" target (compute_100a/sm_100a), not plain sm_100.
+    suffix = "a" if major >= 10 else ""
+    os.environ["TVM_FFI_CUDA_ARCH_LIST"] = f"{major}.{minor}{suffix}"
+    print(f"[run_modal] TVM_FFI_CUDA_ARCH_LIST={major}.{minor}{suffix}")
+
+
+def _ensure_flashinfer_include_paths() -> None:
+    """Expose FlashInfer's vendored headers to TVM-FFI/nvcc.
+
+    The contest CUDA builder does not process Solution.spec.dependencies for
+    tvm-ffi builds. For experiments that directly include FlashInfer's CUTLASS
+    SM100 groupwise GEMM headers, CPATH is the least invasive way to make the
+    vendored `flashinfer/` and `cutlass/` headers visible.
+    """
+    import os
+    from pathlib import Path
+
+    try:
+        import flashinfer
+    except Exception as exc:
+        print(f"[run_modal] flashinfer import failed; CUTLASS headers unavailable: {exc}")
+        return
+
+    base = Path(flashinfer.__file__).resolve().parent / "data"
+    paths = [
+        base / "include",
+        base / "cutlass" / "include",
+        base / "cutlass" / "tools" / "util" / "include",
+    ]
+    existing = [p for p in paths if p.exists()]
+    if not existing:
+        return
+
+    for var in ("CPATH", "CPLUS_INCLUDE_PATH"):
+        prior = os.environ.get(var, "")
+        pieces = [str(p) for p in existing]
+        if prior:
+            pieces.append(prior)
+        os.environ[var] = ":".join(pieces)
+    print("[run_modal] FlashInfer include paths:", ", ".join(str(p) for p in existing))
+
+    import tvm_ffi.cpp
+
+    if getattr(tvm_ffi.cpp.build, "_fib_flashinfer_patched", False):
+        return
+
+    original_build = tvm_ffi.cpp.build
+
+    def build_with_flashinfer_headers(*args, **kwargs):
+        inc = list(kwargs.get("extra_include_paths") or [])
+        for p in existing:
+            sp = str(p)
+            if sp not in inc:
+                inc.append(sp)
+        kwargs["extra_include_paths"] = inc
+
+        cuda_flags = list(kwargs.get("extra_cuda_cflags") or [])
+        for flag in (
+            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+            "-DFLASHINFER_ENABLE_FP8_E8M0",
+            "-DFLASHINFER_ENABLE_FP4_E2M1",
+        ):
+            if flag not in cuda_flags:
+                cuda_flags.append(flag)
+        kwargs["extra_cuda_cflags"] = cuda_flags
+        return original_build(*args, **kwargs)
+
+    build_with_flashinfer_headers._fib_flashinfer_patched = True
+    tvm_ffi.cpp.build = build_with_flashinfer_headers
 
 
 def _extract_results(definition_name, result_trace_set) -> dict:
@@ -119,6 +187,7 @@ def _run_impl(solution: Solution, config: BenchmarkConfig, max_workloads: int,
     from flashinfer_bench.compile import BuildError, BuilderRegistry
 
     _ensure_cuda_arch()
+    _ensure_flashinfer_include_paths()
     saved_env = _apply_env(env_vars or {})
 
     try:
@@ -174,6 +243,7 @@ def _run_sweep_impl(solution: Solution, config: BenchmarkConfig, max_workloads: 
     from flashinfer_bench.compile import BuildError, BuilderRegistry
 
     _ensure_cuda_arch()
+    _ensure_flashinfer_include_paths()
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
     if solution.definition not in trace_set.definitions:

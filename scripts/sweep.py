@@ -33,8 +33,12 @@ DEFAULT_VARIANTS = [
     # Default (grouped) is the shipped path as of 2026-04-18. Legacy opt-out is
     # retained so we can still A/B the dense-mask path against grouped.
     {"name": "default", "env": {}},
+    {"name": "tc", "env": {"FIB_MOE_TC": "1"}},
+    {"name": "tc_gemm1_only", "env": {"FIB_MOE_TC": "1", "FIB_MOE_TC_GEMM1_ONLY": "1"}},
+    {"name": "tc_no_transpose_b", "env": {"FIB_MOE_TC": "1", "FIB_MOE_TC_NO_TRANSPOSE_B": "1"}},
     {"name": "legacy", "env": {"FIB_MOE_LEGACY": "1"}},
     {"name": "default_profile", "env": {"FIB_MOE_PROFILE": "1"}},
+    {"name": "tc_profile", "env": {"FIB_MOE_TC": "1", "FIB_MOE_PROFILE": "1"}},
     {"name": "legacy_profile", "env": {"FIB_MOE_LEGACY": "1", "FIB_MOE_PROFILE": "1"}},
 ]
 
