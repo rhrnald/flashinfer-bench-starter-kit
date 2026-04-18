@@ -69,6 +69,19 @@ class DeviceMxfpGemmModule {
                  const uint8_t* gemm1_w_dev, const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
                  const float* gemm2_s_dev, float* out_acc_dev, cudaStream_t stream) const;
 
+  // Compact / grouped path: runs the MoE expert over only the tokens that
+  // were routed to it. Inputs `permuted_tok_e` and `permuted_w_e` are pointers
+  // into the routing-metadata buffers, already offset to this expert's slice.
+  // `n_rows` = number of tokens in that slice (= expert_counts[local_expert_idx]).
+  // This is the swap point that a future CUTLASS SM100 blockwise FP8 grouped
+  // GEMM would replace; the signature is already grouped-GEMM shaped.
+  void RunExpertPermuted(const float* a_dev, int64_t t, int n_rows,
+                         const int* permuted_tok_e, const float* permuted_w_e,
+                         int local_expert_idx, const uint8_t* gemm1_w_dev,
+                         const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
+                         const float* gemm2_s_dev, float* out_acc_dev,
+                         cudaStream_t stream) const;
+
  private:
   int hidden_;
   int intermediate_;

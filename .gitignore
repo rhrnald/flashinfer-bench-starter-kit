@@ -1,6 +1,9 @@
 # FlashInfer Competition
 solution.json
 
+# Claude Code runtime state
+.claude/
+
 # CUDA build artifacts
 *.o
 *.obj

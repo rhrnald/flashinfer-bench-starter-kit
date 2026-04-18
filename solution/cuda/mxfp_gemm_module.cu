@@ -143,6 +143,138 @@ __global__ void swiglu_kernel(const float* __restrict__ g1, int64_t t, int inter
   c[idx] = y;
 }
 
+// Permuted-path GEMM1. `a` is the original [T, H] activation tensor; we gather
+// rows via `permuted_tok[pr]` rather than expanding into a compact buffer, to
+// save a DRAM pass. Output is compact: `g1_perm[n_rows, gemm1_out]`.
+__global__ void gemm1_permuted_kernel(const float* __restrict__ a, int hidden, int gemm1_out,
+                                      int block, int hidden_blocks, int n_rows,
+                                      const int* __restrict__ permuted_tok,
+                                      const uint8_t* __restrict__ w13,
+                                      const float* __restrict__ s13, bool emulate_fp8_unit,
+                                      bool emulate_fp16_operands, bool emulate_acc_half,
+                                      float* __restrict__ g1_perm) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = static_cast<int64_t>(n_rows) * gemm1_out;
+  if (idx >= total) return;
+
+  int pr = static_cast<int>(idx / gemm1_out);
+  int j = static_cast<int>(idx - static_cast<int64_t>(pr) * gemm1_out);
+  int tok = permuted_tok[pr];
+
+  int jb = j / block;
+  const float* a_row = a + static_cast<int64_t>(tok) * hidden;
+  const uint8_t* w_row = w13 + static_cast<int64_t>(j) * hidden;
+  float acc = 0.0f;
+  __half acc_h = __float2half(0.0f);
+  for (int hb = 0; hb < hidden_blocks; ++hb) {
+    float scale = s13[jb * hidden_blocks + hb];
+    float block_raw = 0.0f;
+    int h0 = hb * block;
+    for (int u = 0; u < block; ++u) {
+      int h = h0 + u;
+      float wv_raw = fp8_e4m3fn_to_float_device(w_row[h]);
+      float av = a_row[h];
+      if (emulate_fp8_unit) {
+        av = quantize_e4m3fn_like(av);
+        wv_raw = quantize_e4m3fn_like(wv_raw);
+      }
+      float prod_raw;
+      if (emulate_fp16_operands) {
+        __half av_h = __float2half(av);
+        __half wv_h = __float2half(wv_raw);
+        prod_raw = __half2float(__hmul(av_h, wv_h));
+      } else {
+        prod_raw = av * wv_raw;
+      }
+      block_raw += prod_raw;
+    }
+    float block_val = block_raw * scale;
+    if (emulate_acc_half) {
+      acc_h = __hadd(acc_h, __float2half(block_val));
+    } else {
+      acc += block_val;
+    }
+  }
+  g1_perm[idx] = emulate_acc_half ? __half2float(acc_h) : acc;
+}
+
+// Permuted swiglu: input/output are both compact n_rows-indexed, no masking.
+__global__ void swiglu_permuted_kernel(const float* __restrict__ g1_perm, int intermediate,
+                                       int n_rows, bool emulate_fp8_unit,
+                                       float* __restrict__ c_perm) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = static_cast<int64_t>(n_rows) * intermediate;
+  if (idx >= total) return;
+  int pr = static_cast<int>(idx / intermediate);
+  int i = static_cast<int>(idx - static_cast<int64_t>(pr) * intermediate);
+  const float* g1_row = g1_perm + static_cast<int64_t>(pr) * (2 * intermediate);
+  float x1 = g1_row[i];
+  float x2 = g1_row[i + intermediate];
+  (void)emulate_fp8_unit;  // Activation path stays FP32 in TC-like emulation.
+  c_perm[idx] = x1 * siluf_device(x2);
+}
+
+// Permuted GEMM2 + scatter-accumulate into the global [T, H] out_acc tensor.
+// Within a single launch each (pr, h) touches a unique out_acc cell because a
+// token routes to any given expert at most once; across expert launches the
+// stream orders contributions, so no atomicAdd is needed.
+__global__ void gemm2_scatter_accumulate_kernel(const float* __restrict__ c_perm, int hidden,
+                                                int intermediate, int block,
+                                                int intermediate_blocks, int n_rows,
+                                                const int* __restrict__ permuted_tok,
+                                                const float* __restrict__ permuted_w,
+                                                const uint8_t* __restrict__ w2,
+                                                const float* __restrict__ s2,
+                                                bool emulate_fp8_unit,
+                                                bool emulate_fp16_operands, bool emulate_acc_half,
+                                                float* __restrict__ out_acc) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = static_cast<int64_t>(n_rows) * hidden;
+  if (idx >= total) return;
+
+  int pr = static_cast<int>(idx / hidden);
+  int h = static_cast<int>(idx - static_cast<int64_t>(pr) * hidden);
+  int tok = permuted_tok[pr];
+  float w_tok = permuted_w[pr];
+
+  int hb = h / block;
+  const float* c_row = c_perm + static_cast<int64_t>(pr) * intermediate;
+  const uint8_t* w_row = w2 + static_cast<int64_t>(h) * intermediate;
+  float acc = 0.0f;
+  __half acc_h = __float2half(0.0f);
+  for (int ib = 0; ib < intermediate_blocks; ++ib) {
+    float scale = s2[hb * intermediate_blocks + ib];
+    float block_raw = 0.0f;
+    int i0 = ib * block;
+    for (int u = 0; u < block; ++u) {
+      int i = i0 + u;
+      float wv_raw = fp8_e4m3fn_to_float_device(w_row[i]);
+      float cv = c_row[i];
+      if (emulate_fp8_unit) {
+        cv = quantize_e4m3fn_like(cv);
+        wv_raw = quantize_e4m3fn_like(wv_raw);
+      }
+      float prod_raw;
+      if (emulate_fp16_operands) {
+        __half cv_h = __float2half(cv);
+        __half wv_h = __float2half(wv_raw);
+        prod_raw = __half2float(__hmul(cv_h, wv_h));
+      } else {
+        prod_raw = cv * wv_raw;
+      }
+      block_raw += prod_raw;
+    }
+    float block_val = block_raw * scale;
+    if (emulate_acc_half) {
+      acc_h = __hadd(acc_h, __float2half(block_val));
+    } else {
+      acc += block_val;
+    }
+  }
+  acc = emulate_acc_half ? __half2float(acc_h) : acc;
+  out_acc[static_cast<int64_t>(tok) * hidden + h] += w_tok * acc;
+}
+
 __global__ void gemm2_acc_kernel(const float* __restrict__ c, int64_t t, int hidden, int intermediate,
                                  int block, int intermediate_blocks, int local_expert_idx,
                                  const float* __restrict__ local_weight, const uint8_t* __restrict__ w2,
@@ -405,6 +537,44 @@ void DeviceMxfpGemmModule::RunExpert(const float* a_dev, int64_t t, const float*
                                                 emulate_fp16_operands_,
                                                 emulate_acc_half_,
                                                 out_acc_dev);
+}
+
+void DeviceMxfpGemmModule::RunExpertPermuted(const float* a_dev, int64_t /*t*/, int n_rows,
+                                             const int* permuted_tok_e,
+                                             const float* permuted_w_e, int local_expert_idx,
+                                             const uint8_t* gemm1_w_dev, const float* gemm1_s_dev,
+                                             const uint8_t* gemm2_w_dev, const float* gemm2_s_dev,
+                                             float* out_acc_dev, cudaStream_t stream) const {
+  if (n_rows <= 0) return;
+
+  size_t w13_elems = static_cast<size_t>(gemm1_out_) * static_cast<size_t>(hidden_);
+  size_t w13s_elems = static_cast<size_t>(gemm1_out_blocks_) * static_cast<size_t>(hidden_blocks_);
+  size_t w2_elems = static_cast<size_t>(hidden_) * static_cast<size_t>(intermediate_);
+  size_t w2s_elems = static_cast<size_t>(hidden_blocks_) * static_cast<size_t>(intermediate_blocks_);
+
+  const uint8_t* w13_e = gemm1_w_dev + static_cast<size_t>(local_expert_idx) * w13_elems;
+  const float* s13_e = gemm1_s_dev + static_cast<size_t>(local_expert_idx) * w13s_elems;
+  const uint8_t* w2_e = gemm2_w_dev + static_cast<size_t>(local_expert_idx) * w2_elems;
+  const float* s2_e = gemm2_s_dev + static_cast<size_t>(local_expert_idx) * w2s_elems;
+
+  constexpr int kThreads = 128;
+  int64_t n_g1 = static_cast<int64_t>(n_rows) * gemm1_out_;
+  int64_t n_c = static_cast<int64_t>(n_rows) * intermediate_;
+  int64_t n_out = static_cast<int64_t>(n_rows) * hidden_;
+
+  int b1 = static_cast<int>((n_g1 + kThreads - 1) / kThreads);
+  int b2 = static_cast<int>((n_c + kThreads - 1) / kThreads);
+  int b3 = static_cast<int>((n_out + kThreads - 1) / kThreads);
+
+  gemm1_permuted_kernel<<<b1, kThreads, 0, stream>>>(
+      a_dev, hidden_, gemm1_out_, block_, hidden_blocks_, n_rows, permuted_tok_e, w13_e, s13_e,
+      emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_, g1_dev_);
+  swiglu_permuted_kernel<<<b2, kThreads, 0, stream>>>(g1_dev_, intermediate_, n_rows,
+                                                      emulate_fp8_unit_, c_dev_);
+  gemm2_scatter_accumulate_kernel<<<b3, kThreads, 0, stream>>>(
+      c_dev_, hidden_, intermediate_, block_, intermediate_blocks_, n_rows, permuted_tok_e,
+      permuted_w_e, w2_e, s2_e, emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_,
+      out_acc_dev);
 }
 
 }  // namespace mxfp

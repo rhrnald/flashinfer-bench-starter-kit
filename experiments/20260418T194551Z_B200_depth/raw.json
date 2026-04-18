@@ -1,0 +1,126 @@
+{
+  "baseline": {
+    "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048": {
+      "b8f4f012-a32e-4356-b4e1-7665b3d598af": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 14.49212153752645,
+        "reference_latency_ms": 11.482887983322144,
+        "speedup_factor": 0.792353828498327,
+        "max_abs_error": 512.0,
+        "max_rel_error": 0.3990384638309479
+      },
+      "e05c6c03-5603-4a1c-b34c-dcce0ecaeea4": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 6.230995734532674,
+        "reference_latency_ms": 10.859188858668011,
+        "speedup_factor": 1.742769425837595,
+        "max_abs_error": 512.0,
+        "max_rel_error": 0.014814814552664757
+      },
+      "6230e838-67ca-41dd-a9d6-6f36b7676c6b": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 37.53873119354248,
+        "reference_latency_ms": 13.723124329249066,
+        "speedup_factor": 0.36557240729568813,
+        "max_abs_error": 1024.0,
+        "max_rel_error": 0.11398963630199432
+      }
+    }
+  },
+  "profile_only": {
+    "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048": {
+      "b8f4f012-a32e-4356-b4e1-7665b3d598af": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 13.147888453801473,
+        "reference_latency_ms": 11.358341868718464,
+        "speedup_factor": 0.8638909516633757,
+        "max_abs_error": 256.0,
+        "max_rel_error": 0.44374987483024597
+      },
+      "e05c6c03-5603-4a1c-b34c-dcce0ecaeea4": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 7.446562099456787,
+        "reference_latency_ms": 10.81015526453654,
+        "speedup_factor": 1.451697457182976,
+        "max_abs_error": 1024.0,
+        "max_rel_error": 0.031088082119822502
+      },
+      "6230e838-67ca-41dd-a9d6-6f36b7676c6b": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 43.239502016703284,
+        "reference_latency_ms": 13.60127730369568,
+        "speedup_factor": 0.31455675179703846,
+        "max_abs_error": 1024.0,
+        "max_rel_error": 0.43939387798309326
+      }
+    }
+  },
+  "grouped": {
+    "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048": {
+      "b8f4f012-a32e-4356-b4e1-7665b3d598af": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 13.279645331700642,
+        "reference_latency_ms": 11.324524815877277,
+        "speedup_factor": 0.8527731376111244,
+        "max_abs_error": 256.0,
+        "max_rel_error": 0.03086419776082039
+      },
+      "e05c6c03-5603-4a1c-b34c-dcce0ecaeea4": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 6.280867203076681,
+        "reference_latency_ms": 10.869705613454181,
+        "speedup_factor": 1.7306058641280713,
+        "max_abs_error": 128.0,
+        "max_rel_error": 0.0223214291036129
+      },
+      "6230e838-67ca-41dd-a9d6-6f36b7676c6b": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 36.759128189086915,
+        "reference_latency_ms": 13.591173855463664,
+        "speedup_factor": 0.3697360227247888,
+        "max_abs_error": 1024.0,
+        "max_rel_error": 6.444440841674805
+      }
+    }
+  },
+  "grouped_profile": {
+    "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048": {
+      "b8f4f012-a32e-4356-b4e1-7665b3d598af": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 13.12870715459188,
+        "reference_latency_ms": 11.380246988932292,
+        "speedup_factor": 0.8668216035995556,
+        "max_abs_error": 1024.0,
+        "max_rel_error": 0.03141361102461815
+      },
+      "e05c6c03-5603-4a1c-b34c-dcce0ecaeea4": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 7.61996476650238,
+        "reference_latency_ms": 10.823737653096517,
+        "speedup_factor": 1.4204445800954395,
+        "max_abs_error": 1024.0,
+        "max_rel_error": 0.016460904851555824
+      },
+      "6230e838-67ca-41dd-a9d6-6f36b7676c6b": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 36.16000328063965,
+        "reference_latency_ms": 13.685556252797445,
+        "speedup_factor": 0.3784722071672156,
+        "max_abs_error": 1024.0,
+        "max_rel_error": 0.025806451216340065
+      }
+    }
+  }
+}
