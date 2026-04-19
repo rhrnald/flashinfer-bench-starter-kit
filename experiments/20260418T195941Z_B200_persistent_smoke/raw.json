@@ -1,0 +1,54 @@
+{
+  "baseline": {
+    "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048": {
+      "b8f4f012-a32e-4356-b4e1-7665b3d598af": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 10.863168080647787,
+        "reference_latency_ms": 11.948906580607096,
+        "speedup_factor": 1.0999467643231535,
+        "max_abs_error": 1024.0,
+        "max_rel_error": 0.02118644118309021
+      }
+    }
+  },
+  "profile_only": {
+    "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048": {
+      "b8f4f012-a32e-4356-b4e1-7665b3d598af": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 10.952597300211588,
+        "reference_latency_ms": 11.930293401082357,
+        "speedup_factor": 1.0892661415436027,
+        "max_abs_error": 512.0,
+        "max_rel_error": 0.007518797181546688
+      }
+    }
+  },
+  "grouped": {
+    "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048": {
+      "b8f4f012-a32e-4356-b4e1-7665b3d598af": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 10.759413401285807,
+        "reference_latency_ms": 11.856917381286621,
+        "speedup_factor": 1.1020040720686182,
+        "max_abs_error": 64.0,
+        "max_rel_error": 0.026178009808063507
+      }
+    }
+  },
+  "grouped_profile": {
+    "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048": {
+      "b8f4f012-a32e-4356-b4e1-7665b3d598af": {
+        "status": "PASSED",
+        "solution": "moe_fp8_cpu_ref_cuda",
+        "latency_ms": 10.852938969930014,
+        "reference_latency_ms": 11.838730812072754,
+        "speedup_factor": 1.0908317871199729,
+        "max_abs_error": 512.0,
+        "max_rel_error": 0.018518518656492233
+      }
+    }
+  }
+}

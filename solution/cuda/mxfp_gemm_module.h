@@ -69,7 +69,35 @@ class DeviceMxfpGemmModule {
                  const uint8_t* gemm1_w_dev, const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
                  const float* gemm2_s_dev, float* out_acc_dev, cudaStream_t stream) const;
 
+  // Compact / grouped path: runs the MoE expert over only the tokens that
+  // were routed to it. Inputs `permuted_tok_e` and `permuted_w_e` are pointers
+  // into the routing-metadata buffers, already offset to this expert's slice.
+  // `n_rows` = number of tokens in that slice (= expert_counts[local_expert_idx]).
+  // This is the swap point that a future CUTLASS SM100 blockwise FP8 grouped
+  // GEMM would replace; the signature is already grouped-GEMM shaped.
+  void RunExpertPermuted(const float* a_dev, int64_t t, int n_rows,
+                         const int* permuted_tok_e, const float* permuted_w_e,
+                         int local_expert_idx, const uint8_t* gemm1_w_dev,
+                         const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
+                         const float* gemm2_s_dev, float* out_acc_dev,
+                         cudaStream_t stream) const;
+
+  bool SupportsTcPath() const;
+
+  // Experimental Blackwell path: keep the current routing/per-expert loop, but
+  // run each expert's two block-scale FP8 GEMMs through FlashInfer/CUTLASS
+  // SM100 Tensor Core kernels. This consumes the original hidden FP8 tensor and
+  // scale tensor directly, so GEMM1 avoids the scalar dequantized-FP32 path.
+  void RunExpertPermutedTc(const uint8_t* hidden_fp8_dev, const float* hidden_scale_dev,
+                           int64_t t, int n_rows, const int* permuted_tok_e,
+                           const float* permuted_w_e, int local_expert_idx,
+                           const uint8_t* gemm1_w_dev, const float* gemm1_s_dev,
+                           const uint8_t* gemm2_w_dev, const float* gemm2_s_dev,
+                           float* out_acc_dev, cudaStream_t stream);
+
  private:
+  void EnsureTcWorkspace(int rows);
+
   int hidden_;
   int intermediate_;
   int block_;
@@ -83,6 +111,19 @@ class DeviceMxfpGemmModule {
   bool emulate_acc_half_;
   float* g1_dev_;
   float* c_dev_;
+  int tc_max_rows_;
+  bool tc_path_env_;
+  uint8_t* tc_a_fp8_dev_;
+  uint8_t* tc_b_col_dev_;
+  float* tc_a_scale_dev_;
+  float* tc_b_scale_dev_;
+  uint16_t* tc_g1_bf16_dev_;
+  uint8_t* tc_c_fp8_dev_;
+  float* tc_c_scale_dev_;
+  uint16_t* tc_d_bf16_dev_;
+  int* tc_m_indptr_dev_;
+  void* tc_int_workspace_dev_;
+  void* tc_float_workspace_dev_;
 };
 
 }  // namespace mxfp
