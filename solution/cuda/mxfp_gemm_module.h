@@ -4,9 +4,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace mxfp {
+
+class MoeTcBackend;
 
 // Host-side FP8 e4m3fn decoder used by the current reference path.
 float fp8_e4m3fn_to_float(uint8_t x);
@@ -109,6 +112,8 @@ class DeviceMxfpGemmModule {
   bool emulate_fp8_unit_;
   bool emulate_fp16_operands_;
   bool emulate_acc_half_;
+  bool tc5090_env_;
+  std::unique_ptr<MoeTcBackend> tc5090_backend_;
   float* g1_dev_;
   float* c_dev_;
   int tc_max_rows_;

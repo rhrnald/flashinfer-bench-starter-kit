@@ -1,4 +1,5 @@
 #include "mxfp_gemm_module.h"
+#include "moe_tc_backend.h"
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -651,6 +652,8 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
       emulate_fp8_unit_(false),
       emulate_fp16_operands_(false),
       emulate_acc_half_(false),
+      tc5090_env_(false),
+      tc5090_backend_(nullptr),
       g1_dev_(nullptr),
       c_dev_(nullptr),
       tc_max_rows_(0),
@@ -682,13 +685,29 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
   if (emulate_fp16_operands_) {
     std::fprintf(stderr, "[mxfp] FIB_EMULATE_FP16_OPERANDS=1 (fp16*fp16 multiply emulation enabled)\n");
   }
+  const char* env_tc5090 = std::getenv("FIB_MOE_TC5090");
+  tc5090_env_ = (env_tc5090 != nullptr && env_tc5090[0] == '1');
+  if (tc5090_env_) {
+    MoeTcBackendConfig cfg = {
+        hidden_, intermediate_, block_, hidden_blocks_, intermediate_blocks_, gemm1_out_blocks_};
+    tc5090_backend_ = CreateMoeTcBackend5090Temp(cfg);
+    if (tc5090_backend_ != nullptr && tc5090_backend_->IsAvailable()) {
+      std::fprintf(stderr, "[mxfp] FIB_MOE_TC5090=1 using backend=%s\n",
+                   tc5090_backend_->BackendName());
+    } else {
+      std::fprintf(stderr,
+                   "[mxfp] FIB_MOE_TC5090=1 requested but backend unavailable; falling back\n");
+      tc5090_backend_.reset();
+    }
+  }
   const char* env_tc = std::getenv("FIB_MOE_TC");
   tc_path_env_ = (env_tc != nullptr && env_tc[0] == '1');
   if (tc_path_env_) {
     std::fprintf(stderr, "[mxfp] FIB_MOE_TC=1 requested; FlashInfer/CUTLASS SM100 path %s\n",
                  SupportsTcPath() ? "available" : "not available at compile time");
   }
-  if (emulate_fp8_unit_ || emulate_fp16_operands_ || emulate_acc_half_ || tc_path_env_) {
+  if (emulate_fp8_unit_ || emulate_fp16_operands_ || emulate_acc_half_ || tc5090_env_ ||
+      tc_path_env_) {
     std::fflush(stderr);
   }
 }
@@ -819,6 +838,8 @@ void DeviceMxfpGemmModule::RunExpertPermuted(const float* a_dev, int64_t /*t*/, 
                                              const uint8_t* gemm1_w_dev, const float* gemm1_s_dev,
                                              const uint8_t* gemm2_w_dev, const float* gemm2_s_dev,
                                              float* out_acc_dev, cudaStream_t stream) const {
+  // n_rows == T_e (tokens routed to this expert on local rank).
+  // If T_e == 0, skip all expert work.
   if (n_rows <= 0) return;
 
   size_t w13_elems = static_cast<size_t>(gemm1_out_) * static_cast<size_t>(hidden_);
@@ -830,6 +851,26 @@ void DeviceMxfpGemmModule::RunExpertPermuted(const float* a_dev, int64_t /*t*/, 
   const float* s13_e = gemm1_s_dev + static_cast<size_t>(local_expert_idx) * w13s_elems;
   const uint8_t* w2_e = gemm2_w_dev + static_cast<size_t>(local_expert_idx) * w2_elems;
   const float* s2_e = gemm2_s_dev + static_cast<size_t>(local_expert_idx) * w2s_elems;
+
+  if (tc5090_backend_ != nullptr) {
+    cudaError_t st1 = tc5090_backend_->RunStep1Fused(a_dev, n_rows, permuted_tok_e, w13_e, s13_e,
+                                                     c_dev_, stream);
+    if (st1 == cudaSuccess) {
+      cudaError_t st2 = tc5090_backend_->RunStep2(c_dev_, n_rows, permuted_tok_e, permuted_w_e,
+                                                  w2_e, s2_e, out_acc_dev, stream);
+      if (st2 == cudaSuccess) {
+        return;
+      }
+      std::fprintf(stderr,
+                   "[mxfp] 5090 temp backend step2 launch failed (%d), fallback to legacy permuted path\n",
+                   static_cast<int>(st2));
+    } else {
+      std::fprintf(stderr,
+                   "[mxfp] 5090 temp backend step1 launch failed (%d), fallback to legacy permuted path\n",
+                   static_cast<int>(st1));
+    }
+    cudaGetLastError();
+  }
 
   constexpr int kThreads = 128;
   int64_t n_g1 = static_cast<int64_t>(n_rows) * gemm1_out_;
@@ -860,6 +901,7 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
                                                const uint8_t* gemm2_w_dev,
                                                const float* gemm2_s_dev,
                                                float* out_acc_dev, cudaStream_t stream) {
+  // n_rows == T_e (tokens routed to this expert on local rank).
   if (n_rows <= 0) return;
   if (!SupportsTcPath()) {
     return RunExpertPermuted(nullptr, t, n_rows, permuted_tok_e, permuted_w_e, local_expert_idx,
