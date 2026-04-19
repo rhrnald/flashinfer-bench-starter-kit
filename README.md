@@ -24,6 +24,12 @@ Create high-performance GPU kernels for state-of-the-art LLM architectures on NV
 
 * 2026.02.05: Full dataset for definitions and workloads are released at [HuggingFace](https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest)
 
+## Working Notes
+
+Project-specific investigation notes are kept in [`docs/`](docs/):
+
+* [`docs/flashinfer_contest_research_summary.md`](docs/flashinfer_contest_research_summary.md): current kernel status, MoE direction, Modal workflow, and external references.
+
 ## Competition Tracks
 
 The competition features three tracks, each targeting a critical LLM operation:
