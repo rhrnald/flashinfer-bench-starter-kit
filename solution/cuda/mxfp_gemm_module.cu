@@ -703,6 +703,18 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
   const char* env_tc = std::getenv("FIB_MOE_TC");
   tc_path_env_ = (env_tc != nullptr && env_tc[0] == '1');
   if (tc_path_env_) {
+    // Use B200 TC backend when FIB_MOE_TC=1 is set
+    MoeTcBackendConfig cfg = {
+        hidden_, intermediate_, block_, hidden_blocks_, intermediate_blocks_, gemm1_out_blocks_};
+    tc5090_backend_ = CreateMoeTcBackendB200(cfg);
+    if (tc5090_backend_ != nullptr && tc5090_backend_->IsAvailable()) {
+      std::fprintf(stderr, "[mxfp] FIB_MOE_TC=1 using backend=%s\n",
+                   tc5090_backend_->BackendName());
+    } else {
+      std::fprintf(stderr,
+                   "[mxfp] FIB_MOE_TC=1 requested but B200 backend unavailable; falling back\n");
+      tc5090_backend_.reset();
+    }
     std::fprintf(stderr, "[mxfp] FIB_MOE_TC=1 requested; FlashInfer/CUTLASS SM100 path %s\n",
                  SupportsTcPath() ? "available" : "not available at compile time");
   }

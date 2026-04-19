@@ -34,6 +34,6 @@ class MoeTcBackend {
 };
 
 std::unique_ptr<MoeTcBackend> CreateMoeTcBackend5090Temp(const MoeTcBackendConfig& cfg);
-std::unique_ptr<MoeTcBackend> CreateMoeTcBackendB200Stub(const MoeTcBackendConfig& cfg);
+std::unique_ptr<MoeTcBackend> CreateMoeTcBackendB200(const MoeTcBackendConfig& cfg);
 
 }  // namespace mxfp
