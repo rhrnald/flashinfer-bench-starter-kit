@@ -36,6 +36,33 @@ def ensure_tvm_ffi_cuda_arch(solution: Solution) -> None:
     print(f"Using TVM_FFI_CUDA_ARCH_LIST={arch}")
 
 
+def ensure_tvm_ffi_link_cuda_driver(solution: Solution) -> None:
+    """Ensure tvm_ffi links against CUDA driver symbols (e.g. cuTensorMapEncodeTiled)."""
+    if solution.spec.language.value != "cuda":
+        return
+    try:
+        import tvm_ffi.cpp  # type: ignore
+    except Exception as exc:
+        print(f"Skip tvm_ffi -lcuda patch: {exc}")
+        return
+
+    if getattr(tvm_ffi.cpp.build, "_fib_lcuda_patched", False):
+        return
+
+    original_build = tvm_ffi.cpp.build
+
+    def build_with_cuda_driver(*args, **kwargs):
+        ldflags = list(kwargs.get("extra_ldflags") or [])
+        for flag in ("-L/usr/local/cuda/lib64/stubs", "-lcuda"):
+            if flag not in ldflags:
+                ldflags.append(flag)
+        kwargs["extra_ldflags"] = ldflags
+        return original_build(*args, **kwargs)
+
+    build_with_cuda_driver._fib_lcuda_patched = True  # type: ignore[attr-defined]
+    tvm_ffi.cpp.build = build_with_cuda_driver
+
+
 def get_trace_set_path() -> str:
     """Get trace set path from environment variable."""
     path = os.environ.get("FIB_DATASET_PATH")
@@ -127,6 +154,7 @@ def main():
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
     ensure_tvm_ffi_cuda_arch(solution)
+    ensure_tvm_ffi_link_cuda_driver(solution)
 
     print("\nRunning benchmark...")
     results = run_benchmark(solution)

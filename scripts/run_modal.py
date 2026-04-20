@@ -130,6 +130,12 @@ def _ensure_flashinfer_include_paths() -> None:
             if flag not in cuda_flags:
                 cuda_flags.append(flag)
         kwargs["extra_cuda_cflags"] = cuda_flags
+
+        ldflags = list(kwargs.get("extra_ldflags") or [])
+        for flag in ("-L/usr/local/cuda/lib64/stubs", "-lcuda"):
+            if flag not in ldflags:
+                ldflags.append(flag)
+        kwargs["extra_ldflags"] = ldflags
         return original_build(*args, **kwargs)
 
     build_with_flashinfer_headers._fib_flashinfer_patched = True
