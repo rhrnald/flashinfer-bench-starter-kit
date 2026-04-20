@@ -19,10 +19,8 @@ from scripts.pack_solution import pack_solution
 
 
 def ensure_tvm_ffi_cuda_arch(solution: Solution) -> None:
-    """Set TVM_FFI_CUDA_ARCH_LIST from current visible GPU when not explicitly set."""
+    """Force TVM_FFI_CUDA_ARCH_LIST from current visible GPU."""
     if solution.spec.language.value != "cuda":
-        return
-    if os.environ.get("TVM_FFI_CUDA_ARCH_LIST"):
         return
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
         return
@@ -31,6 +29,9 @@ def ensure_tvm_ffi_cuda_arch(solution: Solution) -> None:
     # (compute_100a/sm_100a), not plain sm_100.
     suffix = "a" if major >= 10 else ""
     arch = f"{major}.{minor}{suffix}"
+    prev = os.environ.get("TVM_FFI_CUDA_ARCH_LIST")
+    if prev and prev != arch:
+        print(f"Overriding TVM_FFI_CUDA_ARCH_LIST={prev} -> {arch}")
     os.environ["TVM_FFI_CUDA_ARCH_LIST"] = arch
     print(f"Using TVM_FFI_CUDA_ARCH_LIST={arch}")
 

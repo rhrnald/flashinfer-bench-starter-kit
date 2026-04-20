@@ -48,15 +48,13 @@ image = (
 
 
 def _ensure_cuda_arch() -> None:
-    """Set TVM_FFI_CUDA_ARCH_LIST from the container's visible GPU.
+    """Force TVM_FFI_CUDA_ARCH_LIST from the container's visible GPU.
 
     flashinfer-bench's TVM-FFI builder reads this to pick which SM to compile
     for. Without it the build falls back to a list that may not include sm_100.
     """
     import os
 
-    if os.environ.get("TVM_FFI_CUDA_ARCH_LIST"):
-        return
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
@@ -65,8 +63,12 @@ def _ensure_cuda_arch() -> None:
     # Blackwell TCGEN05/CUTLASS SM100 kernels require the family-specific
     # "a" target (compute_100a/sm_100a), not plain sm_100.
     suffix = "a" if major >= 10 else ""
-    os.environ["TVM_FFI_CUDA_ARCH_LIST"] = f"{major}.{minor}{suffix}"
-    print(f"[run_modal] TVM_FFI_CUDA_ARCH_LIST={major}.{minor}{suffix}")
+    arch = f"{major}.{minor}{suffix}"
+    prev = os.environ.get("TVM_FFI_CUDA_ARCH_LIST")
+    if prev and prev != arch:
+        print(f"[run_modal] overriding TVM_FFI_CUDA_ARCH_LIST={prev} -> {arch}")
+    os.environ["TVM_FFI_CUDA_ARCH_LIST"] = arch
+    print(f"[run_modal] TVM_FFI_CUDA_ARCH_LIST={arch}")
 
 
 def _ensure_flashinfer_include_paths() -> None:

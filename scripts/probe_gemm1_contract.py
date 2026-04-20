@@ -50,16 +50,18 @@ GEMM1_OUT_BLOCKS = GEMM1_OUT // BLOCK
 def _ensure_cuda_arch() -> None:
     import os
 
-    if os.environ.get("TVM_FFI_CUDA_ARCH_LIST"):
-        return
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
         return
     major, minor = torch.cuda.get_device_capability(0)
     suffix = "a" if major >= 10 else ""
-    os.environ["TVM_FFI_CUDA_ARCH_LIST"] = f"{major}.{minor}{suffix}"
-    print(f"[probe_gemm1_contract] TVM_FFI_CUDA_ARCH_LIST={major}.{minor}{suffix}")
+    arch = f"{major}.{minor}{suffix}"
+    prev = os.environ.get("TVM_FFI_CUDA_ARCH_LIST")
+    if prev and prev != arch:
+        print(f"[probe_gemm1_contract] overriding TVM_FFI_CUDA_ARCH_LIST={prev} -> {arch}")
+    os.environ["TVM_FFI_CUDA_ARCH_LIST"] = arch
+    print(f"[probe_gemm1_contract] TVM_FFI_CUDA_ARCH_LIST={arch}")
 
 
 def _fmt(v: Any, spec: str = ".4g") -> str:
