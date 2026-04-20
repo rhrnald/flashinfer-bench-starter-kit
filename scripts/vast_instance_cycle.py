@@ -29,6 +29,10 @@ from typing import Any
 API_BASE = "https://console.vast.ai/api/v0"
 
 
+class RateLimitError(RuntimeError):
+    """Raised when Vast API returns HTTP 429."""
+
+
 def _api_request(api_key: str, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     url = f"{API_BASE}{path}"
     data = None
@@ -43,6 +47,8 @@ def _api_request(api_key: str, method: str, path: str, payload: dict[str, Any] |
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
+        if e.code == 429:
+            raise RateLimitError(f"{method} {path} failed: HTTP 429 {body}") from e
         raise RuntimeError(f"{method} {path} failed: HTTP {e.code} {body}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"{method} {path} failed: {e}") from e
@@ -79,8 +85,13 @@ def _wait_until_running(
 ) -> tuple[str, int]:
     deadline = time.time() + timeout_sec
     last_state = "unknown"
+    backoff_sec = max(15.0, poll_sec * 2.0)
     while time.time() < deadline:
-        payload = _show_instance(api_key, instance_id)
+        try:
+            payload = _show_instance(api_key, instance_id)
+        except RateLimitError:
+            time.sleep(backoff_sec)
+            continue
         inst = payload.get("instances", {})
         state = str(inst.get("actual_status") or inst.get("cur_state") or "unknown").lower()
         last_state = state
@@ -94,11 +105,29 @@ def _wait_until_running(
     raise TimeoutError(f"Timed out waiting for running state (last state: {last_state})")
 
 
-def _build_remote_script(repo_dir: str, git_pull: bool, remote_command: str) -> str:
+def _build_remote_script(
+    repo_dir: str,
+    git_pull: bool,
+    remote_command: str,
+    remote_timeout_sec: int,
+) -> str:
     parts = ["set -euo pipefail", f"cd {shlex.quote(repo_dir)}"]
+    # Best-effort remote conda bootstrap for benchmark runs.
+    parts.extend(
+        [
+            "if [ -f /workspace/miniconda3/etc/profile.d/conda.sh ]; then source /workspace/miniconda3/etc/profile.d/conda.sh; "
+            "elif [ -f /root/miniconda3/etc/profile.d/conda.sh ]; then source /root/miniconda3/etc/profile.d/conda.sh; "
+            "elif [ -f /opt/conda/etc/profile.d/conda.sh ]; then source /opt/conda/etc/profile.d/conda.sh; fi",
+            "if command -v conda >/dev/null 2>&1; then conda activate fi-bench || true; fi",
+        ]
+    )
     if git_pull:
         parts.append("git pull --ff-only")
-    parts.append(remote_command)
+    if remote_timeout_sec > 0 and "timeout " not in remote_command:
+        wrapped = f"timeout -k 5s {int(remote_timeout_sec)}s bash -lc {shlex.quote(remote_command)}"
+        parts.append(wrapped)
+    else:
+        parts.append(remote_command)
     return "\n".join(parts)
 
 
@@ -142,6 +171,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start-timeout-sec", type=int, default=600)
     p.add_argument("--poll-sec", type=float, default=5.0)
     p.add_argument("--ssh-connect-timeout-sec", type=int, default=30)
+    p.add_argument(
+        "--remote-timeout-sec",
+        type=int,
+        default=30,
+        help="Wrap remote command with GNU timeout; set 0 to disable wrapper",
+    )
     p.add_argument("--vast-log-tail", type=int, default=4000)
     p.add_argument("--log-dir", type=str, default="logs/vast")
     return p.parse_args()
@@ -189,6 +224,7 @@ def main() -> int:
             repo_dir=args.remote_repo_dir,
             git_pull=not args.no_git_pull,
             remote_command=args.remote_command,
+            remote_timeout_sec=args.remote_timeout_sec,
         )
         print("[vast] executing remote command over ssh")
         proc = _run_ssh(
@@ -245,4 +281,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
