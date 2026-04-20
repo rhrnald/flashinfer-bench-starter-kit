@@ -28,7 +28,10 @@ def ensure_tvm_ffi_cuda_arch(solution: Solution) -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
         return
     major, minor = torch.cuda.get_device_capability(0)
-    arch = f"{major}.{minor}"
+    # Blackwell family kernels in this repo require the "a" target
+    # (compute_100a/sm_100a), not plain sm_100.
+    suffix = "a" if major >= 10 else ""
+    arch = f"{major}.{minor}{suffix}"
     os.environ["TVM_FFI_CUDA_ARCH_LIST"] = arch
     print(f"Using TVM_FFI_CUDA_ARCH_LIST={arch}")
 
