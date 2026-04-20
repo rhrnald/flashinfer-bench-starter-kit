@@ -1,7 +1,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include "mxfp_gemm_module.h"
+#include "backend_a100.h"
 
 #include <algorithm>
 #include <chrono>
@@ -44,21 +44,6 @@ __device__ __forceinline__ float bf16_to_float_device(uint16_t bits) {
   return __uint_as_float(u32);
 }
 
-__device__ __forceinline__ float fp8_e4m3fn_to_float_device(uint8_t x) {
-  int sign = (x & 0x80) ? -1 : 1;
-  int exp = (x >> 3) & 0x0f;
-  int mant = x & 0x07;
-
-  if (exp == 0) {
-    if (mant == 0) return sign == 1 ? 0.0f : -0.0f;
-    float frac = static_cast<float>(mant) * 0.125f;
-    return sign * ldexpf(frac, -6);
-  }
-
-  float frac = 1.0f + static_cast<float>(mant) * 0.125f;
-  return sign * ldexpf(frac, exp - 7);
-}
-
 __device__ __forceinline__ uint16_t float_to_bf16_rne_device(float x) {
   uint32_t u32 = __float_as_uint(x);
   uint32_t lsb = (u32 >> 16) & 1u;
@@ -92,7 +77,7 @@ __device__ __forceinline__ void insert_topk8_device(TopKEntry* topk, float v, in
 
 __global__ void routing_kernel(const float* __restrict__ logits, const uint16_t* __restrict__ bias_bf16,
                                int64_t t, int local_expert_offset, float routed_scaling_factor,
-                               float* __restrict__ local_weight, uint8_t* __restrict__ expert_used) {
+                               float* __restrict__ local_weight) {
   int tok = blockIdx.x * blockDim.x + threadIdx.x;
   if (tok >= t) return;
 
@@ -163,24 +148,8 @@ __global__ void routing_kernel(const float* __restrict__ logits, const uint16_t*
     if (0 <= le && le < kNumLocalExperts) {
       float w = (s[ge] / wsum) * routed_scaling_factor;
       lw_row[le] = w;
-      expert_used[le] = 1;
     }
   }
-}
-
-__global__ void dequant_hidden_kernel(const uint8_t* __restrict__ hidden_fp8,
-                                      const float* __restrict__ hidden_scale, int64_t t,
-                                      float* __restrict__ a_out) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  int64_t total = t * kHidden;
-  if (idx >= total) return;
-
-  int64_t tok = idx / kHidden;
-  int h = static_cast<int>(idx - tok * kHidden);
-  int hb = h / kBlock;
-  float scale = hidden_scale[static_cast<int64_t>(hb) * t + tok];
-  float v = fp8_e4m3fn_to_float_device(hidden_fp8[idx]);
-  a_out[idx] = v * scale;
 }
 
 __global__ void f32_to_bf16_kernel(const float* __restrict__ in, int64_t n, uint16_t* __restrict__ out) {
@@ -253,26 +222,22 @@ __global__ void scatter_placements_kernel(const float* __restrict__ local_weight
 struct MoeWorkspace {
   int64_t cap_t = 0;
   int64_t cap_t_grouped = 0;
+  int64_t cap_routed = 0;
   float* local_weight_dev = nullptr;
-  uint8_t* expert_used_dev = nullptr;
-  float* a_dev = nullptr;
   float* out_acc_dev = nullptr;
   int* expert_counts_dev = nullptr;
   int* expert_offsets_dev = nullptr;
   int* running_counter_dev = nullptr;
   int* permuted_token_ids_dev = nullptr;
   float* permuted_weights_dev = nullptr;
+  float* c_perm_all_dev = nullptr;
 
   void ensure_core(int64_t t) {
     if (t <= cap_t && local_weight_dev != nullptr) return;
     if (local_weight_dev) cudaFree(local_weight_dev);
-    if (expert_used_dev) cudaFree(expert_used_dev);
-    if (a_dev) cudaFree(a_dev);
     if (out_acc_dev) cudaFree(out_acc_dev);
     cap_t = t;
     cudaMalloc(&local_weight_dev, static_cast<size_t>(t) * kNumLocalExperts * sizeof(float));
-    cudaMalloc(&expert_used_dev, kNumLocalExperts * sizeof(uint8_t));
-    cudaMalloc(&a_dev, static_cast<size_t>(t) * kHidden * sizeof(float));
     cudaMalloc(&out_acc_dev, static_cast<size_t>(t) * kHidden * sizeof(float));
   }
 
@@ -290,6 +255,16 @@ struct MoeWorkspace {
     cudaMalloc(&running_counter_dev, kNumLocalExperts * sizeof(int));
     cudaMalloc(&permuted_token_ids_dev, static_cast<size_t>(max_routed) * sizeof(int));
     cudaMalloc(&permuted_weights_dev, static_cast<size_t>(max_routed) * sizeof(float));
+  }
+
+  void ensure_routed_step1(int64_t routed_rows) {
+    if (routed_rows <= cap_routed && c_perm_all_dev != nullptr) return;
+    if (c_perm_all_dev) cudaFree(c_perm_all_dev);
+    cap_routed = routed_rows;
+    if (routed_rows > 0) {
+      cudaMalloc(&c_perm_all_dev,
+                 static_cast<size_t>(routed_rows) * kIntermediate * sizeof(float));
+    }
   }
 };
 
@@ -341,18 +316,8 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   // runs. Opt in with FIB_MOE_PROFILE=1 (any non-empty value) when A/B testing.
   const bool kProfile = std::getenv("FIB_MOE_PROFILE") != nullptr;
 
-  // Grouped / permuted expert path: builds routing metadata and calls the
-  // compact GEMM kernels instead of the dense-masked per-T loop. As of the
-  // persistent-workspace + all-19 B200 deep sweep (2026-04-18) this is the
-  // better default — grouped beats legacy on mean speedup (0.576x vs 0.554x
-  // warmup=2 iter=10 trial=2) and wins on 13/19 workloads with losses ≤5%.
-  // Opt out with FIB_MOE_LEGACY=1 for the legacy dense-mask path.
-  // FIB_MOE_GROUPED=1 is still honored for backward compatibility (no-op since
-  // it's already the default).
-  const bool kLegacy = std::getenv("FIB_MOE_LEGACY") != nullptr;
-  const bool kGrouped = !kLegacy;
+  // B200 branch policy: grouped/permuted path is always on.
   static mxfp::DeviceMxfpGemmModule gemm_mod(kHidden, kIntermediate, kBlock);
-  const bool kTc = kGrouped && gemm_mod.SupportsTcPath();
 
   const auto t0_total =
       kProfile ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
@@ -360,29 +325,19 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   static MoeWorkspace ws;
   ws.ensure_core(t);
   float* local_weight_dev = ws.local_weight_dev;
-  uint8_t* expert_used_dev = ws.expert_used_dev;
-  float* a_dev = ws.a_dev;
   float* out_acc_dev = ws.out_acc_dev;
 
   cudaMemsetAsync(local_weight_dev, 0, static_cast<size_t>(t) * kNumLocalExperts * sizeof(float), stream);
-  cudaMemsetAsync(expert_used_dev, 0, static_cast<size_t>(kNumLocalExperts), stream);
   cudaMemsetAsync(out_acc_dev, 0, static_cast<size_t>(t) * kHidden * sizeof(float), stream);
 
-  int* expert_counts_dev = nullptr;
-  int* expert_offsets_dev = nullptr;
-  int* running_counter_dev = nullptr;
-  int* permuted_token_ids_dev = nullptr;
-  float* permuted_weights_dev = nullptr;
-  if (kGrouped) {
-    ws.ensure_grouped(t);
-    expert_counts_dev = ws.expert_counts_dev;
-    expert_offsets_dev = ws.expert_offsets_dev;
-    running_counter_dev = ws.running_counter_dev;
-    permuted_token_ids_dev = ws.permuted_token_ids_dev;
-    permuted_weights_dev = ws.permuted_weights_dev;
-    cudaMemsetAsync(expert_counts_dev, 0, kNumLocalExperts * sizeof(int), stream);
-    cudaMemsetAsync(running_counter_dev, 0, kNumLocalExperts * sizeof(int), stream);
-  }
+  ws.ensure_grouped(t);
+  int* expert_counts_dev = ws.expert_counts_dev;
+  int* expert_offsets_dev = ws.expert_offsets_dev;
+  int* running_counter_dev = ws.running_counter_dev;
+  int* permuted_token_ids_dev = ws.permuted_token_ids_dev;
+  float* permuted_weights_dev = ws.permuted_weights_dev;
+  cudaMemsetAsync(expert_counts_dev, 0, kNumLocalExperts * sizeof(int), stream);
+  cudaMemsetAsync(running_counter_dev, 0, kNumLocalExperts * sizeof(int), stream);
 
   std::chrono::high_resolution_clock::time_point t0_routing, t1_routing;
   std::chrono::high_resolution_clock::time_point t0_dequant, t1_dequant;
@@ -395,91 +350,97 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   routing_kernel<<<routing_blocks, kRoutingThreads, 0, stream>>>(
       static_cast<const float*>(routing_logits.data_ptr()),
       static_cast<const uint16_t*>(routing_bias.data_ptr()), t, static_cast<int>(local_expert_offset),
-      static_cast<float>(routed_scaling_factor), local_weight_dev, expert_used_dev);
+      static_cast<float>(routed_scaling_factor), local_weight_dev);
   if (kProfile) {
     cudaStreamSynchronize(stream);
     t1_routing = std::chrono::high_resolution_clock::now();
   }
 
   int64_t n_hidden = t * kHidden;
-  if (kProfile) t0_dequant = std::chrono::high_resolution_clock::now();
-  if (!kTc) {
-    constexpr int kDequantThreads = 256;
-    int dequant_blocks = static_cast<int>((n_hidden + kDequantThreads - 1) / kDequantThreads);
-    dequant_hidden_kernel<<<dequant_blocks, kDequantThreads, 0, stream>>>(
-        static_cast<const uint8_t*>(hidden_states.data_ptr()),
-        static_cast<const float*>(hidden_states_scale.data_ptr()), t, a_dev);
-  }
   if (kProfile) {
-    cudaStreamSynchronize(stream);
-    t1_dequant = std::chrono::high_resolution_clock::now();
+    t0_dequant = std::chrono::high_resolution_clock::now();
+    // FP8 activation dequant is fused inside GEMM1 path now.
+    t1_dequant = t0_dequant;
   }
 
   if (kProfile) t0_expert = std::chrono::high_resolution_clock::now();
 
-  if (!kTc) {
-    gemm_mod.EnsureWorkspace(t, stream);
-  }
+  gemm_mod.EnsureWorkspace(t, stream);
 
-  std::vector<uint8_t> expert_used_host(kNumLocalExperts, 0);
   std::vector<int> expert_counts_host(kNumLocalExperts, 0);
   std::vector<int> expert_offsets_host(kNumLocalExperts + 1, 0);
 
-  if (kGrouped) {
-    // Build grouped-GEMM metadata.
-    constexpr int kMetaThreads = 128;
-    int meta_blocks = static_cast<int>((t + kMetaThreads - 1) / kMetaThreads);
-    build_counts_kernel<<<meta_blocks, kMetaThreads, 0, stream>>>(local_weight_dev, t,
-                                                                  expert_counts_dev);
-    scan_offsets_kernel<<<1, 32, 0, stream>>>(expert_counts_dev, expert_offsets_dev);
-    scatter_placements_kernel<<<meta_blocks, kMetaThreads, 0, stream>>>(
-        local_weight_dev, t, expert_offsets_dev, running_counter_dev, permuted_token_ids_dev,
-        permuted_weights_dev);
+  // Build grouped-GEMM metadata.
+  constexpr int kMetaThreads = 128;
+  int meta_blocks = static_cast<int>((t + kMetaThreads - 1) / kMetaThreads);
+  build_counts_kernel<<<meta_blocks, kMetaThreads, 0, stream>>>(local_weight_dev, t,
+                                                                expert_counts_dev);
+  scan_offsets_kernel<<<1, 32, 0, stream>>>(expert_counts_dev, expert_offsets_dev);
+  scatter_placements_kernel<<<meta_blocks, kMetaThreads, 0, stream>>>(
+      local_weight_dev, t, expert_offsets_dev, running_counter_dev, permuted_token_ids_dev,
+      permuted_weights_dev);
 
-    cudaMemcpyAsync(expert_counts_host.data(), expert_counts_dev,
-                    kNumLocalExperts * sizeof(int), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(expert_offsets_host.data(), expert_offsets_dev,
-                    (kNumLocalExperts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+  cudaMemcpyAsync(expert_counts_host.data(), expert_counts_dev,
+                  kNumLocalExperts * sizeof(int), cudaMemcpyDeviceToHost, stream);
+  cudaMemcpyAsync(expert_offsets_host.data(), expert_offsets_dev,
+                  (kNumLocalExperts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
+  cudaStreamSynchronize(stream);
 
-    for (int le = 0; le < kNumLocalExperts; ++le) {
-      int n_rows = expert_counts_host[le];
-      if (n_rows == 0) continue;
-      int start = expert_offsets_host[le];
-      if (kTc) {
-        gemm_mod.RunExpertPermutedTc(
-            static_cast<const uint8_t*>(hidden_states.data_ptr()),
-            static_cast<const float*>(hidden_states_scale.data_ptr()), t, n_rows,
-            permuted_token_ids_dev + start, permuted_weights_dev + start, le,
-            static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
-            static_cast<const float*>(gemm1_weights_scale.data_ptr()),
-            static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
-            static_cast<const float*>(gemm2_weights_scale.data_ptr()), out_acc_dev, stream);
-      } else {
-        gemm_mod.RunExpertPermuted(
-            a_dev, t, n_rows, permuted_token_ids_dev + start, permuted_weights_dev + start, le,
-            static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
-            static_cast<const float*>(gemm1_weights_scale.data_ptr()),
+  const int total_routed = expert_offsets_host[kNumLocalExperts];
+  bool used_direct_step1 = false;
+
+  if (gemm_mod.IsB200DirectEnabled() && total_routed > 0) {
+    ws.ensure_routed_step1(total_routed);
+    cudaError_t st1 = gemm_mod.RunStep1AllExpertsDirect(
+        static_cast<const uint8_t*>(hidden_states.data_ptr()),
+        static_cast<const float*>(hidden_states_scale.data_ptr()), t, expert_counts_dev,
+        expert_offsets_dev, permuted_token_ids_dev,
+        static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
+        static_cast<const float*>(gemm1_weights_scale.data_ptr()), ws.c_perm_all_dev, stream);
+    if (st1 == cudaSuccess) {
+      used_direct_step1 = true;
+    } else {
+      std::fprintf(stderr,
+                   "[moe] direct Step1(all experts) failed (%d), fallback to legacy per-expert path\n",
+                   static_cast<int>(st1));
+      cudaGetLastError();
+    }
+  }
+
+  if (used_direct_step1) {
+    cudaError_t st2 = gemm_mod.RunStep2AllExpertsDirect(
+        ws.c_perm_all_dev, expert_counts_dev, expert_offsets_dev, permuted_token_ids_dev,
+        permuted_weights_dev, static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
+        static_cast<const float*>(gemm2_weights_scale.data_ptr()), out_acc_dev, stream);
+    if (st2 != cudaSuccess) {
+      std::fprintf(stderr,
+                   "[moe] direct Step2(all experts) failed (%d), fallback to per-expert Step2\n",
+                   static_cast<int>(st2));
+      cudaGetLastError();
+      for (int le = 0; le < kNumLocalExperts; ++le) {
+        int n_rows = expert_counts_host[le];
+        if (n_rows == 0) continue;
+        int start = expert_offsets_host[le];
+        const float* c_perm_e = ws.c_perm_all_dev + static_cast<int64_t>(start) * kIntermediate;
+        gemm_mod.RunStep2PermutedOnly(
+            c_perm_e, n_rows, permuted_token_ids_dev + start, permuted_weights_dev + start, le,
             static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
             static_cast<const float*>(gemm2_weights_scale.data_ptr()), out_acc_dev, stream);
       }
     }
   } else {
-    // Legacy dense-mask path.
-    // expert_used_host drives the host-side expert loop below, so this sync is
-    // functionally required and stays unconditional.
-    cudaMemcpyAsync(expert_used_host.data(), expert_used_dev,
-                    static_cast<size_t>(kNumLocalExperts), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-
     for (int le = 0; le < kNumLocalExperts; ++le) {
-      if (expert_used_host[le] == 0) continue;
-      gemm_mod.RunExpert(a_dev, t, local_weight_dev, le,
-                         static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
-                         static_cast<const float*>(gemm1_weights_scale.data_ptr()),
-                         static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
-                         static_cast<const float*>(gemm2_weights_scale.data_ptr()), out_acc_dev,
-                         stream);
+      int n_rows = expert_counts_host[le];
+      if (n_rows == 0) continue;
+      int start = expert_offsets_host[le];
+      gemm_mod.RunExpertPermuted(
+          static_cast<const uint8_t*>(hidden_states.data_ptr()),
+          static_cast<const float*>(hidden_states_scale.data_ptr()), t, n_rows,
+          permuted_token_ids_dev + start, permuted_weights_dev + start, le,
+          static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
+          static_cast<const float*>(gemm1_weights_scale.data_ptr()),
+          static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
+          static_cast<const float*>(gemm2_weights_scale.data_ptr()), out_acc_dev, stream);
     }
   }
   if (kProfile) {
