@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -82,8 +81,9 @@ class DeviceMxfpGemmModule {
   bool emulate_acc_half_;
   bool quantize_scale_e8m0_;
   bool b200_direct_enabled_;
-  mutable CUtensorMap* step1_hidden_tmap_dev_;
-  mutable CUtensorMap* step1_w13_tmap_dev_;
+  mutable void* step1_hidden_tma_desc_dev_;
+  mutable void* step1_w13_tma_desc_dev_;
+  mutable void* step2_w2_tma_desc_dev_;
   float* g1_dev_;
   float* c_dev_;
 };
