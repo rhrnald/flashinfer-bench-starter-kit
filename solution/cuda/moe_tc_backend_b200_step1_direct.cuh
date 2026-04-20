@@ -83,7 +83,9 @@ __global__ void step1_gemm1_swiglu_direct_kernel(const uint8_t* __restrict__ hid
 
   const int gate_tile = itile;
   const int up_tile = itile + (kStep1Intermediate / kStep1Block);
-  const bool use_tma = (hidden_tmap_dev != nullptr && w13_tmap_dev != nullptr);
+  // Validation-first safety: placeholder TMA path can stall on some SM100 toolchains.
+  // Keep direct scalar path until full TMA/barrier contract is verified.
+  const bool use_tma = false;  // (hidden_tmap_dev != nullptr && w13_tmap_dev != nullptr);
 
   __shared__ float s_out_tile[kStep1Block];
   __shared__ alignas(16) uint8_t s_a_tile[kStep1Block];
@@ -101,35 +103,26 @@ __global__ void step1_gemm1_swiglu_direct_kernel(const uint8_t* __restrict__ hid
 
     for (int hb = 0; hb < hidden_blocks; ++hb) {
       const int h0 = hb * kStep1Block;
-      if (lane == 0) {
-        if (use_tma) {
+      if (lane == 0 && use_tma) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-          cuda::ptx::mbarrier_init(&s_tma_bar, 3);
+        cuda::ptx::mbarrier_init(&s_tma_bar, 3);
 #endif
-          ptx::TmaDesc a_tma_desc{};
-          a_tma_desc.tensor_map = hidden_tmap_dev;
-          a_tma_desc.smem_bar = &s_tma_bar;
-          a_tma_desc.cta_group = 1;
-          a_tma_desc.valid = true;
-          ptx::tma_async_load_2d(a_tma_desc, s_a_tile, tok, h0);
+        ptx::TmaDesc a_tma_desc{};
+        a_tma_desc.tensor_map = hidden_tmap_dev;
+        a_tma_desc.smem_bar = &s_tma_bar;
+        a_tma_desc.cta_group = 1;
+        a_tma_desc.valid = true;
+        ptx::tma_async_load_2d(a_tma_desc, s_a_tile, tok, h0);
 
-          ptx::TmaDesc w_tma_desc{};
-          w_tma_desc.tensor_map = w13_tmap_dev;
-          w_tma_desc.smem_bar = &s_tma_bar;
-          w_tma_desc.cta_group = 1;
-          w_tma_desc.valid = true;
-          ptx::tma_async_load_2d(w_tma_desc, s_w_gate_tile, expert_i_offset, h0);
-          ptx::tma_async_load_2d(w_tma_desc, s_w_up_tile, expert_i_offset + kStep1Intermediate, h0);
-          ptx::tma_commit_group();
-          ptx::tma_wait_group(0);
-        }
-
-        auto tmem_h = ptx::tmem_alloc(1);
-        ptx::Tcgen05MmaDesc mma_desc{};
-        ptx::tcgen05_mma_f8(mma_desc);
-        ptx::tmem_wait();
-        ptx::tmem_cp();
-        ptx::tmem_dealloc(tmem_h);
+        ptx::TmaDesc w_tma_desc{};
+        w_tma_desc.tensor_map = w13_tmap_dev;
+        w_tma_desc.smem_bar = &s_tma_bar;
+        w_tma_desc.cta_group = 1;
+        w_tma_desc.valid = true;
+        ptx::tma_async_load_2d(w_tma_desc, s_w_gate_tile, expert_i_offset, h0);
+        ptx::tma_async_load_2d(w_tma_desc, s_w_up_tile, expert_i_offset + kStep1Intermediate, h0);
+        ptx::tma_commit_group();
+        ptx::tma_wait_group(0);
       }
       __syncthreads();
 
@@ -172,14 +165,6 @@ __global__ void step1_gemm1_swiglu_direct_kernel(const uint8_t* __restrict__ hid
       s_out_tile[col] = acc_gate[v] * siluf_device(acc_up[v]);
     }
     __syncthreads();
-
-    if (lane == 0) {
-      // TODO(B200): Replace with real TMA store from staged tile to global.
-      ptx::TmaDesc tma_store_desc{};
-      ptx::tma_async_load_2d(tma_store_desc, nullptr, itile, slot);
-      ptx::tma_commit_group();
-      ptx::tma_wait_group(0);
-    }
 
 #pragma unroll
     for (int v = 0; v < 4; ++v) {

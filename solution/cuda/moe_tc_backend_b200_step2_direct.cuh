@@ -49,14 +49,8 @@ __global__ void step2_gemm2_scatter_direct_kernel(const float* __restrict__ c_pe
   const int h = hb * kStep2Block + lane;
   if (h >= kStep2Hidden) return;
 
-  if (lane == 0) {
-    ptx::TmaDesc tma_desc{};
-    ptx::tma_async_load_2d(tma_desc, nullptr, 0, 0);
-    auto tmem_h = ptx::tmem_alloc(0);
-    ptx::Tcgen05MmaDesc mma_desc{};
-    ptx::tcgen05_mma_f8(mma_desc);
-    ptx::tmem_dealloc(tmem_h);
-  }
+  // NOTE(B200): placeholder TMA/TMEM/tcgen probes are intentionally removed here.
+  // These calls can stall if issued without a fully valid descriptor/barrier contract.
 
   const int intermediate_blocks = kStep2Intermediate / kStep2Block;
   const int tok = permuted_tok_e[row];
@@ -132,16 +126,6 @@ __global__ void step2_gemm2_scatter_all_experts_direct_kernel(
 
     float acc4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int ib = 0; ib < intermediate_blocks; ++ib) {
-      if (lane == 0) {
-        // TODO(B200): Replace with real Step2 TMA/tcgen05 staging sequence.
-        ptx::TmaDesc tma_desc{};
-        ptx::tma_async_load_2d(tma_desc, nullptr, hb, ib);
-        auto tmem_h = ptx::tmem_alloc(0);
-        ptx::Tcgen05MmaDesc mma_desc{};
-        ptx::tcgen05_mma_f8(mma_desc);
-        ptx::tmem_dealloc(tmem_h);
-      }
-
       const float scale = s2_e[hb * intermediate_blocks + ib];
       const int i0 = ib * kStep2Block;
       float raw4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
