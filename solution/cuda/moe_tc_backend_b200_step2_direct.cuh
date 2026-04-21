@@ -40,7 +40,7 @@ __device__ __forceinline__ bool TryTmaLoad128x1Step2(void* smem_dst, const void*
     uint32_t dst_ptr = SmemPtrStep2(smem_dst);
     uint32_t bar_ptr = SmemPtrStep2(smem_barrier);
     asm volatile("mbarrier.init.shared.b64 [%0], %1;" : : "r"(bar_ptr), "r"(1) : "memory");
-    asm volatile("mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;"
+    asm volatile("mbarrier.expect_tx.shared::cta.b64 [%0], %1;"
                  : : "r"(bar_ptr), "r"(kStep2Block) : "memory");
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::1 "

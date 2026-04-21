@@ -384,10 +384,12 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
                   kNumLocalExperts * sizeof(int), cudaMemcpyDeviceToHost, stream);
   cudaMemcpyAsync(expert_offsets_host.data(), expert_offsets_dev,
                   (kNumLocalExperts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
-  cudaStreamSynchronize(stream);
+  cudaError_t meta_sync = cudaStreamSynchronize(stream);
+  TVM_FFI_ICHECK_EQ(meta_sync, cudaSuccess)
+      << "grouped-metadata sync failed before direct backend launch: "
+      << cudaGetErrorString(meta_sync);
 
   const int total_routed = expert_offsets_host[kNumLocalExperts];
-  bool used_direct_step1 = false;
 
   if (gemm_mod.IsB200DirectEnabled() && total_routed > 0) {
     ws.ensure_routed_step1(total_routed);
@@ -397,37 +399,15 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
         expert_offsets_dev, permuted_token_ids_dev,
         static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
         static_cast<const float*>(gemm1_weights_scale.data_ptr()), ws.c_perm_all_dev, stream);
-    if (st1 == cudaSuccess) {
-      used_direct_step1 = true;
-    } else {
-      std::fprintf(stderr,
-                   "[moe] direct Step1(all experts) failed (%d), fallback to legacy per-expert path\n",
-                   static_cast<int>(st1));
-      cudaGetLastError();
-    }
-  }
+    TVM_FFI_ICHECK_EQ(st1, cudaSuccess)
+        << "direct Step1(all experts) launch failed: " << cudaGetErrorString(st1);
 
-  if (used_direct_step1) {
     cudaError_t st2 = gemm_mod.RunStep2AllExpertsDirect(
         ws.c_perm_all_dev, expert_counts_dev, expert_offsets_dev, permuted_token_ids_dev,
         permuted_weights_dev, static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
         static_cast<const float*>(gemm2_weights_scale.data_ptr()), out_acc_dev, stream);
-    if (st2 != cudaSuccess) {
-      std::fprintf(stderr,
-                   "[moe] direct Step2(all experts) failed (%d), fallback to per-expert Step2\n",
-                   static_cast<int>(st2));
-      cudaGetLastError();
-      for (int le = 0; le < kNumLocalExperts; ++le) {
-        int n_rows = expert_counts_host[le];
-        if (n_rows == 0) continue;
-        int start = expert_offsets_host[le];
-        const float* c_perm_e = ws.c_perm_all_dev + static_cast<int64_t>(start) * kIntermediate;
-        gemm_mod.RunStep2PermutedOnly(
-            c_perm_e, n_rows, permuted_token_ids_dev + start, permuted_weights_dev + start, le,
-            static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
-            static_cast<const float*>(gemm2_weights_scale.data_ptr()), out_acc_dev, stream);
-      }
-    }
+    TVM_FFI_ICHECK_EQ(st2, cudaSuccess)
+        << "direct Step2(all experts) launch failed: " << cudaGetErrorString(st2);
   } else {
     for (int le = 0; le < kNumLocalExperts; ++le) {
       int n_rows = expert_counts_host[le];

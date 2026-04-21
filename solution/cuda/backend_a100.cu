@@ -23,6 +23,12 @@ inline void CheckCu(CUresult status, const char* where) {
   throw std::runtime_error(std::string(where) + ": " + msg);
 }
 
+inline std::string CudaErrMsg(cudaError_t st) {
+  const char* s = cudaGetErrorString(st);
+  if (s == nullptr) s = "unknown cudaError_t";
+  return s;
+}
+
 template <typename T>
 inline CUtensorMapDataType GetTensorMapType();
 
@@ -54,15 +60,23 @@ inline CUtensorMap EncodeTensorMap2D(T* base, uint64_t dim0, uint64_t dim1, uint
 }
 
 inline void UploadTensorMap(const CUtensorMap& map, void** dev_ptr) {
+  // Surface earlier async launch faults immediately. Otherwise they can
+  // appear here as a misleading cudaMemcpy failure.
+  cudaError_t pending = cudaGetLastError();
+  if (pending != cudaSuccess) {
+    throw std::runtime_error(std::string("UploadTensorMap: pending CUDA error before upload: ") +
+                             CudaErrMsg(pending));
+  }
   if (*dev_ptr == nullptr) {
     cudaError_t st = cudaMalloc(dev_ptr, sizeof(CUtensorMap));
     if (st != cudaSuccess) {
-      throw std::runtime_error("cudaMalloc failed for CUtensorMap upload");
+      throw std::runtime_error(std::string("UploadTensorMap: cudaMalloc failed: ") + CudaErrMsg(st));
     }
   }
   cudaError_t st = cudaMemcpy(*dev_ptr, &map, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
   if (st != cudaSuccess) {
-    throw std::runtime_error("cudaMemcpy failed for CUtensorMap upload");
+    throw std::runtime_error(std::string("UploadTensorMap: cudaMemcpy(H2D) failed: ") +
+                             CudaErrMsg(st));
   }
 }
 
