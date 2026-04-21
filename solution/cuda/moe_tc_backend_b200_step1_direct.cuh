@@ -1,8 +1,6 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cuda/__ptx/instructions/tcgen05_alloc.h>
-
 #include <cmath>
 #include <cstdint>
 
@@ -97,19 +95,11 @@ __global__ void step1_gemm1_swiglu_direct_kernel(
   if (expert >= kStep1LocalExperts) return;
   if (itile >= (kStep1Intermediate / kStep1Block)) return;
 
-  __shared__ uint32_t tmem_base;
-  cuda::ptx::tcgen05_alloc(cuda::ptx::cta_group_1, &tmem_base, uint32_t(32));
-  cuda::ptx::tcgen05_relinquish_alloc_permit(cuda::ptx::cta_group_1);
-  __syncwarp();
-
   const int hidden_blocks = kStep1Hidden / kStep1Block;
   const int gemm1_out_blocks = (2 * kStep1Intermediate) / kStep1Block;
   const int expert_i_offset = itile * kStep1Block;
   const int t_valid = expert_t_valid[expert];
-  if (t_valid <= 0) {
-    cuda::ptx::tcgen05_dealloc(cuda::ptx::cta_group_1, tmem_base, uint32_t(32));
-    return;
-  }
+  if (t_valid <= 0) return;
   const int row_start = expert_offset[expert];
 
   const size_t w13_expert_elems = static_cast<size_t>(2 * kStep1Intermediate) * kStep1Hidden;
@@ -205,9 +195,6 @@ __global__ void step1_gemm1_swiglu_direct_kernel(
           acc_gate[v] * siluf_device(acc_up[v]);
     }
   }
-
-  __syncwarp();
-  cuda::ptx::tcgen05_dealloc(cuda::ptx::cta_group_1, tmem_base, uint32_t(32));
 }
 
 static inline cudaError_t LaunchStep1DirectAllExperts(

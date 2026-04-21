@@ -1,8 +1,6 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cuda/__ptx/instructions/tcgen05_alloc.h>
-
 #include <cmath>
 #include <cstdint>
 
@@ -143,16 +141,8 @@ __global__ void step2_gemm2_scatter_all_experts_direct_kernel(
   if (expert >= kStep2LocalExperts) return;
   if (hb >= (kStep2Hidden / kStep2Block)) return;
 
-  __shared__ uint32_t tmem_base;
-  cuda::ptx::tcgen05_alloc(cuda::ptx::cta_group_1, &tmem_base, uint32_t(32));
-  cuda::ptx::tcgen05_relinquish_alloc_permit(cuda::ptx::cta_group_1);
-  __syncwarp();
-
   const int t_valid = expert_t_valid[expert];
-  if (t_valid <= 0) {
-    cuda::ptx::tcgen05_dealloc(cuda::ptx::cta_group_1, tmem_base, uint32_t(32));
-    return;
-  }
+  if (t_valid <= 0) return;
   const int row_start = expert_offset[expert];
 
   const int intermediate_blocks = kStep2Intermediate / kStep2Block;
@@ -210,9 +200,6 @@ __global__ void step2_gemm2_scatter_all_experts_direct_kernel(
       atomicAdd(&out_acc_dev[static_cast<int64_t>(tok) * kStep2Hidden + h], tok_w * acc4[v]);
     }
   }
-
-  __syncwarp();
-  cuda::ptx::tcgen05_dealloc(cuda::ptx::cta_group_1, tmem_base, uint32_t(32));
 }
 
 static inline cudaError_t LaunchStep2DirectAllExperts(
