@@ -42,7 +42,7 @@ __device__ __forceinline__ bool TryTmaLoad128x1Step2(void* smem_dst, const void*
                  : : "r"(bar_ptr), "r"(kStep2Block) : "memory");
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes.cta_group::1 "
-        "[%0], [%1, {%2, %3}], [%4];"
+        "[%0], [%1, {%3, %2}], [%4];"
         :
         : "r"(dst_ptr), "l"(tensor_map), "r"(coord_x), "r"(coord_y), "r"(bar_ptr)
         : "memory");
