@@ -571,10 +571,14 @@ cudaError_t DeviceMxfpGemmModule::RunStep1AllExpertsDirect(const uint8_t* hidden
   UploadTensorMap(hidden_tmap, &step1_hidden_tma_desc_dev_);
   UploadTensorMap(w13_tmap, &step1_w13_tma_desc_dev_);
 
-  return b200::direct::LaunchStep1DirectAllExperts(hidden_fp8_dev, hidden_scale_dev, t,
-                                                   expert_t_valid, expert_offset, valid_token_idx,
-                                                   gemm1_w_dev, gemm1_s_dev, step1_hidden_tma_desc_dev_,
-                                                   step1_w13_tma_desc_dev_, c_perm_all_dev, stream);
+  cudaError_t st = b200::direct::LaunchStep1DirectAllExperts(
+      hidden_fp8_dev, hidden_scale_dev, t, expert_t_valid, expert_offset, valid_token_idx,
+      gemm1_w_dev, gemm1_s_dev, step1_hidden_tma_desc_dev_, step1_w13_tma_desc_dev_,
+      c_perm_all_dev, stream);
+  if (st != cudaSuccess) return st;
+  // Debug/stability guard: force surfacing async kernel faults at Step1 boundary
+  // so they are not misattributed to later descriptor uploads.
+  return cudaStreamSynchronize(stream);
 }
 
 void DeviceMxfpGemmModule::RunStep2PermutedOnly(const float* c_perm_e, int n_rows,
@@ -612,10 +616,11 @@ cudaError_t DeviceMxfpGemmModule::RunStep2AllExpertsDirect(const float* c_perm_a
                                           intermediate_, b200::direct::kStep2Block, 1);
   UploadTensorMap(w2_tmap, &step2_w2_tma_desc_dev_);
 
-  return b200::direct::LaunchStep2DirectAllExperts(c_perm_all_dev, expert_t_valid, expert_offset,
-                                                   valid_token_idx, valid_token_w, gemm2_w_dev,
-                                                   gemm2_s_dev, step2_w2_tma_desc_dev_, out_acc_dev,
-                                                   stream);
+  cudaError_t st = b200::direct::LaunchStep2DirectAllExperts(
+      c_perm_all_dev, expert_t_valid, expert_offset, valid_token_idx, valid_token_w, gemm2_w_dev,
+      gemm2_s_dev, step2_w2_tma_desc_dev_, out_acc_dev, stream);
+  if (st != cudaSuccess) return st;
+  return cudaStreamSynchronize(stream);
 }
 
 bool DeviceMxfpGemmModule::IsB200DirectEnabled() const { return b200_direct_enabled_; }
