@@ -162,7 +162,7 @@ __global__ void step2_gemm2_scatter_all_experts_direct_kernel(
   const float* s2_e = s2_all_dev + static_cast<size_t>(expert) * s2_expert_elems;
 
   alignas(16) __shared__ uint8_t s_w[4][kStep2Block];
-  alignas(16) __shared__ uint64_t bar_w[4];
+  alignas(16) __shared__ uint64_t bar_w;
 
   for (int row_local = 0; row_local < t_valid; ++row_local) {
     const int slot = row_start + row_local;
@@ -180,7 +180,7 @@ __global__ void step2_gemm2_scatter_all_experts_direct_kernel(
       for (int v = 0; v < 4; ++v) {
         const int h = hb * kStep2Block + lane + v * 32;
         const int w_row_global = expert * kStep2Hidden + h;
-        tma_w_ok[v] = TryTmaLoad128x1Step2(s_w[v], w2_tma_desc, i0, w_row_global, &bar_w[v]);
+        tma_w_ok[v] = TryTmaLoad128x1Step2(s_w[v], w2_tma_desc, i0, w_row_global, &bar_w);
         if (!tma_w_ok[v]) {
           for (int uu = lane; uu < kStep2Block; uu += 32) {
             s_w[v][uu] = w2_e[static_cast<int64_t>(h) * kStep2Intermediate + (i0 + uu)];

@@ -124,8 +124,7 @@ __global__ void step1_gemm1_swiglu_direct_kernel(
   alignas(16) __shared__ uint8_t s_w_gate[4][kStep1Block];
   alignas(16) __shared__ uint8_t s_w_up[4][kStep1Block];
   alignas(16) __shared__ uint64_t bar_a;
-  alignas(16) __shared__ uint64_t bar_w_gate[4];
-  alignas(16) __shared__ uint64_t bar_w_up[4];
+  alignas(16) __shared__ uint64_t bar_w;
 
   for (int row_local = 0; row_local < t_valid; ++row_local) {
     const int slot = row_start + row_local;
@@ -151,8 +150,8 @@ __global__ void step1_gemm1_swiglu_direct_kernel(
         const int j_up = j_gate + kStep1Intermediate;
         const int j_gate_global = expert * (2 * kStep1Intermediate) + j_gate;
         const int j_up_global = j_gate_global + kStep1Intermediate;
-        tma_wg_ok[v] = TryTmaLoad128x1(s_w_gate[v], w13_tma_desc, h0, j_gate_global, &bar_w_gate[v]);
-        tma_wu_ok[v] = TryTmaLoad128x1(s_w_up[v], w13_tma_desc, h0, j_up_global, &bar_w_up[v]);
+        tma_wg_ok[v] = TryTmaLoad128x1(s_w_gate[v], w13_tma_desc, h0, j_gate_global, &bar_w);
+        tma_wu_ok[v] = TryTmaLoad128x1(s_w_up[v], w13_tma_desc, h0, j_up_global, &bar_w);
       }
 
       if (!tma_a_ok) {
