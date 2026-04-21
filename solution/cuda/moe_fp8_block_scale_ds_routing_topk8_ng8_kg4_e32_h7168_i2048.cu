@@ -1,7 +1,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include "backend_a100.h"
+#include "reference_backend.h"
 
 #include <algorithm>
 #include <chrono>
@@ -21,6 +21,12 @@
 using tvm::ffi::TensorView;
 
 namespace {
+
+bool UseDirectImplementation() {
+  const char* impl = std::getenv("FIB_MOE_IMPL");
+  if (impl == nullptr) return false;
+  return std::strcmp(impl, "direct") == 0;
+}
 
 constexpr int kNumExperts = 256;
 constexpr int kNumLocalExperts = 32;
@@ -316,8 +322,7 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   // runs. Opt in with FIB_MOE_PROFILE=1 (any non-empty value) when A/B testing.
   const bool kProfile = std::getenv("FIB_MOE_PROFILE") != nullptr;
 
-  // B200 branch policy: grouped/permuted path is always on.
-  static mxfp::DeviceMxfpGemmModule gemm_mod(kHidden, kIntermediate, kBlock);
+  static reference_backend::ReferenceGemmModule gemm_mod(kHidden, kIntermediate, kBlock);
 
   const auto t0_total =
       kProfile ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
@@ -391,7 +396,7 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
 
   const int total_routed = expert_offsets_host[kNumLocalExperts];
 
-  if (gemm_mod.IsB200DirectEnabled() && total_routed > 0) {
+  if (UseDirectImplementation() && total_routed > 0) {
     ws.ensure_routed_step1(total_routed);
     cudaError_t st1 = gemm_mod.RunStep1AllExpertsDirect(
         static_cast<const uint8_t*>(hidden_states.data_ptr()),
