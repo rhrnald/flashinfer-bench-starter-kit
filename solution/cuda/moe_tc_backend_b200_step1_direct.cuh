@@ -36,6 +36,13 @@ __device__ __forceinline__ uint32_t SmemPtr(const void* ptr) {
 __device__ __forceinline__ bool TryTmaLoad128x1(void* smem_dst, const void* tensor_map,
                                                  int32_t coord_x, int32_t coord_y,
                                                  uint64_t* smem_barrier) {
+  (void)smem_dst;
+  (void)tensor_map;
+  (void)coord_x;
+  (void)coord_y;
+  (void)smem_barrier;
+  return false;
+#if 0
   if (threadIdx.x == 0) {
     uint32_t dst_ptr = SmemPtr(smem_dst);
     uint32_t bar_ptr = SmemPtr(smem_barrier);
@@ -72,6 +79,7 @@ __device__ __forceinline__ bool TryTmaLoad128x1(void* smem_dst, const void* tens
   }
   ready = __shfl_sync(0xffffffffu, ready, 0);
   return ready != 0;
+#endif
 }
 
 // Step1 direct path with expert-parallel fixed tiling:

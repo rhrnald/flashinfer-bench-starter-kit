@@ -34,6 +34,13 @@ __device__ __forceinline__ uint32_t SmemPtrStep2(const void* ptr) {
 __device__ __forceinline__ bool TryTmaLoad128x1Step2(void* smem_dst, const void* tensor_map,
                                                       int32_t coord_x, int32_t coord_y,
                                                       uint64_t* smem_barrier) {
+  (void)smem_dst;
+  (void)tensor_map;
+  (void)coord_x;
+  (void)coord_y;
+  (void)smem_barrier;
+  return false;
+#if 0
   if (threadIdx.x == 0) {
     uint32_t dst_ptr = SmemPtrStep2(smem_dst);
     uint32_t bar_ptr = SmemPtrStep2(smem_barrier);
@@ -70,6 +77,7 @@ __device__ __forceinline__ bool TryTmaLoad128x1Step2(void* smem_dst, const void*
   }
   ready = __shfl_sync(0xffffffffu, ready, 0);
   return ready != 0;
+#endif
 }
 
 // Step2 direct path for a single expert slice (legacy path kept for call-site compatibility).
