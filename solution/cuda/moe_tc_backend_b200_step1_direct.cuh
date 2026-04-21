@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cmath>
 #include <cstdint>
 
@@ -129,8 +130,10 @@ __global__ void step1_gemm1_swiglu_direct_kernel(
     const int tok = valid_token_idx[slot];
     const uint8_t* a_row = hidden_fp8_dev + static_cast<int64_t>(tok) * kStep1Hidden;
 
-    float acc_gate[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float acc_up[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    __half acc_gate[4] = {__float2half(0.0f), __float2half(0.0f), __float2half(0.0f),
+                          __float2half(0.0f)};
+    __half acc_up[4] = {__float2half(0.0f), __float2half(0.0f), __float2half(0.0f),
+                        __float2half(0.0f)};
 
     for (int hb = 0; hb < hidden_blocks; ++hb) {
       const int h0 = hb * kStep1Block;
@@ -191,8 +194,8 @@ __global__ void step1_gemm1_swiglu_direct_kernel(
 
 #pragma unroll
       for (int v = 0; v < 4; ++v) {
-        acc_gate[v] += raw_gate[v] * scale_gate;
-        acc_up[v] += raw_up[v] * scale_up;
+        acc_gate[v] = __hadd(acc_gate[v], __float2half(raw_gate[v] * scale_gate));
+        acc_up[v] = __hadd(acc_up[v], __float2half(raw_up[v] * scale_up));
       }
     }
 
@@ -200,7 +203,7 @@ __global__ void step1_gemm1_swiglu_direct_kernel(
     for (int v = 0; v < 4; ++v) {
       const int col = lane + v * 32;
       c_perm_all_dev[static_cast<int64_t>(slot) * kStep1Intermediate + expert_i_offset + col] =
-          acc_gate[v] * siluf_device(acc_up[v]);
+          __half2float(acc_gate[v]) * siluf_device(__half2float(acc_up[v]));
     }
   }
 }
