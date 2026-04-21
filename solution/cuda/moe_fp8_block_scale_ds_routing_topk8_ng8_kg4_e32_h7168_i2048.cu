@@ -395,10 +395,15 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
     ws.ensure_routed_step1(total_routed);
     cudaError_t st1 = gemm_mod.RunStep1AllExpertsDirect(
         static_cast<const uint8_t*>(hidden_states.data_ptr()),
-        static_cast<const float*>(hidden_states_scale.data_ptr()), t, expert_counts_dev,
-        expert_offsets_dev, permuted_token_ids_dev,
+        static_cast<const float*>(hidden_states_scale.data_ptr()),
+        t,
+        expert_counts_dev,
+        expert_offsets_dev,
+        permuted_token_ids_dev,
         static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
-        static_cast<const float*>(gemm1_weights_scale.data_ptr()), ws.c_perm_all_dev, stream);
+        static_cast<const float*>(gemm1_weights_scale.data_ptr()),
+        ws.c_perm_all_dev,
+        stream);
     TVM_FFI_ICHECK_EQ(st1, cudaSuccess)
         << "direct Step1(all experts) launch failed: " << cudaGetErrorString(st1);
 

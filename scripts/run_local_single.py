@@ -290,6 +290,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workload-indexes", type=str, default="", help="Comma-separated 0-based workload indexes")
     p.add_argument("--rtol", type=float, default=1e-2)
     p.add_argument("--atol", type=float, default=1e-2)
+    p.add_argument("--required-matched-ratio", type=float, default=None)
     return p.parse_args()
 
 
@@ -311,6 +312,11 @@ def main():
         num_trials=args.num_trials,
         rtol=float(args.rtol),
         atol=float(args.atol),
+        required_matched_ratio=(
+            float(args.required_matched_ratio)
+            if args.required_matched_ratio is not None
+            else None
+        ),
     )
 
     print(
