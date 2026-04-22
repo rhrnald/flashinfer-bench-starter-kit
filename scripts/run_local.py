@@ -4,6 +4,7 @@ FlashInfer-Bench Local Benchmark Runner.
 Automatically packs the solution from source files and runs benchmarks locally.
 """
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -145,8 +146,23 @@ def print_results(results: dict):
             print()
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Local benchmark runner")
+    parser.add_argument(
+        "--impl",
+        choices=("reference", "direct"),
+        default="reference",
+        help="MoE expert implementation to run",
+    )
+    return parser.parse_args()
+
+
 def main():
     """Pack solution and run benchmark."""
+    args = parse_args()
+    os.environ["FIB_MOE_IMPL"] = args.impl
+    print(f"Selected implementation: {args.impl}")
+
     print("Packing solution from source files...")
     solution_path = pack_solution()
 

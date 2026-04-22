@@ -4,16 +4,16 @@
 
 #include <cstdint>
 
-namespace mxfp {
+namespace reference_backend {
 
 // Device implementation for end-to-end GPU execution.
-class DeviceMxfpGemmModule {
+class ReferenceGemmModule {
  public:
-  DeviceMxfpGemmModule(int hidden, int intermediate, int block);
-  ~DeviceMxfpGemmModule();
+  ReferenceGemmModule(int hidden, int intermediate, int block);
+  ~ReferenceGemmModule();
 
-  DeviceMxfpGemmModule(const DeviceMxfpGemmModule&) = delete;
-  DeviceMxfpGemmModule& operator=(const DeviceMxfpGemmModule&) = delete;
+  ReferenceGemmModule(const ReferenceGemmModule&) = delete;
+  ReferenceGemmModule& operator=(const ReferenceGemmModule&) = delete;
 
   void EnsureWorkspace(int64_t t, cudaStream_t stream);
   void RunExpert(const float* a_dev, int64_t t, const float* local_weight_dev, int local_expert_idx,
@@ -65,8 +65,6 @@ class DeviceMxfpGemmModule {
                                        float* out_acc_dev,
                                        cudaStream_t stream) const;
 
-  bool IsB200DirectEnabled() const;
-
  private:
   int hidden_;
   int intermediate_;
@@ -80,7 +78,6 @@ class DeviceMxfpGemmModule {
   bool emulate_fp16_operands_;
   bool emulate_acc_half_;
   bool quantize_scale_e8m0_;
-  bool b200_direct_enabled_;
   mutable void* step1_hidden_tma_desc_dev_;
   mutable void* step1_w13_tma_desc_dev_;
   mutable void* step2_w2_tma_desc_dev_;
@@ -88,4 +85,4 @@ class DeviceMxfpGemmModule {
   float* c_dev_;
 };
 
-}  // namespace mxfp
+}  // namespace reference_backend

@@ -282,6 +282,12 @@ def print_results(results: dict):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Single-process local benchmark runner")
+    p.add_argument(
+        "--impl",
+        choices=("reference", "direct"),
+        default="reference",
+        help="MoE expert implementation to run",
+    )
     p.add_argument("--warmup-runs", type=int, default=1)
     p.add_argument("--iterations", type=int, default=3)
     p.add_argument("--num-trials", type=int, default=1)
@@ -296,6 +302,8 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+    os.environ["FIB_MOE_IMPL"] = args.impl
+    print(f"Selected implementation: {args.impl}")
 
     print("Packing solution from source files...")
     solution_path = pack_solution()

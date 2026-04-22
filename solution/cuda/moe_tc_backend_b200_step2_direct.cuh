@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstdint>
 
-namespace mxfp::b200::direct {
+namespace direct_backend {
 
 static constexpr int kStep2Hidden = 7168;
 static constexpr int kStep2Intermediate = 2048;
@@ -222,4 +222,4 @@ static inline cudaError_t LaunchStep2DirectAllExperts(
   return cudaGetLastError();
 }
 
-}  // namespace mxfp::b200::direct
+}  // namespace direct_backend

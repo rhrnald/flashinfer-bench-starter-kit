@@ -1,4 +1,4 @@
-#include "backend_a100.h"
+#include "reference_backend.h"
 #include "moe_tc_backend_b200_step1_direct.cuh"
 #include "moe_tc_backend_b200_step2_direct.cuh"
 
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace mxfp {
+namespace reference_backend {
 
 namespace {
 
@@ -420,7 +420,7 @@ __global__ void gemm2_acc_kernel(const float* __restrict__ c, int64_t t, int hid
 
 }  // namespace
 
-DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int block)
+ReferenceGemmModule::ReferenceGemmModule(int hidden, int intermediate, int block)
     : hidden_(hidden),
       intermediate_(intermediate),
       block_(block),
@@ -433,7 +433,6 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
       emulate_fp16_operands_(false),
       emulate_acc_half_(false),
       quantize_scale_e8m0_(false),
-      b200_direct_enabled_(true),
       step1_hidden_tma_desc_dev_(nullptr),
       step1_w13_tma_desc_dev_(nullptr),
       step2_w2_tma_desc_dev_(nullptr),
@@ -444,7 +443,7 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
   std::fflush(stderr);
 }
 
-DeviceMxfpGemmModule::~DeviceMxfpGemmModule() {
+ReferenceGemmModule::~ReferenceGemmModule() {
   if (g1_dev_ != nullptr) cudaFree(g1_dev_);
   if (c_dev_ != nullptr) cudaFree(c_dev_);
   if (step1_hidden_tma_desc_dev_ != nullptr) cudaFree(step1_hidden_tma_desc_dev_);
@@ -452,7 +451,7 @@ DeviceMxfpGemmModule::~DeviceMxfpGemmModule() {
   if (step2_w2_tma_desc_dev_ != nullptr) cudaFree(step2_w2_tma_desc_dev_);
 }
 
-void DeviceMxfpGemmModule::EnsureWorkspace(int64_t t, cudaStream_t stream) {
+void ReferenceGemmModule::EnsureWorkspace(int64_t t, cudaStream_t stream) {
   (void)stream;
   if (t <= max_t_ && g1_dev_ != nullptr && c_dev_ != nullptr) return;
 
@@ -469,11 +468,11 @@ void DeviceMxfpGemmModule::EnsureWorkspace(int64_t t, cudaStream_t stream) {
   cudaError_t e1 = cudaMalloc(&g1_dev_, static_cast<size_t>(t) * static_cast<size_t>(gemm1_out_) * sizeof(float));
   cudaError_t e2 = cudaMalloc(&c_dev_, static_cast<size_t>(t) * static_cast<size_t>(intermediate_) * sizeof(float));
   if (e1 != cudaSuccess || e2 != cudaSuccess) {
-    throw std::runtime_error("cudaMalloc failed for DeviceMxfpGemmModule workspace");
+    throw std::runtime_error("cudaMalloc failed for ReferenceGemmModule workspace");
   }
 }
 
-void DeviceMxfpGemmModule::RunExpert(const float* a_dev, int64_t t, const float* local_weight_dev,
+void ReferenceGemmModule::RunExpert(const float* a_dev, int64_t t, const float* local_weight_dev,
                                      int local_expert_idx, const uint8_t* gemm1_w_dev,
                                      const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
                                      const float* gemm2_s_dev, float* out_acc_dev,
@@ -510,7 +509,7 @@ void DeviceMxfpGemmModule::RunExpert(const float* a_dev, int64_t t, const float*
                                                 out_acc_dev);
 }
 
-void DeviceMxfpGemmModule::RunExpertPermuted(const uint8_t* hidden_fp8_dev,
+void ReferenceGemmModule::RunExpertPermuted(const uint8_t* hidden_fp8_dev,
                                              const float* hidden_scale_dev, int64_t t, int n_rows,
                                              const int* permuted_tok_e,
                                              const float* permuted_w_e, int local_expert_idx,
@@ -552,7 +551,7 @@ void DeviceMxfpGemmModule::RunExpertPermuted(const uint8_t* hidden_fp8_dev,
       quantize_scale_e8m0_, out_acc_dev);
 }
 
-cudaError_t DeviceMxfpGemmModule::RunStep1AllExpertsDirect(const uint8_t* hidden_fp8_dev,
+cudaError_t ReferenceGemmModule::RunStep1AllExpertsDirect(const uint8_t* hidden_fp8_dev,
                                                            const float* hidden_scale_dev, int64_t t,
                                                            const int* expert_t_valid,
                                                            const int* expert_offset,
@@ -563,25 +562,24 @@ cudaError_t DeviceMxfpGemmModule::RunStep1AllExpertsDirect(const uint8_t* hidden
                                                            cudaStream_t stream) const {
   CUtensorMap hidden_tmap =
       EncodeTensorMap2D(const_cast<uint8_t*>(hidden_fp8_dev), hidden_, static_cast<uint64_t>(t), hidden_,
-                        b200::direct::kStep1Block, 1);
-  const uint64_t w13_rows_total = static_cast<uint64_t>(b200::direct::kStep1LocalExperts) *
+                        direct_backend::kStep1Block, 1);
+  const uint64_t w13_rows_total = static_cast<uint64_t>(direct_backend::kStep1LocalExperts) *
                                   static_cast<uint64_t>(2 * intermediate_);
   CUtensorMap w13_tmap = EncodeTensorMap2D(const_cast<uint8_t*>(gemm1_w_dev), hidden_, w13_rows_total,
-                                           hidden_, b200::direct::kStep1Block, 1);
+                                           hidden_, direct_backend::kStep1Block, 1);
   UploadTensorMap(hidden_tmap, &step1_hidden_tma_desc_dev_);
   UploadTensorMap(w13_tmap, &step1_w13_tma_desc_dev_);
 
-  cudaError_t st = b200::direct::LaunchStep1DirectAllExperts(
+  cudaError_t st = direct_backend::RunStep1AllExpertsDirect(
       hidden_fp8_dev, hidden_scale_dev, t, expert_t_valid, expert_offset, valid_token_idx,
-      gemm1_w_dev, gemm1_s_dev, step1_hidden_tma_desc_dev_, step1_w13_tma_desc_dev_,
-      c_perm_all_dev, stream);
+      gemm1_w_dev, gemm1_s_dev, c_perm_all_dev, stream);
   if (st != cudaSuccess) return st;
   // Debug/stability guard: force surfacing async kernel faults at Step1 boundary
   // so they are not misattributed to later descriptor uploads.
   return cudaStreamSynchronize(stream);
 }
 
-void DeviceMxfpGemmModule::RunStep2PermutedOnly(const float* c_perm_e, int n_rows,
+void ReferenceGemmModule::RunStep2PermutedOnly(const float* c_perm_e, int n_rows,
                                                 const int* permuted_tok_e,
                                                 const float* permuted_w_e, int local_expert_idx,
                                                 const uint8_t* gemm2_w_dev,
@@ -594,14 +592,14 @@ void DeviceMxfpGemmModule::RunStep2PermutedOnly(const float* c_perm_e, int n_row
   const uint8_t* w2_e = gemm2_w_dev + static_cast<size_t>(local_expert_idx) * w2_elems;
   const float* s2_e = gemm2_s_dev + static_cast<size_t>(local_expert_idx) * w2s_elems;
 
-  cudaError_t st2 = b200::direct::LaunchStep2Direct(c_perm_e, n_rows, permuted_tok_e, permuted_w_e,
-                                                    w2_e, s2_e, out_acc_dev, stream);
+  cudaError_t st2 = direct_backend::LaunchStep2Direct(
+      c_perm_e, n_rows, permuted_tok_e, permuted_w_e, w2_e, s2_e, out_acc_dev, stream);
   if (st2 != cudaSuccess) {
     throw std::runtime_error("direct B200 step2 launch failed");
   }
 }
 
-cudaError_t DeviceMxfpGemmModule::RunStep2AllExpertsDirect(const float* c_perm_all_dev,
+cudaError_t ReferenceGemmModule::RunStep2AllExpertsDirect(const float* c_perm_all_dev,
                                                            const int* expert_t_valid,
                                                            const int* expert_offset,
                                                            const int* valid_token_idx,
@@ -610,19 +608,17 @@ cudaError_t DeviceMxfpGemmModule::RunStep2AllExpertsDirect(const float* c_perm_a
                                                            const float* gemm2_s_dev,
                                                            float* out_acc_dev,
                                                            cudaStream_t stream) const {
-  const uint64_t w2_rows_total = static_cast<uint64_t>(b200::direct::kStep2LocalExperts) *
+  const uint64_t w2_rows_total = static_cast<uint64_t>(direct_backend::kStep2LocalExperts) *
                                  static_cast<uint64_t>(hidden_);
   CUtensorMap w2_tmap = EncodeTensorMap2D(const_cast<uint8_t*>(gemm2_w_dev), intermediate_, w2_rows_total,
-                                          intermediate_, b200::direct::kStep2Block, 1);
+                                          intermediate_, direct_backend::kStep2Block, 1);
   UploadTensorMap(w2_tmap, &step2_w2_tma_desc_dev_);
 
-  cudaError_t st = b200::direct::LaunchStep2DirectAllExperts(
+  cudaError_t st = direct_backend::LaunchStep2DirectAllExperts(
       c_perm_all_dev, expert_t_valid, expert_offset, valid_token_idx, valid_token_w, gemm2_w_dev,
       gemm2_s_dev, step2_w2_tma_desc_dev_, out_acc_dev, stream);
   if (st != cudaSuccess) return st;
   return cudaStreamSynchronize(stream);
 }
 
-bool DeviceMxfpGemmModule::IsB200DirectEnabled() const { return b200_direct_enabled_; }
-
-}  // namespace mxfp
+}  // namespace reference_backend
