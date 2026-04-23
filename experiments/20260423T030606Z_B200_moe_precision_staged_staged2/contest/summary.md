@@ -89,6 +89,14 @@
 | strict_survivors | gemm1_accumulator__f16, gemm1_operands__f16, gemm1_output__f16, gemm2_operands__f16, out_accumulator__bf16, swiglu_input__f16 |
 | pairwise_shortlist | gemm1_operands__f16, gemm1_accumulator__f16, gemm1_output__f16, gemm2_accumulator__bf16, out_accumulator__bf16 |
 
+## Recommendation
+
+- First-pass precision policy: `gemm1_operands -> f16`, `gemm1_accumulator -> f16`, `gemm1_output -> f16`, `gemm2_accumulator -> bf16`.
+- These four form the strongest cumulative stack that stayed safe on all 19 contest workloads.
+- Do not promote `gemm2_operands -> f16` yet; the cumulative frontier fails when it is added.
+- Second-tier reductions that are safe in isolation on the full 19: `out_accumulator -> bf16`, `swiglu_input -> f16`.
+- Selective FP8 is viable with `block` scaling for `hidden_dequant` and `swiglu_output`, but both have weak strict margins and should remain exploratory rather than first-pass defaults.
+
 ## Sampled Results
 
 | candidate | phase | workload | seq_len | matched_contest | matched_strict | max_abs | max_rel | failure |
