@@ -25,6 +25,78 @@ namespace {
 
 inline float siluf_host(float x) { return x / (1.0f + std::exp(-x)); }
 
+enum PrecisionStage {
+  kStageNone = 0,
+  kStageHiddenDequant,
+  kStageGemm1Operands,
+  kStageGemm1Accumulator,
+  kStageGemm1Output,
+  kStageSwigluInput,
+  kStageSwigluOutput,
+  kStageGemm2Operands,
+  kStageGemm2Accumulator,
+  kStageOutAccumulator,
+};
+
+enum PrecisionMode {
+  kModeNone = 0,
+  kModeBf16,
+  kModeF16,
+  kModeFp8,
+};
+
+enum PrecisionScale {
+  kScaleNone = 0,
+  kScaleTensor,
+  kScaleRow,
+  kScaleBlock,
+};
+
+enum PrecisionScope {
+  kScopeStorageCompute = 0,
+  kScopeStorageOnly,
+  kScopeOperandsOnly,
+  kScopeAccumulatorOnly,
+};
+
+inline int parse_precision_stage(const char* env) {
+  if (env == nullptr || env[0] == '\0') return kStageNone;
+  if (std::strcmp(env, "hidden_dequant") == 0) return kStageHiddenDequant;
+  if (std::strcmp(env, "gemm1_operands") == 0) return kStageGemm1Operands;
+  if (std::strcmp(env, "gemm1_accumulator") == 0) return kStageGemm1Accumulator;
+  if (std::strcmp(env, "gemm1_output") == 0) return kStageGemm1Output;
+  if (std::strcmp(env, "swiglu_input") == 0) return kStageSwigluInput;
+  if (std::strcmp(env, "swiglu_output") == 0) return kStageSwigluOutput;
+  if (std::strcmp(env, "gemm2_operands") == 0) return kStageGemm2Operands;
+  if (std::strcmp(env, "gemm2_accumulator") == 0) return kStageGemm2Accumulator;
+  if (std::strcmp(env, "out_accumulator") == 0) return kStageOutAccumulator;
+  return kStageNone;
+}
+
+inline int parse_precision_mode(const char* env) {
+  if (env == nullptr || env[0] == '\0') return kModeNone;
+  if (std::strcmp(env, "bf16") == 0) return kModeBf16;
+  if (std::strcmp(env, "f16") == 0) return kModeF16;
+  if (std::strcmp(env, "fp8") == 0) return kModeFp8;
+  return kModeNone;
+}
+
+inline int parse_precision_scale(const char* env) {
+  if (env == nullptr || env[0] == '\0') return kScaleNone;
+  if (std::strcmp(env, "tensor") == 0) return kScaleTensor;
+  if (std::strcmp(env, "row") == 0) return kScaleRow;
+  if (std::strcmp(env, "block") == 0) return kScaleBlock;
+  return kScaleNone;
+}
+
+inline int parse_precision_scope(const char* env) {
+  if (env == nullptr || env[0] == '\0') return kScopeStorageCompute;
+  if (std::strcmp(env, "storage_only") == 0) return kScopeStorageOnly;
+  if (std::strcmp(env, "operands_only") == 0) return kScopeOperandsOnly;
+  if (std::strcmp(env, "accumulator_only") == 0) return kScopeAccumulatorOnly;
+  return kScopeStorageCompute;
+}
+
 __device__ __forceinline__ float fp8_e4m3fn_to_float_device(uint8_t x) {
   int sign = (x & 0x80) ? -1 : 1;
   int exp = (x >> 3) & 0x0f;
@@ -49,6 +121,13 @@ __device__ __forceinline__ float bf16_to_float_device(uint16_t bits) {
   return __uint_as_float(u32);
 }
 
+__device__ __forceinline__ uint16_t float_to_bf16_rne_device(float x) {
+  uint32_t u32 = __float_as_uint(x);
+  uint32_t lsb = (u32 >> 16) & 1u;
+  uint32_t rounding_bias = 0x7fffu + lsb;
+  return static_cast<uint16_t>((u32 + rounding_bias) >> 16);
+}
+
 __device__ __forceinline__ float f16_to_float_device(uint16_t bits) {
   union {
     uint16_t u;
@@ -56,6 +135,14 @@ __device__ __forceinline__ float f16_to_float_device(uint16_t bits) {
   } v;
   v.u = bits;
   return __half2float(v.h);
+}
+
+__device__ __forceinline__ float round_bf16_device(float x) {
+  return bf16_to_float_device(float_to_bf16_rne_device(x));
+}
+
+__device__ __forceinline__ float round_f16_device(float x) {
+  return __half2float(__float2half(x));
 }
 
 __device__ __forceinline__ uint8_t float_to_e4m3_device(float x) {
@@ -97,11 +184,19 @@ __device__ __forceinline__ float quantize_e4m3fn_like(float x) {
   return sign * qmf * base;
 }
 
+__device__ __forceinline__ float apply_precision_mode_device(float x, int mode) {
+  if (mode == kModeBf16) return round_bf16_device(x);
+  if (mode == kModeF16) return round_f16_device(x);
+  if (mode == kModeFp8) return quantize_e4m3fn_like(x);
+  return x;
+}
+
 __global__ void gemm1_kernel(const float* __restrict__ a, int64_t t, int hidden, int gemm1_out,
                              int block, int hidden_blocks, int local_expert_idx,
                              const float* __restrict__ local_weight, const uint8_t* __restrict__ w13,
                              const float* __restrict__ s13, bool emulate_fp8_unit,
                              bool emulate_fp16_operands, bool emulate_acc_half,
+                             int precision_stage, int precision_mode,
                              float* __restrict__ g1) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t total = t * gemm1_out;
@@ -129,6 +224,10 @@ __global__ void gemm1_kernel(const float* __restrict__ a, int64_t t, int hidden,
       int h = h0 + u;
       float wv_raw = fp8_e4m3fn_to_float_device(w_row[h]);
       float av = a_row[h];
+      if (precision_stage == kStageGemm1Operands) {
+        av = apply_precision_mode_device(av, precision_mode);
+        wv_raw = apply_precision_mode_device(wv_raw, precision_mode);
+      }
       if (emulate_fp8_unit) {
         av = quantize_e4m3fn_like(av);
         wv_raw = quantize_e4m3fn_like(wv_raw);
@@ -149,14 +248,22 @@ __global__ void gemm1_kernel(const float* __restrict__ a, int64_t t, int hidden,
       acc_h = __hadd(acc_h, __float2half(block_val));
     } else {
       acc += block_val;
+      if (precision_stage == kStageGemm1Accumulator) {
+        acc = apply_precision_mode_device(acc, precision_mode);
+      }
     }
   }
-  g1[idx] = emulate_acc_half ? __half2float(acc_h) : acc;
+  float out = emulate_acc_half ? __half2float(acc_h) : acc;
+  if (precision_stage == kStageGemm1Output) {
+    out = apply_precision_mode_device(out, precision_mode);
+  }
+  g1[idx] = out;
 }
 
 __global__ void swiglu_kernel(const float* __restrict__ g1, int64_t t, int intermediate,
                               int local_expert_idx, const float* __restrict__ local_weight,
-                              bool emulate_fp8_unit, float* __restrict__ c) {
+                              bool emulate_fp8_unit, int precision_stage,
+                              int precision_mode, float* __restrict__ c) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t total = t * intermediate;
   if (idx >= total) return;
@@ -172,9 +279,16 @@ __global__ void swiglu_kernel(const float* __restrict__ g1, int64_t t, int inter
   const float* g1_row = g1 + tok * (2 * intermediate);
   float x1 = g1_row[i];
   float x2 = g1_row[i + intermediate];
+  if (precision_stage == kStageSwigluInput) {
+    x1 = apply_precision_mode_device(x1, precision_mode);
+    x2 = apply_precision_mode_device(x2, precision_mode);
+  }
   float y = x1 * siluf_device(x2);
   // Keep FP32 activation path in TC-like emulation mode.
   (void)emulate_fp8_unit;
+  if (precision_stage == kStageSwigluOutput) {
+    y = apply_precision_mode_device(y, precision_mode);
+  }
   c[idx] = y;
 }
 
@@ -187,6 +301,7 @@ __global__ void gemm1_permuted_kernel(const float* __restrict__ a, int hidden, i
                                       const uint8_t* __restrict__ w13,
                                       const float* __restrict__ s13, bool emulate_fp8_unit,
                                       bool emulate_fp16_operands, bool emulate_acc_half,
+                                      int precision_stage, int precision_mode,
                                       float* __restrict__ g1_perm) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t total = static_cast<int64_t>(n_rows) * gemm1_out;
@@ -209,6 +324,10 @@ __global__ void gemm1_permuted_kernel(const float* __restrict__ a, int hidden, i
       int h = h0 + u;
       float wv_raw = fp8_e4m3fn_to_float_device(w_row[h]);
       float av = a_row[h];
+      if (precision_stage == kStageGemm1Operands) {
+        av = apply_precision_mode_device(av, precision_mode);
+        wv_raw = apply_precision_mode_device(wv_raw, precision_mode);
+      }
       if (emulate_fp8_unit) {
         av = quantize_e4m3fn_like(av);
         wv_raw = quantize_e4m3fn_like(wv_raw);
@@ -228,14 +347,22 @@ __global__ void gemm1_permuted_kernel(const float* __restrict__ a, int hidden, i
       acc_h = __hadd(acc_h, __float2half(block_val));
     } else {
       acc += block_val;
+      if (precision_stage == kStageGemm1Accumulator) {
+        acc = apply_precision_mode_device(acc, precision_mode);
+      }
     }
   }
-  g1_perm[idx] = emulate_acc_half ? __half2float(acc_h) : acc;
+  float out = emulate_acc_half ? __half2float(acc_h) : acc;
+  if (precision_stage == kStageGemm1Output) {
+    out = apply_precision_mode_device(out, precision_mode);
+  }
+  g1_perm[idx] = out;
 }
 
 // Permuted swiglu: input/output are both compact n_rows-indexed, no masking.
 __global__ void swiglu_permuted_kernel(const float* __restrict__ g1_perm, int intermediate,
-                                       int n_rows, bool emulate_fp8_unit,
+                                       int n_rows, bool emulate_fp8_unit, int precision_stage,
+                                       int precision_mode,
                                        float* __restrict__ c_perm) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t total = static_cast<int64_t>(n_rows) * intermediate;
@@ -245,8 +372,16 @@ __global__ void swiglu_permuted_kernel(const float* __restrict__ g1_perm, int in
   const float* g1_row = g1_perm + static_cast<int64_t>(pr) * (2 * intermediate);
   float x1 = g1_row[i];
   float x2 = g1_row[i + intermediate];
+  if (precision_stage == kStageSwigluInput) {
+    x1 = apply_precision_mode_device(x1, precision_mode);
+    x2 = apply_precision_mode_device(x2, precision_mode);
+  }
   (void)emulate_fp8_unit;  // Activation path stays FP32 in TC-like emulation.
-  c_perm[idx] = x1 * siluf_device(x2);
+  float out = x1 * siluf_device(x2);
+  if (precision_stage == kStageSwigluOutput) {
+    out = apply_precision_mode_device(out, precision_mode);
+  }
+  c_perm[idx] = out;
 }
 
 // Permuted GEMM2 + scatter-accumulate into the global [T, H] out_acc tensor.
@@ -262,6 +397,7 @@ __global__ void gemm2_scatter_accumulate_kernel(const float* __restrict__ c_perm
                                                 const float* __restrict__ s2,
                                                 bool emulate_fp8_unit,
                                                 bool emulate_fp16_operands, bool emulate_acc_half,
+                                                int precision_stage, int precision_mode,
                                                 float* __restrict__ out_acc) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t total = static_cast<int64_t>(n_rows) * hidden;
@@ -285,6 +421,10 @@ __global__ void gemm2_scatter_accumulate_kernel(const float* __restrict__ c_perm
       int i = i0 + u;
       float wv_raw = fp8_e4m3fn_to_float_device(w_row[i]);
       float cv = c_row[i];
+      if (precision_stage == kStageGemm2Operands) {
+        cv = apply_precision_mode_device(cv, precision_mode);
+        wv_raw = apply_precision_mode_device(wv_raw, precision_mode);
+      }
       if (emulate_fp8_unit) {
         cv = quantize_e4m3fn_like(cv);
         wv_raw = quantize_e4m3fn_like(wv_raw);
@@ -304,10 +444,17 @@ __global__ void gemm2_scatter_accumulate_kernel(const float* __restrict__ c_perm
       acc_h = __hadd(acc_h, __float2half(block_val));
     } else {
       acc += block_val;
+      if (precision_stage == kStageGemm2Accumulator) {
+        acc = apply_precision_mode_device(acc, precision_mode);
+      }
     }
   }
   acc = emulate_acc_half ? __half2float(acc_h) : acc;
-  out_acc[static_cast<int64_t>(tok) * hidden + h] += w_tok * acc;
+  float out = out_acc[static_cast<int64_t>(tok) * hidden + h] + w_tok * acc;
+  if (precision_stage == kStageOutAccumulator) {
+    out = apply_precision_mode_device(out, precision_mode);
+  }
+  out_acc[static_cast<int64_t>(tok) * hidden + h] = out;
 }
 
 __global__ void gemm2_acc_kernel(const float* __restrict__ c, int64_t t, int hidden, int intermediate,
@@ -315,6 +462,7 @@ __global__ void gemm2_acc_kernel(const float* __restrict__ c, int64_t t, int hid
                                  const float* __restrict__ local_weight, const uint8_t* __restrict__ w2,
                                  const float* __restrict__ s2, bool emulate_fp8_unit,
                                  bool emulate_fp16_operands, bool emulate_acc_half,
+                                 int precision_stage, int precision_mode,
                                  float* __restrict__ out_acc) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t total = t * hidden;
@@ -339,6 +487,10 @@ __global__ void gemm2_acc_kernel(const float* __restrict__ c, int64_t t, int hid
       int i = i0 + u;
       float wv_raw = fp8_e4m3fn_to_float_device(w_row[i]);
       float cv = c_row[i];
+      if (precision_stage == kStageGemm2Operands) {
+        cv = apply_precision_mode_device(cv, precision_mode);
+        wv_raw = apply_precision_mode_device(wv_raw, precision_mode);
+      }
       if (emulate_fp8_unit) {
         cv = quantize_e4m3fn_like(cv);
         wv_raw = quantize_e4m3fn_like(wv_raw);
@@ -359,11 +511,18 @@ __global__ void gemm2_acc_kernel(const float* __restrict__ c, int64_t t, int hid
       acc_h = __hadd(acc_h, __float2half(block_val));
     } else {
       acc += block_val;
+      if (precision_stage == kStageGemm2Accumulator) {
+        acc = apply_precision_mode_device(acc, precision_mode);
+      }
     }
   }
 
   acc = emulate_acc_half ? __half2float(acc_h) : acc;
-  out_acc[idx] += w_tok * acc;
+  float out = out_acc[idx] + w_tok * acc;
+  if (precision_stage == kStageOutAccumulator) {
+    out = apply_precision_mode_device(out, precision_mode);
+  }
+  out_acc[idx] = out;
 }
 
 __global__ void write_single_group_indptr_kernel(int padded_rows, int* __restrict__ indptr) {
@@ -654,6 +813,11 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
       emulate_acc_half_(false),
       tc5090_env_(false),
       tc5090_backend_(nullptr),
+      precision_stage_(kStageNone),
+      precision_mode_(kModeNone),
+      precision_scale_(kScaleNone),
+      precision_scope_(kScopeStorageCompute),
+      precision_enabled_(false),
       g1_dev_(nullptr),
       c_dev_(nullptr),
       tc_max_rows_(0),
@@ -669,12 +833,7 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
       tc_m_indptr_dev_(nullptr),
       tc_int_workspace_dev_(nullptr),
       tc_float_workspace_dev_(nullptr) {
-  const char* env = std::getenv("FIB_EMULATE_FP8_UNIT");
-  emulate_fp8_unit_ = (env != nullptr && env[0] == '1');
-  const char* env_fp16_op = std::getenv("FIB_EMULATE_FP16_OPERANDS");
-  emulate_fp16_operands_ = (env_fp16_op != nullptr && env_fp16_op[0] == '1');
-  const char* env_acc = std::getenv("FIB_EMULATE_FP8_ACC_HALF");
-  emulate_acc_half_ = (env_acc != nullptr && env_acc[0] == '1');
+  RefreshEnvironmentFlags();
   if (emulate_fp8_unit_) {
     std::fprintf(stderr,
                  "[mxfp] FIB_EMULATE_FP8_UNIT=1 (TC-like emulation: FP8-like operands, FP32 accumulate)\n");
@@ -685,31 +844,49 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
   if (emulate_fp16_operands_) {
     std::fprintf(stderr, "[mxfp] FIB_EMULATE_FP16_OPERANDS=1 (fp16*fp16 multiply emulation enabled)\n");
   }
+  if (tc5090_env_ && tc5090_backend_ != nullptr && tc5090_backend_->IsAvailable()) {
+    std::fprintf(stderr, "[mxfp] FIB_MOE_TC5090=1 using backend=%s\n",
+                 tc5090_backend_->BackendName());
+  }
+  if (tc_path_env_) {
+    std::fprintf(stderr, "[mxfp] FIB_MOE_TC=1 requested; FlashInfer/CUTLASS SM100 path %s\n",
+                 SupportsTcPath() ? "available" : "not available at compile time");
+  }
+  if (precision_enabled_) {
+    std::fprintf(stderr,
+                 "[mxfp] precision experiment enabled stage=%d mode=%d scale=%d scope=%d\n",
+                 precision_stage_, precision_mode_, precision_scale_, precision_scope_);
+  }
+  if (emulate_fp8_unit_ || emulate_fp16_operands_ || emulate_acc_half_ || tc5090_env_ ||
+      tc_path_env_ || precision_enabled_) {
+    std::fflush(stderr);
+  }
+}
+
+void DeviceMxfpGemmModule::RefreshEnvironmentFlags() {
+  const char* env = std::getenv("FIB_EMULATE_FP8_UNIT");
+  emulate_fp8_unit_ = (env != nullptr && env[0] == '1');
+  const char* env_fp16_op = std::getenv("FIB_EMULATE_FP16_OPERANDS");
+  emulate_fp16_operands_ = (env_fp16_op != nullptr && env_fp16_op[0] == '1');
+  const char* env_acc = std::getenv("FIB_EMULATE_FP8_ACC_HALF");
+  emulate_acc_half_ = (env_acc != nullptr && env_acc[0] == '1');
   const char* env_tc5090 = std::getenv("FIB_MOE_TC5090");
   tc5090_env_ = (env_tc5090 != nullptr && env_tc5090[0] == '1');
-  if (tc5090_env_) {
+  if (tc5090_env_ && tc5090_backend_ == nullptr) {
     MoeTcBackendConfig cfg = {
         hidden_, intermediate_, block_, hidden_blocks_, intermediate_blocks_, gemm1_out_blocks_};
     tc5090_backend_ = CreateMoeTcBackend5090Temp(cfg);
-    if (tc5090_backend_ != nullptr && tc5090_backend_->IsAvailable()) {
-      std::fprintf(stderr, "[mxfp] FIB_MOE_TC5090=1 using backend=%s\n",
-                   tc5090_backend_->BackendName());
-    } else {
-      std::fprintf(stderr,
-                   "[mxfp] FIB_MOE_TC5090=1 requested but backend unavailable; falling back\n");
+    if (tc5090_backend_ == nullptr || !tc5090_backend_->IsAvailable()) {
       tc5090_backend_.reset();
     }
   }
   const char* env_tc = std::getenv("FIB_MOE_TC");
   tc_path_env_ = (env_tc != nullptr && env_tc[0] == '1');
-  if (tc_path_env_) {
-    std::fprintf(stderr, "[mxfp] FIB_MOE_TC=1 requested; FlashInfer/CUTLASS SM100 path %s\n",
-                 SupportsTcPath() ? "available" : "not available at compile time");
-  }
-  if (emulate_fp8_unit_ || emulate_fp16_operands_ || emulate_acc_half_ || tc5090_env_ ||
-      tc_path_env_) {
-    std::fflush(stderr);
-  }
+  precision_stage_ = parse_precision_stage(std::getenv("FIB_MOE_PREC_STAGE"));
+  precision_mode_ = parse_precision_mode(std::getenv("FIB_MOE_PREC_MODE"));
+  precision_scale_ = parse_precision_scale(std::getenv("FIB_MOE_PREC_SCALE"));
+  precision_scope_ = parse_precision_scope(std::getenv("FIB_MOE_PREC_SCOPE"));
+  precision_enabled_ = (precision_stage_ != kStageNone && precision_mode_ != kModeNone);
 }
 
 DeviceMxfpGemmModule::~DeviceMxfpGemmModule() {
@@ -749,7 +926,8 @@ void DeviceMxfpGemmModule::EnsureWorkspace(int64_t t, cudaStream_t stream) {
   }
 }
 
-bool DeviceMxfpGemmModule::SupportsTcPath() const {
+bool DeviceMxfpGemmModule::SupportsTcPath() {
+  RefreshEnvironmentFlags();
   return tc_path_env_ && FIB_HAS_FLASHINFER_FP8_GROUP_GEMM_SM100;
 }
 
@@ -800,7 +978,8 @@ void DeviceMxfpGemmModule::RunExpert(const float* a_dev, int64_t t, const float*
                                      int local_expert_idx, const uint8_t* gemm1_w_dev,
                                      const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
                                      const float* gemm2_s_dev, float* out_acc_dev,
-                                     cudaStream_t stream) const {
+                                     cudaStream_t stream) {
+  RefreshEnvironmentFlags();
   size_t w13_elems = static_cast<size_t>(gemm1_out_) * static_cast<size_t>(hidden_);
   size_t w13s_elems = static_cast<size_t>(gemm1_out_blocks_) * static_cast<size_t>(hidden_blocks_);
   size_t w2_elems = static_cast<size_t>(hidden_) * static_cast<size_t>(intermediate_);
@@ -821,14 +1000,17 @@ void DeviceMxfpGemmModule::RunExpert(const float* a_dev, int64_t t, const float*
 
   gemm1_kernel<<<b1, kThreads, 0, stream>>>(a_dev, t, hidden_, gemm1_out_, block_, hidden_blocks_,
                                             local_expert_idx, local_weight_dev, w13_e, s13_e,
-                                            emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_, g1_dev_);
+                                            emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_,
+                                            precision_stage_, precision_mode_, g1_dev_);
   swiglu_kernel<<<b2, kThreads, 0, stream>>>(g1_dev_, t, intermediate_, local_expert_idx,
-                                             local_weight_dev, emulate_fp8_unit_, c_dev_);
+                                             local_weight_dev, emulate_fp8_unit_, precision_stage_,
+                                             precision_mode_, c_dev_);
   gemm2_acc_kernel<<<b3, kThreads, 0, stream>>>(c_dev_, t, hidden_, intermediate_, block_,
                                                 intermediate_blocks_, local_expert_idx,
                                                 local_weight_dev, w2_e, s2_e, emulate_fp8_unit_,
                                                 emulate_fp16_operands_,
                                                 emulate_acc_half_,
+                                                precision_stage_, precision_mode_,
                                                 out_acc_dev);
 }
 
@@ -837,7 +1019,8 @@ void DeviceMxfpGemmModule::RunExpertPermuted(const float* a_dev, int64_t /*t*/, 
                                              const float* permuted_w_e, int local_expert_idx,
                                              const uint8_t* gemm1_w_dev, const float* gemm1_s_dev,
                                              const uint8_t* gemm2_w_dev, const float* gemm2_s_dev,
-                                             float* out_acc_dev, cudaStream_t stream) const {
+                                             float* out_acc_dev, cudaStream_t stream) {
+  RefreshEnvironmentFlags();
   // n_rows == T_e (tokens routed to this expert on local rank).
   // If T_e == 0, skip all expert work.
   if (n_rows <= 0) return;
@@ -852,7 +1035,7 @@ void DeviceMxfpGemmModule::RunExpertPermuted(const float* a_dev, int64_t /*t*/, 
   const uint8_t* w2_e = gemm2_w_dev + static_cast<size_t>(local_expert_idx) * w2_elems;
   const float* s2_e = gemm2_s_dev + static_cast<size_t>(local_expert_idx) * w2s_elems;
 
-  if (tc5090_backend_ != nullptr) {
+  if (tc5090_env_ && tc5090_backend_ != nullptr) {
     cudaError_t st1 = tc5090_backend_->RunStep1Fused(a_dev, n_rows, permuted_tok_e, w13_e, s13_e,
                                                      c_dev_, stream);
     if (st1 == cudaSuccess) {
@@ -883,12 +1066,15 @@ void DeviceMxfpGemmModule::RunExpertPermuted(const float* a_dev, int64_t /*t*/, 
 
   gemm1_permuted_kernel<<<b1, kThreads, 0, stream>>>(
       a_dev, hidden_, gemm1_out_, block_, hidden_blocks_, n_rows, permuted_tok_e, w13_e, s13_e,
-      emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_, g1_dev_);
+      emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_, precision_stage_,
+      precision_mode_, g1_dev_);
   swiglu_permuted_kernel<<<b2, kThreads, 0, stream>>>(g1_dev_, intermediate_, n_rows,
-                                                      emulate_fp8_unit_, c_dev_);
+                                                      emulate_fp8_unit_, precision_stage_,
+                                                      precision_mode_, c_dev_);
   gemm2_scatter_accumulate_kernel<<<b3, kThreads, 0, stream>>>(
       c_dev_, hidden_, intermediate_, block_, intermediate_blocks_, n_rows, permuted_tok_e,
       permuted_w_e, w2_e, s2_e, emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_,
+      precision_stage_, precision_mode_,
       out_acc_dev);
 }
 
@@ -901,6 +1087,7 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
                                                const uint8_t* gemm2_w_dev,
                                                const float* gemm2_s_dev,
                                                float* out_acc_dev, cudaStream_t stream) {
+  RefreshEnvironmentFlags();
   // n_rows == T_e (tokens routed to this expert on local rank).
   if (n_rows <= 0) return;
   if (!SupportsTcPath()) {
@@ -986,11 +1173,12 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
     int64_t out_elems = static_cast<int64_t>(n_rows) * hidden_;
     swiglu_permuted_kernel<<<static_cast<int>((c_elems + kThreads - 1) / kThreads),
                               kThreads, 0, stream>>>(
-        g1_dev_, intermediate_, n_rows, false, c_dev_);
+        g1_dev_, intermediate_, n_rows, false, precision_stage_, precision_mode_, c_dev_);
     gemm2_scatter_accumulate_kernel<<<static_cast<int>((out_elems + kThreads - 1) / kThreads),
                                       kThreads, 0, stream>>>(
         c_dev_, hidden_, intermediate_, block_, intermediate_blocks_, n_rows, permuted_tok_e,
         permuted_w_e, w2_e, s2_e, emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_,
+        precision_stage_, precision_mode_,
         out_acc_dev);
     return;
   }

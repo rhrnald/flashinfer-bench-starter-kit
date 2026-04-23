@@ -1,4 +1,5 @@
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include "mxfp_gemm_module.h"
@@ -32,6 +33,32 @@ constexpr int kGroupSize = 32;
 constexpr int kTopKGroups = 4;
 constexpr int kTopK = 8;
 
+enum PrecisionStage {
+  kStageNone = 0,
+  kStageHiddenDequant = 1,
+};
+
+enum PrecisionMode {
+  kModeNone = 0,
+  kModeBf16,
+  kModeF16,
+  kModeFp8,
+};
+
+inline int parse_precision_stage(const char* env) {
+  if (env == nullptr || env[0] == '\0') return kStageNone;
+  if (std::strcmp(env, "hidden_dequant") == 0) return kStageHiddenDequant;
+  return kStageNone;
+}
+
+inline int parse_precision_mode(const char* env) {
+  if (env == nullptr || env[0] == '\0') return kModeNone;
+  if (std::strcmp(env, "bf16") == 0) return kModeBf16;
+  if (std::strcmp(env, "f16") == 0) return kModeF16;
+  if (std::strcmp(env, "fp8") == 0) return kModeFp8;
+  return kModeNone;
+}
+
 inline float bf16_to_float(uint16_t bits) {
   uint32_t u32 = static_cast<uint32_t>(bits) << 16;
   float out;
@@ -64,6 +91,14 @@ __device__ __forceinline__ uint16_t float_to_bf16_rne_device(float x) {
   uint32_t lsb = (u32 >> 16) & 1u;
   uint32_t rounding_bias = 0x7fffu + lsb;
   return static_cast<uint16_t>((u32 + rounding_bias) >> 16);
+}
+
+__device__ __forceinline__ float round_bf16_device(float x) {
+  return bf16_to_float_device(float_to_bf16_rne_device(x));
+}
+
+__device__ __forceinline__ float round_f16_device(float x) {
+  return __half2float(__float2half(x));
 }
 
 __device__ __forceinline__ float sigmoidf_device(float x) {
@@ -170,6 +205,7 @@ __global__ void routing_kernel(const float* __restrict__ logits, const uint16_t*
 
 __global__ void dequant_hidden_kernel(const uint8_t* __restrict__ hidden_fp8,
                                       const float* __restrict__ hidden_scale, int64_t t,
+                                      int precision_stage, int precision_mode,
                                       float* __restrict__ a_out) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t total = t * kHidden;
@@ -180,7 +216,12 @@ __global__ void dequant_hidden_kernel(const uint8_t* __restrict__ hidden_fp8,
   int hb = h / kBlock;
   float scale = hidden_scale[static_cast<int64_t>(hb) * t + tok];
   float v = fp8_e4m3fn_to_float_device(hidden_fp8[idx]);
-  a_out[idx] = v * scale;
+  float out = v * scale;
+  if (precision_stage == kStageHiddenDequant) {
+    if (precision_mode == kModeBf16) out = round_bf16_device(out);
+    if (precision_mode == kModeF16) out = round_f16_device(out);
+  }
+  a_out[idx] = out;
 }
 
 __global__ void f32_to_bf16_kernel(const float* __restrict__ in, int64_t n, uint16_t* __restrict__ out) {
@@ -351,6 +392,8 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   // it's already the default).
   const bool kLegacy = std::getenv("FIB_MOE_LEGACY") != nullptr;
   const bool kGrouped = !kLegacy;
+  const int precision_stage = parse_precision_stage(std::getenv("FIB_MOE_PREC_STAGE"));
+  const int precision_mode = parse_precision_mode(std::getenv("FIB_MOE_PREC_MODE"));
   static mxfp::DeviceMxfpGemmModule gemm_mod(kHidden, kIntermediate, kBlock);
   const bool kTc = kGrouped && gemm_mod.SupportsTcPath();
 
@@ -408,7 +451,8 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
     int dequant_blocks = static_cast<int>((n_hidden + kDequantThreads - 1) / kDequantThreads);
     dequant_hidden_kernel<<<dequant_blocks, kDequantThreads, 0, stream>>>(
         static_cast<const uint8_t*>(hidden_states.data_ptr()),
-        static_cast<const float*>(hidden_states_scale.data_ptr()), t, a_dev);
+        static_cast<const float*>(hidden_states_scale.data_ptr()), t, precision_stage,
+        precision_mode, a_dev);
   }
   if (kProfile) {
     cudaStreamSynchronize(stream);

@@ -70,7 +70,7 @@ class DeviceMxfpGemmModule {
   void EnsureWorkspace(int64_t t, cudaStream_t stream);
   void RunExpert(const float* a_dev, int64_t t, const float* local_weight_dev, int local_expert_idx,
                  const uint8_t* gemm1_w_dev, const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
-                 const float* gemm2_s_dev, float* out_acc_dev, cudaStream_t stream) const;
+                 const float* gemm2_s_dev, float* out_acc_dev, cudaStream_t stream);
 
   // Compact / grouped path: runs the MoE expert over only the tokens that
   // were routed to it. Inputs `permuted_tok_e` and `permuted_w_e` are pointers
@@ -83,9 +83,9 @@ class DeviceMxfpGemmModule {
                          int local_expert_idx, const uint8_t* gemm1_w_dev,
                          const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
                          const float* gemm2_s_dev, float* out_acc_dev,
-                         cudaStream_t stream) const;
+                         cudaStream_t stream);
 
-  bool SupportsTcPath() const;
+  bool SupportsTcPath();
 
   // Experimental Blackwell path: keep the current routing/per-expert loop, but
   // run each expert's two block-scale FP8 GEMMs through FlashInfer/CUTLASS
@@ -99,6 +99,7 @@ class DeviceMxfpGemmModule {
                            float* out_acc_dev, cudaStream_t stream);
 
  private:
+  void RefreshEnvironmentFlags();
   void EnsureTcWorkspace(int rows);
 
   int hidden_;
@@ -114,6 +115,11 @@ class DeviceMxfpGemmModule {
   bool emulate_acc_half_;
   bool tc5090_env_;
   std::unique_ptr<MoeTcBackend> tc5090_backend_;
+  int precision_stage_;
+  int precision_mode_;
+  int precision_scale_;
+  int precision_scope_;
+  bool precision_enabled_;
   float* g1_dev_;
   float* c_dev_;
   int tc_max_rows_;
