@@ -84,10 +84,10 @@ class DeviceMxfpGemmModule {
 
   bool SupportsTcPath() const;
 
-  // Experimental Blackwell path: keep the current routing/per-expert loop, but
-  // run each expert's two block-scale FP8 GEMMs through FlashInfer/CUTLASS
-  // SM100 Tensor Core kernels. This consumes the original hidden FP8 tensor and
-  // scale tensor directly, so GEMM1 avoids the scalar dequantized-FP32 path.
+  // Blackwell/CUTLASS path: keep the current routing/per-expert loop, run
+  // GEMM1 as direct FP8 block-scaled GEMM on compact routed rows, round the
+  // GEMM1 output to fp16 before the fp32 middle ops, then run GEMM2 from
+  // bf16 activations / bf16-dequantized weights.
   void RunExpertPermutedTc(const uint8_t* hidden_fp8_dev, const float* hidden_scale_dev,
                            int64_t t, int n_rows, const int* permuted_tok_e,
                            const float* permuted_w_e, int local_expert_idx,
@@ -112,15 +112,18 @@ class DeviceMxfpGemmModule {
   float* g1_dev_;
   float* c_dev_;
   int tc_max_rows_;
-  bool tc_path_env_;
+  bool tc_path_enabled_;
   uint8_t* tc_a_fp8_dev_;
   uint8_t* tc_b_col_dev_;
   float* tc_a_scale_dev_;
   float* tc_b_scale_dev_;
-  uint16_t* tc_g1_bf16_dev_;
+  float* tc_g1_f32_dev_;
+  uint16_t* tc_g1_f16_dev_;
   uint8_t* tc_c_fp8_dev_;
   float* tc_c_scale_dev_;
-  uint16_t* tc_d_bf16_dev_;
+  uint16_t* tc_c_bf16_dev_;
+  uint16_t* tc_b_bf16_dev_;
+  float* tc_d_f32_dev_;
   int* tc_m_indptr_dev_;
   void* tc_int_workspace_dev_;
   void* tc_float_workspace_dev_;
