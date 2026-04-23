@@ -362,13 +362,14 @@ def _write_outputs(
 
     lines.append("## Cumulative Safe Frontier")
     lines.append("")
-    lines.append("| order | candidate | worst_matched_contest | worst_matched_strict | worst_rel | status |")
-    lines.append("|---|---|---:|---:|---:|---|")
+    lines.append("| order | candidate | worst_matched_contest | worst_matched_strict | worst_rel | status | kept |")
+    lines.append("|---|---|---:|---:|---:|---|---|")
     for i, row in enumerate(frontier, start=1):
+        kept = "yes" if row.get("kept", row.get("status") == "safe") else "no"
         lines.append(
             f"| {i} | {row['candidate']} | {_fmt(row['worst_matched_ratio_contest'], '.6f')} | "
             f"{_fmt(row['worst_matched_ratio_strict'], '.6f')} | "
-            f"{_fmt(row['worst_max_rel'], '.4e')} | {row['status']} |"
+            f"{_fmt(row['worst_max_rel'], '.4e')} | {row['status']} | {kept} |"
         )
     lines.append("")
 
@@ -803,11 +804,10 @@ def _analyze_candidates(
     )
 
     frontier_rows: list[dict] = []
-    combined = _combined_candidates(survivors)
     active: list[Candidate] = []
-    for cand in combined:
-        active.append(cand)
-        cfg = _make_eval_config(active, "cumulative")
+    for cand in _combined_candidates(survivors):
+        trial = active + [cand]
+        cfg = _make_eval_config(trial, "cumulative")
         staged_rows = _evaluate_configs(
             panel_records,
             definition,
@@ -819,9 +819,10 @@ def _analyze_candidates(
         )
         rows.extend(staged_rows)
         agg = _aggregate_configs(staged_rows, [cfg], required_matched_ratio=required_matched_ratio)[cfg.name]
+        agg["kept"] = agg["status"] == "safe"
         frontier_rows.append(agg)
-        if agg["status"] != "safe":
-            break
+        if agg["kept"]:
+            active.append(cand)
 
     stage_summary = _build_stage_summary(candidate_aggs, candidates)
     margin_summary = _build_margin_summary(candidate_aggs, BF16_F16_STAGES)
