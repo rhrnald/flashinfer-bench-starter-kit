@@ -1,0 +1,25 @@
+{
+  "contest_safe_oracle_candidates": [
+    "out_accumulator__fp8__tensor",
+    "out_accumulator__fp8__row",
+    "out_accumulator__fp8__block",
+    "swiglu_output__fp8__block",
+    "swiglu_output__fp8__row",
+    "swiglu_output__fp8__tensor",
+    "gemm1_output__fp8__tensor",
+    "gemm1_output__fp8__row",
+    "gemm1_output__fp8__block",
+    "swiglu_input__fp8__block",
+    "gemm2_operands__fp8__block",
+    "swiglu_input__fp8__tensor",
+    "swiglu_input__fp8__row",
+    "gemm2_operands__fp8__tensor",
+    "gemm2_operands__fp8__row",
+    "hidden_dequant__fp8__block",
+    "hidden_dequant__fp8__row",
+    "hidden_dequant__fp8__tensor"
+  ],
+  "strict_safe_oracle_candidates": [],
+  "kernel_validated_candidates": [],
+  "pairwise_shortlist": []
+}

@@ -6,6 +6,12 @@ evaluates stage-scoped precision reductions one at a time, then cumulatively.
 The search is declarative: candidates are generated from stage/mode/scale/scope
 metadata rather than hardcoded for one hypothesis.
 
+Important:
+    This is oracle-only evidence. It does not validate the real CUDA kernel path.
+    The primary pass/fail gate matches the contest MoE tolerance
+    (`atol=1`, `rtol=0.3`, `required_matched_ratio=0.9`). The stricter
+    `0.01/0.01` metric is reported as a shadow check only.
+
 Usage:
     modal run scripts/probe_moe_precision.py::probe
 """
@@ -46,7 +52,7 @@ TOP_K = 8
 N_GROUP = 8
 TOPK_GROUP = 4
 E_LOCAL = 32
-DEFAULT_PANEL_SIZE = 8
+DEFAULT_PANEL_SIZE = 19
 DEFAULT_ATOL = 1.0
 DEFAULT_RTOL = 0.3
 DEFAULT_REQUIRED_MATCHED_RATIO = 0.9
@@ -86,9 +92,22 @@ DEFAULT_STRESS_CANDIDATES = (
     "gemm2_accumulator__bf16",
 )
 
-DEFAULT_FP8_TARGET_STAGES = ("swiglu_output",)
-OPTIONAL_FP8_TARGET_STAGES = ("hidden_dequant",)
-FP8_PROMOTION_MARGIN = 0.02
+DEFAULT_FP8_TARGET_STAGES = (
+    "hidden_dequant",
+    "gemm1_operands",
+    "gemm1_output",
+    "swiglu_input",
+    "swiglu_output",
+    "gemm2_operands",
+    "gemm2_accumulator",
+    "out_accumulator",
+)
+DEFAULT_PROMOTE_TOP_K_PER_STAGE = 1
+DEFAULT_ENABLE_KERNEL_VALIDATION = True
+DEFAULT_KERNEL_VALIDATION_LIMIT = 5
+EVIDENCE_SCOPE = "oracle_only"
+KERNEL_EVIDENCE_SCOPE = "kernel_validated"
+KERNEL_UNSUPPORTED_SCOPE = "kernel_not_supported"
 
 
 @dataclass(frozen=True)
@@ -157,6 +176,25 @@ def _mode_rank(mode: str) -> int:
     return order.get(mode, 99)
 
 
+def _scale_rank(scale_mode: str) -> int:
+    order = {"none": 0, "tensor": 1, "row": 2, "block": 3}
+    return order.get(scale_mode, -1)
+
+
+def _pipeline_stage_rank(stage: str) -> int:
+    order = {
+        "hidden_dequant": 0,
+        "gemm1_operands": 1,
+        "gemm1_output": 2,
+        "swiglu_input": 3,
+        "swiglu_output": 4,
+        "gemm2_operands": 5,
+        "gemm2_accumulator": 6,
+        "out_accumulator": 7,
+    }
+    return order.get(stage, 999)
+
+
 def _round_tensor(x, mode: str):
     import torch
 
@@ -214,7 +252,10 @@ def _accumulate_blockwise(a, b_t, block_terms: int, acc_mode: str):
     for chunk in chunks:
         acc = acc + chunk
         if acc_mode != "fp32":
-            acc = _round_tensor(acc, acc_mode)
+            if acc_mode in ("bf16", "f16"):
+                acc = _round_tensor(acc, acc_mode)
+            else:
+                acc = _apply_precision(acc, acc_mode, "tensor")
     return acc
 
 
@@ -257,21 +298,40 @@ def _build_fp8_candidates(stages: Iterable[str]) -> list[Candidate]:
     return table
 
 
+def _pick_top_fp8_candidates(
+    candidate_aggs: dict[str, dict],
+    fp8_candidates: list[Candidate],
+    top_k_per_stage: int,
+) -> list[Candidate]:
+    chosen: list[Candidate] = []
+    stages = sorted({cand.stage for cand in fp8_candidates}, key=_pipeline_stage_rank)
+    for stage in stages:
+        stage_cands = []
+        for cand in fp8_candidates:
+            if cand.stage != stage:
+                continue
+            agg = candidate_aggs.get(cand.name)
+            if agg is None or agg["status"] != "safe":
+                continue
+            stage_cands.append((cand, agg))
+        stage_cands.sort(
+            key=lambda item: (
+                item[1]["worst_matched_ratio_contest"],
+                item[1]["worst_matched_ratio_strict"],
+                -item[1]["worst_max_rel"],
+                _scale_rank(item[0].scale_mode),
+            ),
+            reverse=True,
+        )
+        chosen.extend(cand for cand, _ in stage_cands[:top_k_per_stage])
+    return chosen
+
+
 def _combined_candidates(survivors: list[Candidate]) -> list[Candidate]:
-    chosen: dict[str, Candidate] = {}
-    for cand in survivors:
-        if cand.stage in chosen:
-            prev = chosen[cand.stage]
-            cur_key = (_mode_rank(cand.mode), cand.scale_mode)
-            prev_key = (_mode_rank(prev.mode), prev.scale_mode)
-            if cur_key > prev_key:
-                chosen[cand.stage] = cand
-        else:
-            chosen[cand.stage] = cand
     return [
-        chosen[stage]
-        for stage in sorted(chosen.keys())
-        if stage != "baseline"
+        cand
+        for cand in sorted(survivors, key=lambda c: (_pipeline_stage_rank(c.stage), c.name))
+        if cand.stage != "baseline"
     ]
 
 
@@ -332,44 +392,52 @@ def _write_outputs(
         lines.append(f"| {k} | {v} |")
     lines.append("")
 
-    lines.append("## Survivor Summary")
+    lines.append("## Evidence Scope")
+    lines.append("")
+    lines.append("| field | value |")
+    lines.append("|---|---|")
+    lines.append(f"| evidence_scope | {meta.get('evidence_scope', EVIDENCE_SCOPE)} |")
+    lines.append(f"| kernel_validated_candidates | {meta.get('kernel_validated_candidates', '-')} |")
+    lines.append("")
+
+    lines.append("## Oracle Survivor Summary")
     lines.append("")
     lines.append("| category | count | candidates |")
     lines.append("|---|---:|---|")
     lines.append(
-        f"| contest_safe_single_stage | {meta['contest_safe_survivor_count']} | {meta['contest_safe_survivors']} |"
+        f"| contest_safe_oracle_single_stage | {meta['contest_safe_survivor_count']} | {meta['contest_safe_survivors']} |"
     )
     lines.append(
-        f"| strict_safe_single_stage | {meta['strict_safe_survivor_count']} | {meta['strict_safe_survivors']} |"
+        f"| strict_safe_oracle_single_stage | {meta['strict_safe_survivor_count']} | {meta['strict_safe_survivors']} |"
     )
     lines.append(
-        f"| contest_only_single_stage | {meta['contest_only_survivor_count']} | {meta['contest_only_survivors']} |"
+        f"| contest_only_oracle_single_stage | {meta['contest_only_survivor_count']} | {meta['contest_only_survivors']} |"
     )
     lines.append("")
 
     lines.append("## Stage Summary")
     lines.append("")
-    lines.append("| stage | best_safe_mode | scale | worst_matched_contest | worst_matched_strict | worst_rel | status |")
-    lines.append("|---|---|---|---:|---:|---:|---|")
+    lines.append("| stage | best_contest_safe_mode | scale | worst_matched_contest | worst_matched_strict | worst_rel | contest_status | strict_status | evidence |")
+    lines.append("|---|---|---|---:|---:|---:|---|---|---|")
     for row in stage_summary:
         lines.append(
             f"| {row['stage']} | {row['best_safe_mode']} | {row['scale_mode']} | "
             f"{_fmt(row['worst_matched_ratio_contest'], '.6f')} | {_fmt(row['worst_matched_ratio_strict'], '.6f')} | "
             f"{_fmt(row['worst_max_rel'], '.4e')} | "
-            f"{row['status']} |"
+            f"{row['contest_status']} | {row['strict_status']} | {row['evidence_scope']} |"
         )
     lines.append("")
 
-    lines.append("## Cumulative Safe Frontier")
+    lines.append("## Contest-Safe Oracle Frontier")
     lines.append("")
-    lines.append("| order | candidate | worst_matched_contest | worst_matched_strict | worst_rel | status | kept |")
-    lines.append("|---|---|---:|---:|---:|---|---|")
+    lines.append("| order | candidate | worst_matched_contest | worst_matched_strict | worst_rel | contest_status | strict_status | evidence | kept |")
+    lines.append("|---|---|---:|---:|---:|---|---|---|---|")
     for i, row in enumerate(frontier, start=1):
         kept = "yes" if row.get("kept", row.get("status") == "safe") else "no"
         lines.append(
             f"| {i} | {row['candidate']} | {_fmt(row['worst_matched_ratio_contest'], '.6f')} | "
             f"{_fmt(row['worst_matched_ratio_strict'], '.6f')} | "
-            f"{_fmt(row['worst_max_rel'], '.4e')} | {row['status']} | {kept} |"
+            f"{_fmt(row['worst_max_rel'], '.4e')} | {row['contest_status']} | {row['strict_status']} | {row['evidence_scope']} | {kept} |"
         )
     lines.append("")
 
@@ -391,13 +459,13 @@ def _write_outputs(
         pairwise_summary = extra_json["pairwise_summary.json"]
         lines.append("## Pairwise Summary")
         lines.append("")
-        lines.append("| pair | worst_matched_contest | worst_matched_strict | worst_rel | status |")
-        lines.append("|---|---:|---:|---:|---|")
+        lines.append("| pair | worst_matched_contest | worst_matched_strict | worst_rel | contest_status | strict_status | evidence |")
+        lines.append("|---|---:|---:|---:|---|---|---|")
         for row in pairwise_summary:
             lines.append(
                 f"| {row['candidate']} | {_fmt(row['worst_matched_ratio_contest'], '.6f')} | "
                 f"{_fmt(row['worst_matched_ratio_strict'], '.6f')} | "
-                f"{_fmt(row['worst_max_rel'], '.4e')} | {row['status']} |"
+                f"{_fmt(row['worst_max_rel'], '.4e')} | {row['contest_status']} | {row['strict_status']} | {row['evidence_scope']} |"
             )
         lines.append("")
 
@@ -405,13 +473,13 @@ def _write_outputs(
         stress_summary = extra_json["stress_summary.json"]
         lines.append("## Stress Summary")
         lines.append("")
-        lines.append("| candidate | worst_workload | worst_seq_len | worst_matched_contest | worst_matched_strict | status |")
-        lines.append("|---|---|---:|---:|---:|---|")
+        lines.append("| candidate | worst_workload | worst_seq_len | worst_matched_contest | worst_matched_strict | contest_status | strict_status | evidence |")
+        lines.append("|---|---|---:|---:|---:|---|---|---|")
         for row in stress_summary:
             lines.append(
                 f"| {row['candidate']} | {row['worst_workload']} | {row['worst_seq_len']} | "
                 f"{_fmt(row['worst_matched_ratio_contest'], '.6f')} | {_fmt(row['worst_matched_ratio_strict'], '.6f')} | "
-                f"{row['status']} |"
+                f"{row['contest_status']} | {row['strict_status']} | {row['evidence_scope']} |"
             )
         lines.append("")
 
@@ -425,6 +493,21 @@ def _write_outputs(
             if isinstance(value, list):
                 lines.append(f"| {key} | {', '.join(value) or '-'} |")
         lines.append("")
+
+    if extra_json and "kernel_validation_summary.json" in extra_json:
+        kernel_summary = extra_json["kernel_validation_summary.json"]
+        lines.append("## Kernel Validation Summary")
+        lines.append("")
+        lines.append("| candidate | validation_status | workloads_passed | total_workloads | worst_max_abs | worst_max_rel | evidence | notes |")
+        lines.append("|---|---|---:|---:|---:|---:|---|---|")
+        for row in kernel_summary:
+            lines.append(
+                f"| {row['candidate']} | {row['validation_status']} | "
+                f"{row.get('workloads_passed', '-')} | {row.get('total_workloads', '-')} | "
+                f"{_fmt(row.get('worst_max_abs'), '.4e')} | {_fmt(row.get('worst_max_rel'), '.4e')} | "
+                f"{row.get('evidence_scope', '-')} | {row.get('notes', '-')} |"
+            )
+    lines.append("")
 
     lines.append("## Sampled Results")
     lines.append("")
@@ -577,6 +660,7 @@ def _aggregate_candidate(rows: Iterable[dict]) -> dict:
         "worst_max_rel": worst_rel,
         "worst_max_abs": worst_abs,
         "status": "safe",
+        "evidence_scope": EVIDENCE_SCOPE,
     }
 
 
@@ -666,7 +750,11 @@ def _aggregate_configs(
                 "scope": cfg.scope,
             }
         )
-        agg["status"] = "safe" if agg["worst_matched_ratio_contest"] >= required_matched_ratio else "unsafe"
+        contest_safe = agg["worst_matched_ratio_contest"] >= required_matched_ratio
+        strict_safe = agg["worst_matched_ratio_strict"] >= required_matched_ratio
+        agg["status"] = "safe" if contest_safe else "unsafe"
+        agg["contest_status"] = "contest_safe" if contest_safe else "contest_unsafe"
+        agg["strict_status"] = "strict_safe" if strict_safe else "strict_unsafe"
         aggs[cfg.name] = agg
     return aggs
 
@@ -692,6 +780,9 @@ def _build_stage_summary(candidate_aggs: dict[str, dict], candidates: list[Candi
                     "worst_matched_ratio_strict": best["worst_matched_ratio_strict"],
                     "worst_max_rel": best["worst_max_rel"],
                     "status": "safe",
+                    "contest_status": best["contest_status"],
+                    "strict_status": best["strict_status"],
+                    "evidence_scope": best["evidence_scope"],
                 }
             )
         else:
@@ -706,6 +797,9 @@ def _build_stage_summary(candidate_aggs: dict[str, dict], candidates: list[Candi
                     "worst_matched_ratio_strict": first["worst_matched_ratio_strict"],
                     "worst_max_rel": first["worst_max_rel"],
                     "status": "unsafe",
+                    "contest_status": first["contest_status"],
+                    "strict_status": first["strict_status"],
+                    "evidence_scope": first["evidence_scope"],
                 }
             )
     return stage_summary
@@ -759,10 +853,173 @@ def _build_stress_summary(rows: list[dict], aggs: dict[str, dict]) -> list[dict]
                 "worst_matched_ratio_contest": agg["worst_matched_ratio_contest"],
                 "worst_matched_ratio_strict": agg["worst_matched_ratio_strict"],
                 "status": agg["status"],
+                "contest_status": agg["contest_status"],
+                "strict_status": agg["strict_status"],
+                "evidence_scope": agg["evidence_scope"],
             }
         )
     summary.sort(key=lambda r: (r["worst_matched_ratio_contest"], r["worst_matched_ratio_strict"]))
     return summary
+
+
+def _kernel_stage_supported(cand: Candidate) -> tuple[bool, str]:
+    if cand.stage == "hidden_dequant" and cand.mode == "fp8":
+        return False, "top-level hidden_dequant kernel only implements bf16/f16 rounding"
+    if cand.stage in {
+        "gemm1_operands",
+        "gemm1_output",
+        "swiglu_input",
+        "swiglu_output",
+        "gemm2_operands",
+        "gemm2_accumulator",
+        "out_accumulator",
+    }:
+        return True, ""
+    return False, "kernel precision hook is not implemented for this stage"
+
+
+def _kernel_config_supported(cfg: EvalConfig) -> tuple[bool, str]:
+    unsupported: list[str] = []
+    for cand in cfg.candidates:
+        ok, reason = _kernel_stage_supported(cand)
+        if not ok:
+            unsupported.append(f"{cand.name}: {reason}")
+    if unsupported:
+        return False, "; ".join(unsupported)
+    return True, ""
+
+
+def _build_kernel_validation_configs(
+    contest_candidates: list[Candidate],
+    contest_analysis: dict[str, Any],
+    *,
+    limit: int,
+) -> list[EvalConfig]:
+    configs: list[EvalConfig] = []
+    seen: set[str] = set()
+    promoted_fp8 = [cand for cand in contest_candidates if cand.mode == "fp8"]
+    for cand in promoted_fp8:
+        cfg = _make_eval_config((cand,), "kernel_validation")
+        if cfg.name not in seen:
+            configs.append(cfg)
+            seen.add(cfg.name)
+    active = contest_analysis.get("active_candidates", [])
+    if active:
+        cfg = _make_eval_config(tuple(active), "kernel_validation")
+        if cfg.name not in seen:
+            configs.append(cfg)
+            seen.add(cfg.name)
+    return configs[:limit]
+
+
+def _run_kernel_validation(
+    configs: list[EvalConfig],
+    *,
+    atol: float,
+    rtol: float,
+    required_matched_ratio: float,
+) -> list[dict]:
+    try:
+        from flashinfer_bench import Solution
+        from scripts.pack_solution import pack_solution
+        from scripts.run_modal import _run_impl
+    except Exception as exc:
+        return [
+            {
+                "candidate": cfg.name,
+                "validation_status": "kernel_not_supported",
+                "workloads_passed": 0,
+                "total_workloads": 19,
+                "worst_max_abs": None,
+                "worst_max_rel": None,
+                "evidence_scope": KERNEL_UNSUPPORTED_SCOPE,
+                "notes": f"kernel validation helper unavailable in Modal worker: {type(exc).__name__}",
+            }
+            for cfg in configs
+        ]
+
+    rows: list[dict] = []
+    solution_path = pack_solution(PROJECT_ROOT / ".tmp_kernel_validation_solution.json")
+    solution = Solution.model_validate_json(solution_path.read_text())
+    try:
+        import os
+        from flashinfer_bench import BenchmarkConfig
+
+        for cfg in configs:
+            supported, reason = _kernel_config_supported(cfg)
+            if not supported:
+                rows.append(
+                    {
+                        "candidate": cfg.name,
+                        "validation_status": "kernel_not_supported",
+                        "workloads_passed": 0,
+                        "total_workloads": 19,
+                        "worst_max_abs": None,
+                        "worst_max_rel": None,
+                        "evidence_scope": KERNEL_UNSUPPORTED_SCOPE,
+                        "notes": reason,
+                    }
+                )
+                continue
+
+            env_vars = {
+                "FIB_MOE_TC": "1",
+                "FIB_MOE_PREC_STAGE": cfg.candidates[0].stage if len(cfg.candidates) == 1 else "",
+                "FIB_MOE_PREC_MODE": cfg.candidates[0].mode if len(cfg.candidates) == 1 else "",
+                "FIB_MOE_PREC_SCALE": cfg.candidates[0].scale_mode if len(cfg.candidates) == 1 else "none",
+                "FIB_MOE_PREC_SCOPE": cfg.candidates[0].scope if len(cfg.candidates) == 1 else "storage_compute",
+            }
+            if len(cfg.candidates) > 1:
+                rows.append(
+                    {
+                        "candidate": cfg.name,
+                        "validation_status": "kernel_not_supported",
+                        "workloads_passed": 0,
+                        "total_workloads": 19,
+                        "worst_max_abs": None,
+                        "worst_max_rel": None,
+                        "evidence_scope": KERNEL_UNSUPPORTED_SCOPE,
+                        "notes": "kernel validation only supports single-stage candidates in this pass",
+                    }
+                )
+                continue
+
+            os.environ.pop("FIB_MOE_LEGACY", None)
+            config = BenchmarkConfig(
+                warmup_runs=1,
+                iterations=3,
+                num_trials=1,
+                atol=atol,
+                rtol=rtol,
+                required_matched_ratio=required_matched_ratio,
+                use_isolated_runner=False,
+                profile_baseline=False,
+            )
+            result = _run_impl(solution, config, max_workloads=19, env_vars=env_vars)
+            traces = result.get(solution.definition, {})
+            workload_rows = [v for k, v in traces.items() if not k.startswith("__")]
+            passed = sum(1 for v in workload_rows if v.get("status") == "CORRECT")
+            worst_abs = max((float(v.get("max_abs_error", 0.0)) for v in workload_rows), default=0.0)
+            worst_rel = max((float(v.get("max_rel_error", 0.0)) for v in workload_rows), default=0.0)
+            status = "kernel_validated" if passed == len(workload_rows) and workload_rows else "kernel_failed"
+            rows.append(
+                {
+                    "candidate": cfg.name,
+                    "validation_status": status,
+                    "workloads_passed": passed,
+                    "total_workloads": len(workload_rows),
+                    "worst_max_abs": worst_abs,
+                    "worst_max_rel": worst_rel,
+                    "evidence_scope": KERNEL_EVIDENCE_SCOPE if status == "kernel_validated" else "kernel_failed",
+                    "notes": "validated through flashinfer-bench benchmark run with FIB_MOE_TC=1",
+                }
+            )
+    finally:
+        try:
+            solution_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return rows
 
 
 def _analyze_candidates(
@@ -846,8 +1103,9 @@ def _analyze_candidates(
     stress_summary = _build_stress_summary(rows, {name: candidate_aggs[name] for name in stress_names})
 
     promotion_summary = {
-        "bf16_f16_survivors": [c.name for c in survivors],
-        "strict_survivors": [c.name for c in strict_survivors],
+        "contest_safe_oracle_candidates": [c.name for c in survivors],
+        "strict_safe_oracle_candidates": [c.name for c in strict_survivors],
+        "kernel_validated_candidates": [],
         "pairwise_shortlist": [c.name for c in pairwise_shortlist],
     }
 
@@ -863,42 +1121,8 @@ def _analyze_candidates(
         "strict_survivors": strict_survivors,
         "contest_only_survivors": contest_only_survivors,
         "promotion_summary": promotion_summary,
+        "active_candidates": active,
     }
-
-
-def _select_fp8_targets(stage_summary: list[dict]) -> list[str]:
-    targets = list(DEFAULT_FP8_TARGET_STAGES)
-    safe_by_stage = {row["stage"]: row for row in stage_summary if row["status"] == "safe"}
-    for stage in OPTIONAL_FP8_TARGET_STAGES:
-        row = safe_by_stage.get(stage)
-        if row is None:
-            continue
-        margin = row["worst_matched_ratio_contest"] - DEFAULT_REQUIRED_MATCHED_RATIO
-        if margin >= FP8_PROMOTION_MARGIN:
-            targets.append(stage)
-    return sorted(set(targets))
-
-
-def _pick_best_fp8_candidates(candidate_aggs: dict[str, dict], fp8_candidates: list[Candidate]) -> list[Candidate]:
-    best_by_stage: dict[str, Candidate] = {}
-    for cand in fp8_candidates:
-        agg = candidate_aggs.get(cand.name)
-        if agg is None or agg["status"] != "safe":
-            continue
-        prev = best_by_stage.get(cand.stage)
-        if prev is None:
-            best_by_stage[cand.stage] = cand
-            continue
-        prev_agg = candidate_aggs[prev.name]
-        if (
-            agg["worst_matched_ratio_contest"],
-            agg["worst_matched_ratio_strict"],
-        ) > (
-            prev_agg["worst_matched_ratio_contest"],
-            prev_agg["worst_matched_ratio_strict"],
-        ):
-            best_by_stage[cand.stage] = cand
-    return [best_by_stage[k] for k in sorted(best_by_stage)]
 
 
 def _candidate_from_stage_row(row: dict) -> Candidate | None:
@@ -911,15 +1135,21 @@ def _candidate_from_stage_row(row: dict) -> Candidate | None:
 def _promoted_contest_candidates(
     stage1_analysis: dict[str, Any],
     fp8_analysis: dict[str, Any],
+    *,
+    promote_top_k_per_stage: int,
 ) -> list[Candidate]:
     promoted: dict[str, Candidate] = {}
     for row in stage1_analysis["stage_summary"]:
         cand = _candidate_from_stage_row(row)
         if cand is not None:
             promoted[cand.stage] = cand
-    for cand in _pick_best_fp8_candidates(fp8_analysis["candidate_aggs"], fp8_analysis["candidates"]):
+    for cand in _pick_top_fp8_candidates(
+        fp8_analysis["candidate_aggs"],
+        fp8_analysis["candidates"],
+        promote_top_k_per_stage,
+    ):
         promoted[cand.stage] = cand
-    return [promoted[stage] for stage in sorted(promoted)]
+    return [promoted[stage] for stage in sorted(promoted, key=_pipeline_stage_rank)]
 
 
 def _staged_probe_impl(
@@ -929,6 +1159,9 @@ def _staged_probe_impl(
     atol: float,
     rtol: float,
     required_matched_ratio: float,
+    promote_top_k_per_stage: int,
+    enable_kernel_validation: bool,
+    kernel_validation_limit: int,
 ) -> dict:
     import torch
     from flashinfer_bench import TraceSet
@@ -955,7 +1188,7 @@ def _staged_probe_impl(
         required_matched_ratio=required_matched_ratio,
     )
 
-    fp8_targets = _select_fp8_targets(stage1_analysis["stage_summary"])
+    fp8_targets = list(DEFAULT_FP8_TARGET_STAGES)
     fp8_candidates = _build_fp8_candidates(fp8_targets)
     fp8_analysis = _analyze_candidates(
         stage1_records,
@@ -968,7 +1201,11 @@ def _staged_probe_impl(
     )
     fp8_analysis["candidates"] = fp8_candidates
 
-    contest_candidates = _promoted_contest_candidates(stage1_analysis, fp8_analysis)
+    contest_candidates = _promoted_contest_candidates(
+        stage1_analysis,
+        fp8_analysis,
+        promote_top_k_per_stage=promote_top_k_per_stage,
+    )
     contest_analysis = _analyze_candidates(
         contest_records,
         definition,
@@ -977,6 +1214,20 @@ def _staged_probe_impl(
         atol=atol,
         rtol=rtol,
         required_matched_ratio=required_matched_ratio,
+    )
+    kernel_validation_summary = (
+        _run_kernel_validation(
+            _build_kernel_validation_configs(
+                contest_candidates,
+                contest_analysis,
+                limit=kernel_validation_limit,
+            ),
+            atol=atol,
+            rtol=rtol,
+            required_matched_ratio=required_matched_ratio,
+        )
+        if enable_kernel_validation
+        else []
     )
 
     base_meta = {
@@ -989,6 +1240,8 @@ def _staged_probe_impl(
         "strict_atol": STRICT_ATOL,
         "strict_rtol": STRICT_RTOL,
         "device": torch.cuda.get_device_name(0),
+        "evidence_scope": EVIDENCE_SCOPE,
+        "kernel_validated_candidates": "-",
     }
     return {
         "stage1": {
@@ -1006,10 +1259,12 @@ def _staged_probe_impl(
                 "strict_safe_survivors": ", ".join(c.name for c in stage1_analysis["strict_survivors"]) or "-",
                 "contest_only_survivor_count": len(stage1_analysis["contest_only_survivors"]),
                 "contest_only_survivors": ", ".join(c.name for c in stage1_analysis["contest_only_survivors"]) or "-",
+                "promote_top_k_per_stage": promote_top_k_per_stage,
             },
         },
         "fp8": {
             **fp8_analysis,
+            "kernel_validation_summary": [],
             "meta": {
                 **base_meta,
                 "run_stage": "stage1_fp8_followup",
@@ -1024,10 +1279,12 @@ def _staged_probe_impl(
                 "strict_safe_survivors": ", ".join(c.name for c in fp8_analysis["strict_survivors"]) or "-",
                 "contest_only_survivor_count": len(fp8_analysis["contest_only_survivors"]),
                 "contest_only_survivors": ", ".join(c.name for c in fp8_analysis["contest_only_survivors"]) or "-",
+                "promote_top_k_per_stage": promote_top_k_per_stage,
             },
         },
         "contest": {
             **contest_analysis,
+            "kernel_validation_summary": kernel_validation_summary,
             "meta": {
                 **base_meta,
                 "run_stage": "contest_panel",
@@ -1041,6 +1298,9 @@ def _staged_probe_impl(
                 "strict_safe_survivors": ", ".join(c.name for c in contest_analysis["strict_survivors"]) or "-",
                 "contest_only_survivor_count": len(contest_analysis["contest_only_survivors"]),
                 "contest_only_survivors": ", ".join(c.name for c in contest_analysis["contest_only_survivors"]) or "-",
+                "promote_top_k_per_stage": promote_top_k_per_stage,
+                "kernel_validation_enabled": str(enable_kernel_validation).lower(),
+                "kernel_validation_limit": kernel_validation_limit,
             },
         },
     }
@@ -1123,8 +1383,21 @@ def probe_b200(
     atol: float,
     rtol: float,
     required_matched_ratio: float,
+    promote_top_k_per_stage: int,
+    enable_kernel_validation: bool,
+    kernel_validation_limit: int,
 ) -> dict:
-    return _staged_probe_impl(seed, stage1_panel_size, contest_panel_size, atol, rtol, required_matched_ratio)
+    return _staged_probe_impl(
+        seed,
+        stage1_panel_size,
+        contest_panel_size,
+        atol,
+        rtol,
+        required_matched_ratio,
+        promote_top_k_per_stage,
+        enable_kernel_validation,
+        kernel_validation_limit,
+    )
 
 
 @app.local_entrypoint()
@@ -1136,8 +1409,21 @@ def probe(
     atol: float = DEFAULT_ATOL,
     rtol: float = DEFAULT_RTOL,
     required_matched_ratio: float = DEFAULT_REQUIRED_MATCHED_RATIO,
+    promote_top_k_per_stage: int = DEFAULT_PROMOTE_TOP_K_PER_STAGE,
+    enable_kernel_validation: bool = DEFAULT_ENABLE_KERNEL_VALIDATION,
+    kernel_validation_limit: int = DEFAULT_KERNEL_VALIDATION_LIMIT,
 ):
-    result = probe_b200.remote(seed, stage1_panel_size, contest_panel_size, atol, rtol, required_matched_ratio)
+    result = probe_b200.remote(
+        seed,
+        stage1_panel_size,
+        contest_panel_size,
+        atol,
+        rtol,
+        required_matched_ratio,
+        promote_top_k_per_stage,
+        enable_kernel_validation,
+        kernel_validation_limit,
+    )
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     suffix = f"_{label}" if label else ""
     root_dir = PROJECT_ROOT / "experiments" / f"{ts}_B200_moe_precision_staged{suffix}"
@@ -1156,6 +1442,7 @@ def probe(
                 "margin_summary.json": run["margin_summary"],
                 "stress_summary.json": run["stress_summary"],
                 "promotion_summary.json": run["promotion_summary"],
+                "kernel_validation_summary.json": run.get("kernel_validation_summary", []),
             },
         )
         print(f"Wrote {out_dir / 'summary.md'}")

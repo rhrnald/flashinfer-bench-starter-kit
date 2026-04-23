@@ -45,8 +45,14 @@ On workload `b8f4f012` (`seq_len=7`), a PyTorch oracle shows:
 | BF16 GEMM1 before SwiGLU | 0.958187 | 2048 | 8.4689 |
 | FP16 GEMM1 before SwiGLU | 0.994938 | 2048 | 2.1754 |
 
-Since the benchmark requires full matched ratio under `rtol=1e-2`, even FP16
-GEMM1 materialization is not sufficient.
+Under the stricter shadow check used in this probe (`atol=0.01`, `rtol=0.01`,
+`required_matched_ratio=1.0` on this single workload), even FP16 GEMM1
+materialization is not sufficient.
+
+This is stronger than the contest MoE correctness gate. The contest evaluation
+uses `atol=1`, `rtol=0.3`, `required_matched_ratio=0.9`, so this probe should be
+interpreted as evidence about tight numerical fidelity, not as a direct claim
+that FP16 fails contest tolerance.
 
 Final smoke after the FP16/MN TC experiment:
 
