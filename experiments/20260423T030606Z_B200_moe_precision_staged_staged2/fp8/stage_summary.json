@@ -1,0 +1,22 @@
+[
+  {
+    "stage": "hidden_dequant",
+    "best_safe_mode": "fp8",
+    "scale_mode": "tensor",
+    "scope": "storage_compute",
+    "worst_matched_ratio_contest": 0.9126674107142857,
+    "worst_matched_ratio_strict": 0.1480189732142857,
+    "worst_max_rel": 3563547.5,
+    "status": "safe"
+  },
+  {
+    "stage": "swiglu_output",
+    "best_safe_mode": "fp8",
+    "scale_mode": "tensor",
+    "scope": "storage_compute",
+    "worst_matched_ratio_contest": 0.9368024553571429,
+    "worst_matched_ratio_strict": 0.2220982142857143,
+    "worst_max_rel": 2160204.0,
+    "status": "safe"
+  }
+]

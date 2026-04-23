@@ -1,0 +1,26 @@
+[
+  {
+    "worst_matched_ratio_contest": 0.9289899553571429,
+    "worst_matched_ratio_strict": 0.1796875,
+    "worst_max_rel": 15366011.0,
+    "worst_max_abs": 51200.0,
+    "status": "safe",
+    "candidate": "hidden_dequant__fp8__tensor",
+    "stage": "hidden_dequant",
+    "mode": "fp8",
+    "scale_mode": "tensor",
+    "scope": "storage_compute"
+  },
+  {
+    "worst_matched_ratio_contest": 0.9030412946428571,
+    "worst_matched_ratio_strict": 0.1368582589285714,
+    "worst_max_rel": 2064372.375,
+    "worst_max_abs": 57344.0,
+    "status": "safe",
+    "candidate": "hidden_dequant__fp8__tensor+swiglu_output__fp8__tensor",
+    "stage": "hidden_dequant+swiglu_output",
+    "mode": "fp8+fp8",
+    "scale_mode": "tensor+tensor",
+    "scope": "storage_compute+storage_compute"
+  }
+]

@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import csv
+import itertools
 import json
 import sys
 from dataclasses import dataclass
@@ -59,6 +60,36 @@ KNOWN_PANEL_UUIDS = [
     "58a34f27",
 ]
 
+BF16_F16_STAGES = (
+    "hidden_dequant",
+    "gemm1_operands",
+    "gemm1_accumulator",
+    "gemm1_output",
+    "swiglu_input",
+    "swiglu_output",
+    "gemm2_operands",
+    "gemm2_accumulator",
+    "out_accumulator",
+)
+
+DEFAULT_PAIRWISE_SHORTLIST = (
+    "hidden_dequant__f16",
+    "gemm1_operands__f16",
+    "gemm1_accumulator__f16",
+    "gemm1_output__f16",
+    "swiglu_output__f16",
+    "gemm2_accumulator__bf16",
+    "out_accumulator__bf16",
+)
+
+DEFAULT_STRESS_CANDIDATES = (
+    "gemm2_accumulator__bf16",
+)
+
+DEFAULT_FP8_TARGET_STAGES = ("swiglu_output",)
+OPTIONAL_FP8_TARGET_STAGES = ("hidden_dequant",)
+FP8_PROMOTION_MARGIN = 0.02
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -75,6 +106,37 @@ class Candidate:
         if self.scope != "storage_compute":
             parts.append(self.scope)
         return "__".join(parts)
+
+
+@dataclass(frozen=True)
+class EvalConfig:
+    name: str
+    candidates: tuple[Candidate, ...]
+    search_phase: str
+
+    @property
+    def stage(self) -> str:
+        if not self.candidates:
+            return "baseline"
+        return "+".join(c.stage for c in self.candidates)
+
+    @property
+    def mode(self) -> str:
+        if not self.candidates:
+            return "fp32"
+        return "+".join(c.mode for c in self.candidates)
+
+    @property
+    def scale_mode(self) -> str:
+        if not self.candidates:
+            return "none"
+        return "+".join(c.scale_mode for c in self.candidates)
+
+    @property
+    def scope(self) -> str:
+        if not self.candidates:
+            return "storage_compute"
+        return "+".join(c.scope for c in self.candidates)
 
 
 def _fmt(v: Any, spec: str = ".4g") -> str:
@@ -174,31 +236,24 @@ def _classify_failure(
     return "localized_outlier"
 
 
-def _candidate_table() -> list[Candidate]:
+def _build_bf16_f16_candidates() -> list[Candidate]:
     table = [Candidate("baseline", "fp32")]
-    for stage, modes in (
-        ("routing_math", ("bf16", "f16")),
-        ("routing_weights", ("bf16", "f16")),
-        ("hidden_dequant", ("bf16", "f16")),
-        ("gemm1_operands", ("bf16", "f16")),
-        ("gemm1_accumulator", ("bf16", "f16")),
-        ("gemm1_output", ("bf16", "f16")),
-        ("swiglu_input", ("bf16", "f16")),
-        ("gemm2_operands", ("bf16", "f16")),
-        ("gemm2_accumulator", ("bf16", "f16")),
-        ("out_accumulator", ("bf16", "f16")),
-    ):
-        for mode in modes:
+    for stage in BF16_F16_STAGES:
+        for mode in ("bf16", "f16"):
             table.append(Candidate(stage, mode))
-    table.extend(
-        [
-            Candidate("swiglu_output", "bf16"),
-            Candidate("swiglu_output", "f16"),
-            Candidate("swiglu_output", "fp8", "tensor"),
-            Candidate("swiglu_output", "fp8", "row"),
-            Candidate("swiglu_output", "fp8", "block"),
-        ]
-    )
+    return table
+
+
+def _build_fp8_candidates(stages: Iterable[str]) -> list[Candidate]:
+    table: list[Candidate] = []
+    for stage in stages:
+        table.extend(
+            [
+                Candidate(stage, "fp8", "tensor"),
+                Candidate(stage, "fp8", "row"),
+                Candidate(stage, "fp8", "block"),
+            ]
+        )
     return table
 
 
@@ -220,7 +275,25 @@ def _combined_candidates(survivors: list[Candidate]) -> list[Candidate]:
     ]
 
 
-def _write_outputs(out_dir: Path, rows: list[dict], meta: dict, stage_summary: list[dict], frontier: list[dict]) -> None:
+def _make_eval_config(candidates: Iterable[Candidate], search_phase: str, name: str | None = None) -> EvalConfig:
+    cands = tuple(candidates)
+    if name is None:
+        name = "baseline__fp32" if not cands else "+".join(c.name for c in cands)
+    return EvalConfig(name=name, candidates=cands, search_phase=search_phase)
+
+
+def _candidate_by_name(candidates: Iterable[Candidate]) -> dict[str, Candidate]:
+    return {c.name: c for c in candidates}
+
+
+def _write_outputs(
+    out_dir: Path,
+    rows: list[dict],
+    meta: dict,
+    stage_summary: list[dict],
+    frontier: list[dict],
+    extra_json: dict[str, Any] | None = None,
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     fields = [
         "candidate",
@@ -248,6 +321,9 @@ def _write_outputs(out_dir: Path, rows: list[dict], meta: dict, stage_summary: l
 
     (out_dir / "stage_summary.json").write_text(json.dumps(stage_summary, indent=2))
     (out_dir / "safe_frontier.json").write_text(json.dumps(frontier, indent=2))
+    if extra_json:
+        for filename, payload in extra_json.items():
+            (out_dir / filename).write_text(json.dumps(payload, indent=2))
 
     lines = [f"# MoE Precision Search {meta['timestamp']}", ""]
     lines.append("| metric | value |")
@@ -295,6 +371,59 @@ def _write_outputs(out_dir: Path, rows: list[dict], meta: dict, stage_summary: l
             f"{_fmt(row['worst_max_rel'], '.4e')} | {row['status']} |"
         )
     lines.append("")
+
+    if extra_json and "margin_summary.json" in extra_json:
+        margin_summary = extra_json["margin_summary.json"]
+        lines.append("## BF16/F16 Margin")
+        lines.append("")
+        lines.append("| stage | preferred | bf16_contest | f16_contest | bf16_strict | f16_strict | |")
+        lines.append("|---|---|---:|---:|---:|---:|---|")
+        for row in margin_summary:
+            lines.append(
+                f"| {row['stage']} | {row['preferred_mode']} | "
+                f"{_fmt(row['bf16_contest'], '.6f')} | {_fmt(row['f16_contest'], '.6f')} | "
+                f"{_fmt(row['bf16_strict'], '.6f')} | {_fmt(row['f16_strict'], '.6f')} | |"
+            )
+        lines.append("")
+
+    if extra_json and "pairwise_summary.json" in extra_json:
+        pairwise_summary = extra_json["pairwise_summary.json"]
+        lines.append("## Pairwise Summary")
+        lines.append("")
+        lines.append("| pair | worst_matched_contest | worst_matched_strict | worst_rel | status |")
+        lines.append("|---|---:|---:|---:|---|")
+        for row in pairwise_summary:
+            lines.append(
+                f"| {row['candidate']} | {_fmt(row['worst_matched_ratio_contest'], '.6f')} | "
+                f"{_fmt(row['worst_matched_ratio_strict'], '.6f')} | "
+                f"{_fmt(row['worst_max_rel'], '.4e')} | {row['status']} |"
+            )
+        lines.append("")
+
+    if extra_json and "stress_summary.json" in extra_json:
+        stress_summary = extra_json["stress_summary.json"]
+        lines.append("## Stress Summary")
+        lines.append("")
+        lines.append("| candidate | worst_workload | worst_seq_len | worst_matched_contest | worst_matched_strict | status |")
+        lines.append("|---|---|---:|---:|---:|---|")
+        for row in stress_summary:
+            lines.append(
+                f"| {row['candidate']} | {row['worst_workload']} | {row['worst_seq_len']} | "
+                f"{_fmt(row['worst_matched_ratio_contest'], '.6f')} | {_fmt(row['worst_matched_ratio_strict'], '.6f')} | "
+                f"{row['status']} |"
+            )
+        lines.append("")
+
+    if extra_json and "promotion_summary.json" in extra_json:
+        promotion = extra_json["promotion_summary.json"]
+        lines.append("## Promotion Summary")
+        lines.append("")
+        lines.append("| category | candidates |")
+        lines.append("|---|---|")
+        for key, value in promotion.items():
+            if isinstance(value, list):
+                lines.append(f"| {key} | {', '.join(value) or '-'} |")
+        lines.append("")
 
     lines.append("## Sampled Results")
     lines.append("")
@@ -455,125 +584,51 @@ def _matched_ratio(diff, rel, *, atol: float, rtol: float) -> float:
     return 1.0 - float(exceeds.sum().item()) / float(exceeds.numel())
 
 
-def _probe_impl(seed: int, panel_size: int, atol: float, rtol: float, required_matched_ratio: float) -> dict:
-    import torch
-    from flashinfer_bench import TraceSet
-    from flashinfer_bench.bench.utils import gen_inputs, load_safetensors
+def _load_panel_records(trace_set, definition, workloads, panel: list[int]) -> list[tuple[int, Any]]:
+    return [(idx, workloads[idx]) for idx in panel]
 
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    trace_set = TraceSet.from_path(TRACE_SET_PATH)
-    definition = trace_set.definitions[DEFINITION]
-    workloads = trace_set.workloads[DEFINITION]
-    panel = _panel_indices(workloads, panel_size)
+
+def _evaluate_configs(
+    panel_records: list[tuple[int, Any]],
+    definition,
+    trace_set,
+    configs: list[EvalConfig],
+    *,
+    atol: float,
+    rtol: float,
+    required_matched_ratio: float,
+) -> list[dict]:
+    import torch
 
     rows: list[dict] = []
-    candidates = _candidate_table()
-    candidate_agg: dict[str, dict] = {}
+    from flashinfer_bench.bench.utils import gen_inputs, load_safetensors
 
-    for workload_index in panel:
-        trace = workloads[workload_index]
+    for workload_index, trace in panel_records:
         safe = load_safetensors(definition, trace.workload, trace_set.root)
         values = gen_inputs(definition, trace.workload, "cuda:0", safe)
         inputs = dict(zip(definition.inputs.keys(), values))
-
         ref, _ = _run_moe(inputs, Candidate("baseline", "fp32"))
-        for cand in candidates:
-            got, selected_experts = (ref, 0) if cand.stage == "baseline" else _run_moe(inputs, cand)
-            diff = (got.to(torch.float32) - ref.to(torch.float32)).abs()
-            rel = diff / (ref.to(torch.float32).abs() + 1e-8)
-            matched_contest = _matched_ratio(diff, rel, atol=atol, rtol=rtol)
-            matched_strict = _matched_ratio(diff, rel, atol=STRICT_ATOL, rtol=STRICT_RTOL)
-            row = {
-                "candidate": cand.name,
-                "search_phase": "single_stage",
-                "workload_index": workload_index,
-                "workload_uuid": trace.workload.uuid,
-                "seq_len": int(inputs["hidden_states"].shape[0]),
-                "stage": cand.stage,
-                "mode": cand.mode,
-                "scale_mode": cand.scale_mode,
-                "scope": cand.scope,
-                "max_abs": float(diff.max().item()),
-                "max_rel": float(rel.max().item()),
-                "mean_abs": float(diff.mean().item()),
-                "matched_ratio_contest": matched_contest,
-                "matched_ratio_strict": matched_strict,
-                "selected_experts": selected_experts,
-                "failure_label": _classify_failure(
-                    matched_contest,
-                    float(rel.max().item()),
-                    float(diff.max().item()),
-                    pass_threshold=required_matched_ratio,
-                ),
-            }
-            rows.append(row)
-
-    for cand in candidates:
-        cand_rows = [r for r in rows if r["candidate"] == cand.name and r["search_phase"] == "single_stage"]
-        agg = _aggregate_candidate(cand_rows)
-        agg.update({
-            "candidate": cand.name,
-            "stage": cand.stage,
-            "mode": cand.mode,
-            "scale_mode": cand.scale_mode,
-            "scope": cand.scope,
-        })
-        agg["status"] = "safe" if agg["worst_matched_ratio_contest"] >= required_matched_ratio else "unsafe"
-        candidate_agg[cand.name] = agg
-
-    survivors = [
-        cand for cand in candidates
-        if cand.stage != "baseline" and candidate_agg[cand.name]["status"] == "safe"
-    ]
-    strict_survivors = [
-        cand
-        for cand in candidates
-        if cand.stage != "baseline"
-        and candidate_agg[cand.name]["worst_matched_ratio_strict"] >= required_matched_ratio
-    ]
-    strict_survivor_names = {cand.name for cand in strict_survivors}
-    contest_only_survivors = [cand for cand in survivors if cand.name not in strict_survivor_names]
-    survivors.sort(
-        key=lambda cand: (
-            candidate_agg[cand.name]["worst_matched_ratio_contest"],
-            -candidate_agg[cand.name]["worst_max_rel"],
-            -_mode_rank(cand.mode),
-        ),
-        reverse=True,
-    )
-
-    frontier_rows: list[dict] = []
-    combined = _combined_candidates(survivors)
-    active: list[Candidate] = []
-    for cand in combined:
-        active.append(cand)
-        combined_name = "+".join(c.name for c in active)
-        staged_rows = []
-        for workload_index in panel:
-            trace = workloads[workload_index]
-            safe = load_safetensors(definition, trace.workload, trace_set.root)
-            values = gen_inputs(definition, trace.workload, "cuda:0", safe)
-            inputs = dict(zip(definition.inputs.keys(), values))
-            ref, _ = _run_moe(inputs, Candidate("baseline", "fp32"))
-            if len(active) == 1:
-                got, selected_experts = _run_moe(inputs, active[0])
+        for cfg in configs:
+            if not cfg.candidates:
+                got, selected_experts = ref, 0
+            elif len(cfg.candidates) == 1:
+                got, selected_experts = _run_moe(inputs, cfg.candidates[0])
             else:
-                got, selected_experts = _run_moe_with_candidates(inputs, active)
+                got, selected_experts = _run_moe_with_candidates(inputs, list(cfg.candidates))
             diff = (got.to(torch.float32) - ref.to(torch.float32)).abs()
             rel = diff / (ref.to(torch.float32).abs() + 1e-8)
             matched_contest = _matched_ratio(diff, rel, atol=atol, rtol=rtol)
             matched_strict = _matched_ratio(diff, rel, atol=STRICT_ATOL, rtol=STRICT_RTOL)
             row = {
-                "candidate": combined_name,
-                "search_phase": "cumulative",
+                "candidate": cfg.name,
+                "search_phase": cfg.search_phase,
                 "workload_index": workload_index,
                 "workload_uuid": trace.workload.uuid,
                 "seq_len": int(inputs["hidden_states"].shape[0]),
-                "stage": "+".join(c.stage for c in active),
-                "mode": "+".join(c.mode for c in active),
-                "scale_mode": "+".join(c.scale_mode for c in active),
-                "scope": "+".join(c.scope for c in active),
+                "stage": cfg.stage,
+                "mode": cfg.mode,
+                "scale_mode": cfg.scale_mode,
+                "scope": cfg.scope,
                 "max_abs": float(diff.max().item()),
                 "max_rel": float(rel.max().item()),
                 "mean_abs": float(diff.mean().item()),
@@ -588,24 +643,43 @@ def _probe_impl(seed: int, panel_size: int, atol: float, rtol: float, required_m
                 ),
             }
             rows.append(row)
-            staged_rows.append(row)
-        agg = _aggregate_candidate(staged_rows)
-        agg["candidate"] = combined_name
-        agg["status"] = "safe" if agg["worst_matched_ratio_contest"] >= required_matched_ratio else "unsafe"
-        frontier_rows.append(agg)
-        if agg["status"] != "safe":
-            break
+    return rows
 
+
+def _aggregate_configs(
+    rows: list[dict],
+    configs: list[EvalConfig],
+    *,
+    required_matched_ratio: float,
+) -> dict[str, dict]:
+    aggs: dict[str, dict] = {}
+    for cfg in configs:
+        cfg_rows = [r for r in rows if r["candidate"] == cfg.name]
+        agg = _aggregate_candidate(cfg_rows)
+        agg.update(
+            {
+                "candidate": cfg.name,
+                "stage": cfg.stage,
+                "mode": cfg.mode,
+                "scale_mode": cfg.scale_mode,
+                "scope": cfg.scope,
+            }
+        )
+        agg["status"] = "safe" if agg["worst_matched_ratio_contest"] >= required_matched_ratio else "unsafe"
+        aggs[cfg.name] = agg
+    return aggs
+
+
+def _build_stage_summary(candidate_aggs: dict[str, dict], candidates: list[Candidate]) -> list[dict]:
     stage_summary: list[dict] = []
     stages = sorted({cand.stage for cand in candidates if cand.stage != "baseline"})
     for stage in stages:
-        stage_cands = [candidate_agg[c.name] for c in candidates if c.stage == stage]
+        stage_cands = [candidate_aggs[c.name] for c in candidates if c.stage == stage and c.name in candidate_aggs]
+        if not stage_cands:
+            continue
         safe_stage = [r for r in stage_cands if r["status"] == "safe"]
         if safe_stage:
-            safe_stage.sort(
-                key=lambda r: (_mode_rank(r["mode"]), r["scale_mode"]),
-                reverse=True,
-            )
+            safe_stage.sort(key=lambda r: (_mode_rank(r["mode"]), r["scale_mode"]), reverse=True)
             best = safe_stage[0]
             stage_summary.append(
                 {
@@ -633,33 +707,341 @@ def _probe_impl(seed: int, panel_size: int, atol: float, rtol: float, required_m
                     "status": "unsafe",
                 }
             )
+    return stage_summary
 
-    meta = {
+
+def _build_margin_summary(candidate_aggs: dict[str, dict], stages: Iterable[str]) -> list[dict]:
+    summary: list[dict] = []
+    for stage in stages:
+        bf16 = candidate_aggs.get(Candidate(stage, "bf16").name)
+        f16 = candidate_aggs.get(Candidate(stage, "f16").name)
+        if bf16 is None or f16 is None:
+            continue
+        preferred = "f16" if f16["worst_matched_ratio_contest"] >= bf16["worst_matched_ratio_contest"] else "bf16"
+        summary.append(
+            {
+                "stage": stage,
+                "preferred_mode": preferred,
+                "bf16_contest": bf16["worst_matched_ratio_contest"],
+                "f16_contest": f16["worst_matched_ratio_contest"],
+                "bf16_strict": bf16["worst_matched_ratio_strict"],
+                "f16_strict": f16["worst_matched_ratio_strict"],
+                "bf16_margin": bf16["worst_matched_ratio_contest"] - DEFAULT_REQUIRED_MATCHED_RATIO,
+                "f16_margin": f16["worst_matched_ratio_contest"] - DEFAULT_REQUIRED_MATCHED_RATIO,
+            }
+        )
+    return summary
+
+
+def _build_pairwise_shortlist(candidate_aggs: dict[str, dict]) -> list[Candidate]:
+    names = [name for name in DEFAULT_PAIRWISE_SHORTLIST if candidate_aggs.get(name, {}).get("status") == "safe"]
+    return [_candidate_by_name(_build_bf16_f16_candidates())[name] for name in names]
+
+
+def _build_pairwise_configs(shortlist: list[Candidate]) -> list[EvalConfig]:
+    configs: list[EvalConfig] = []
+    for left, right in itertools.combinations(shortlist, 2):
+        configs.append(_make_eval_config((left, right), "pairwise"))
+    return configs
+
+
+def _build_stress_summary(rows: list[dict], aggs: dict[str, dict]) -> list[dict]:
+    summary: list[dict] = []
+    for candidate, agg in aggs.items():
+        cand_rows = [r for r in rows if r["candidate"] == candidate]
+        worst = min(cand_rows, key=lambda r: (r["matched_ratio_contest"], r["matched_ratio_strict"]))
+        summary.append(
+            {
+                "candidate": candidate,
+                "worst_workload": _canonical_short_uuid(worst["workload_uuid"]),
+                "worst_seq_len": worst["seq_len"],
+                "worst_matched_ratio_contest": agg["worst_matched_ratio_contest"],
+                "worst_matched_ratio_strict": agg["worst_matched_ratio_strict"],
+                "status": agg["status"],
+            }
+        )
+    summary.sort(key=lambda r: (r["worst_matched_ratio_contest"], r["worst_matched_ratio_strict"]))
+    return summary
+
+
+def _analyze_candidates(
+    panel_records: list[tuple[int, Any]],
+    definition,
+    trace_set,
+    candidates: list[Candidate],
+    *,
+    atol: float,
+    rtol: float,
+    required_matched_ratio: float,
+) -> dict[str, Any]:
+    configs = [_make_eval_config((), "single_stage", "baseline__fp32")]
+    configs.extend(_make_eval_config((cand,), "single_stage", cand.name) for cand in candidates if cand.stage != "baseline")
+    rows = _evaluate_configs(
+        panel_records,
+        definition,
+        trace_set,
+        configs,
+        atol=atol,
+        rtol=rtol,
+        required_matched_ratio=required_matched_ratio,
+    )
+    candidate_aggs = _aggregate_configs(rows, configs, required_matched_ratio=required_matched_ratio)
+    survivors = [cand for cand in candidates if cand.stage != "baseline" and candidate_aggs.get(cand.name, {}).get("status") == "safe"]
+    strict_survivors = [
+        cand for cand in candidates
+        if cand.stage != "baseline" and candidate_aggs.get(cand.name, {}).get("worst_matched_ratio_strict", 0.0) >= required_matched_ratio
+    ]
+    strict_survivor_names = {cand.name for cand in strict_survivors}
+    contest_only_survivors = [cand for cand in survivors if cand.name not in strict_survivor_names]
+    survivors.sort(
+        key=lambda cand: (
+            candidate_aggs[cand.name]["worst_matched_ratio_contest"],
+            -candidate_aggs[cand.name]["worst_max_rel"],
+            -_mode_rank(cand.mode),
+        ),
+        reverse=True,
+    )
+
+    frontier_rows: list[dict] = []
+    combined = _combined_candidates(survivors)
+    active: list[Candidate] = []
+    for cand in combined:
+        active.append(cand)
+        cfg = _make_eval_config(active, "cumulative")
+        staged_rows = _evaluate_configs(
+            panel_records,
+            definition,
+            trace_set,
+            [cfg],
+            atol=atol,
+            rtol=rtol,
+            required_matched_ratio=required_matched_ratio,
+        )
+        rows.extend(staged_rows)
+        agg = _aggregate_configs(staged_rows, [cfg], required_matched_ratio=required_matched_ratio)[cfg.name]
+        frontier_rows.append(agg)
+        if agg["status"] != "safe":
+            break
+
+    stage_summary = _build_stage_summary(candidate_aggs, candidates)
+    margin_summary = _build_margin_summary(candidate_aggs, BF16_F16_STAGES)
+
+    pairwise_shortlist = _build_pairwise_shortlist(candidate_aggs)
+    pairwise_configs = _build_pairwise_configs(pairwise_shortlist)
+    pairwise_rows = _evaluate_configs(
+        panel_records,
+        definition,
+        trace_set,
+        pairwise_configs,
+        atol=atol,
+        rtol=rtol,
+        required_matched_ratio=required_matched_ratio,
+    ) if pairwise_configs else []
+    pairwise_aggs = _aggregate_configs(pairwise_rows, pairwise_configs, required_matched_ratio=required_matched_ratio) if pairwise_configs else {}
+    pairwise_summary = list(pairwise_aggs.values())
+    pairwise_summary.sort(key=lambda r: (r["worst_matched_ratio_contest"], r["worst_matched_ratio_strict"]))
+
+    stress_names = [name for name in DEFAULT_STRESS_CANDIDATES if name in candidate_aggs]
+    stress_summary = _build_stress_summary(rows, {name: candidate_aggs[name] for name in stress_names})
+
+    promotion_summary = {
+        "bf16_f16_survivors": [c.name for c in survivors],
+        "strict_survivors": [c.name for c in strict_survivors],
+        "pairwise_shortlist": [c.name for c in pairwise_shortlist],
+    }
+
+    return {
+        "rows": rows,
+        "candidate_aggs": candidate_aggs,
+        "stage_summary": stage_summary,
+        "frontier": frontier_rows,
+        "margin_summary": margin_summary,
+        "pairwise_summary": pairwise_summary,
+        "stress_summary": stress_summary,
+        "survivors": survivors,
+        "strict_survivors": strict_survivors,
+        "contest_only_survivors": contest_only_survivors,
+        "promotion_summary": promotion_summary,
+    }
+
+
+def _select_fp8_targets(stage_summary: list[dict]) -> list[str]:
+    targets = list(DEFAULT_FP8_TARGET_STAGES)
+    safe_by_stage = {row["stage"]: row for row in stage_summary if row["status"] == "safe"}
+    for stage in OPTIONAL_FP8_TARGET_STAGES:
+        row = safe_by_stage.get(stage)
+        if row is None:
+            continue
+        margin = row["worst_matched_ratio_contest"] - DEFAULT_REQUIRED_MATCHED_RATIO
+        if margin >= FP8_PROMOTION_MARGIN:
+            targets.append(stage)
+    return sorted(set(targets))
+
+
+def _pick_best_fp8_candidates(candidate_aggs: dict[str, dict], fp8_candidates: list[Candidate]) -> list[Candidate]:
+    best_by_stage: dict[str, Candidate] = {}
+    for cand in fp8_candidates:
+        agg = candidate_aggs.get(cand.name)
+        if agg is None or agg["status"] != "safe":
+            continue
+        prev = best_by_stage.get(cand.stage)
+        if prev is None:
+            best_by_stage[cand.stage] = cand
+            continue
+        prev_agg = candidate_aggs[prev.name]
+        if (
+            agg["worst_matched_ratio_contest"],
+            agg["worst_matched_ratio_strict"],
+        ) > (
+            prev_agg["worst_matched_ratio_contest"],
+            prev_agg["worst_matched_ratio_strict"],
+        ):
+            best_by_stage[cand.stage] = cand
+    return [best_by_stage[k] for k in sorted(best_by_stage)]
+
+
+def _candidate_from_stage_row(row: dict) -> Candidate | None:
+    if row["status"] != "safe" or row["best_safe_mode"] == "-":
+        return None
+    scale_mode = row["scale_mode"] if row["scale_mode"] != "-" else "none"
+    return Candidate(row["stage"], row["best_safe_mode"], scale_mode=scale_mode)
+
+
+def _promoted_contest_candidates(
+    stage1_analysis: dict[str, Any],
+    fp8_analysis: dict[str, Any],
+) -> list[Candidate]:
+    promoted: dict[str, Candidate] = {}
+    for row in stage1_analysis["stage_summary"]:
+        cand = _candidate_from_stage_row(row)
+        if cand is not None:
+            promoted[cand.stage] = cand
+    for cand in _pick_best_fp8_candidates(fp8_analysis["candidate_aggs"], fp8_analysis["candidates"]):
+        promoted[cand.stage] = cand
+    return [promoted[stage] for stage in sorted(promoted)]
+
+
+def _staged_probe_impl(
+    seed: int,
+    stage1_panel_size: int,
+    contest_panel_size: int,
+    atol: float,
+    rtol: float,
+    required_matched_ratio: float,
+) -> dict:
+    import torch
+    from flashinfer_bench import TraceSet
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    trace_set = TraceSet.from_path(TRACE_SET_PATH)
+    definition = trace_set.definitions[DEFINITION]
+    workloads = trace_set.workloads[DEFINITION]
+
+    stage1_panel = _panel_indices(workloads, stage1_panel_size)
+    contest_panel = _panel_indices(workloads, min(contest_panel_size, len(workloads)))
+    stage1_records = _load_panel_records(trace_set, definition, workloads, stage1_panel)
+    contest_records = _load_panel_records(trace_set, definition, workloads, contest_panel)
+
+    stage1_candidates = _build_bf16_f16_candidates()
+    stage1_analysis = _analyze_candidates(
+        stage1_records,
+        definition,
+        trace_set,
+        stage1_candidates,
+        atol=atol,
+        rtol=rtol,
+        required_matched_ratio=required_matched_ratio,
+    )
+
+    fp8_targets = _select_fp8_targets(stage1_analysis["stage_summary"])
+    fp8_candidates = _build_fp8_candidates(fp8_targets)
+    fp8_analysis = _analyze_candidates(
+        stage1_records,
+        definition,
+        trace_set,
+        [Candidate("baseline", "fp32"), *fp8_candidates],
+        atol=atol,
+        rtol=rtol,
+        required_matched_ratio=required_matched_ratio,
+    )
+    fp8_analysis["candidates"] = fp8_candidates
+
+    contest_candidates = _promoted_contest_candidates(stage1_analysis, fp8_analysis)
+    contest_analysis = _analyze_candidates(
+        contest_records,
+        definition,
+        trace_set,
+        [Candidate("baseline", "fp32"), *contest_candidates],
+        atol=atol,
+        rtol=rtol,
+        required_matched_ratio=required_matched_ratio,
+    )
+
+    base_meta = {
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "definition": DEFINITION,
         "seed": seed,
-        "panel_size": len(panel),
-        "panel_indices": ",".join(str(i) for i in panel),
         "atol": atol,
         "rtol": rtol,
         "required_matched_ratio": required_matched_ratio,
         "strict_atol": STRICT_ATOL,
         "strict_rtol": STRICT_RTOL,
         "device": torch.cuda.get_device_name(0),
-        "n_candidates": len(candidates),
-        "n_survivors": len(survivors),
-        "contest_safe_survivor_count": len(survivors),
-        "contest_safe_survivors": ", ".join(c.name for c in survivors) or "-",
-        "strict_safe_survivor_count": len(strict_survivors),
-        "strict_safe_survivors": ", ".join(c.name for c in strict_survivors) or "-",
-        "contest_only_survivor_count": len(contest_only_survivors),
-        "contest_only_survivors": ", ".join(c.name for c in contest_only_survivors) or "-",
     }
     return {
-        "meta": meta,
-        "rows": rows,
-        "stage_summary": stage_summary,
-        "frontier": frontier_rows,
+        "stage1": {
+            **stage1_analysis,
+            "meta": {
+                **base_meta,
+                "run_stage": "stage1_bf16_f16",
+                "panel_size": len(stage1_panel),
+                "panel_indices": ",".join(str(i) for i in stage1_panel),
+                "n_candidates": len(stage1_candidates),
+                "n_survivors": len(stage1_analysis["survivors"]),
+                "contest_safe_survivor_count": len(stage1_analysis["survivors"]),
+                "contest_safe_survivors": ", ".join(c.name for c in stage1_analysis["survivors"]) or "-",
+                "strict_safe_survivor_count": len(stage1_analysis["strict_survivors"]),
+                "strict_safe_survivors": ", ".join(c.name for c in stage1_analysis["strict_survivors"]) or "-",
+                "contest_only_survivor_count": len(stage1_analysis["contest_only_survivors"]),
+                "contest_only_survivors": ", ".join(c.name for c in stage1_analysis["contest_only_survivors"]) or "-",
+            },
+        },
+        "fp8": {
+            **fp8_analysis,
+            "meta": {
+                **base_meta,
+                "run_stage": "stage1_fp8_followup",
+                "panel_size": len(stage1_panel),
+                "panel_indices": ",".join(str(i) for i in stage1_panel),
+                "fp8_target_stages": ",".join(fp8_targets) or "-",
+                "n_candidates": len(fp8_candidates),
+                "n_survivors": len(fp8_analysis["survivors"]),
+                "contest_safe_survivor_count": len(fp8_analysis["survivors"]),
+                "contest_safe_survivors": ", ".join(c.name for c in fp8_analysis["survivors"]) or "-",
+                "strict_safe_survivor_count": len(fp8_analysis["strict_survivors"]),
+                "strict_safe_survivors": ", ".join(c.name for c in fp8_analysis["strict_survivors"]) or "-",
+                "contest_only_survivor_count": len(fp8_analysis["contest_only_survivors"]),
+                "contest_only_survivors": ", ".join(c.name for c in fp8_analysis["contest_only_survivors"]) or "-",
+            },
+        },
+        "contest": {
+            **contest_analysis,
+            "meta": {
+                **base_meta,
+                "run_stage": "contest_panel",
+                "panel_size": len(contest_panel),
+                "panel_indices": ",".join(str(i) for i in contest_panel),
+                "n_candidates": len(contest_candidates),
+                "n_survivors": len(contest_analysis["survivors"]),
+                "contest_safe_survivor_count": len(contest_analysis["survivors"]),
+                "contest_safe_survivors": ", ".join(c.name for c in contest_analysis["survivors"]) or "-",
+                "strict_safe_survivor_count": len(contest_analysis["strict_survivors"]),
+                "strict_safe_survivors": ", ".join(c.name for c in contest_analysis["strict_survivors"]) or "-",
+                "contest_only_survivor_count": len(contest_analysis["contest_only_survivors"]),
+                "contest_only_survivors": ", ".join(c.name for c in contest_analysis["contest_only_survivors"]) or "-",
+            },
+        },
     }
 
 
@@ -733,30 +1115,46 @@ def _run_moe_with_candidates(inputs: dict, candidates: list[Candidate]):
 
 
 @app.function(**_COMMON, gpu="B200:1")
-def probe_b200(seed: int, panel_size: int, atol: float, rtol: float, required_matched_ratio: float) -> dict:
-    return _probe_impl(seed, panel_size, atol, rtol, required_matched_ratio)
+def probe_b200(
+    seed: int,
+    stage1_panel_size: int,
+    contest_panel_size: int,
+    atol: float,
+    rtol: float,
+    required_matched_ratio: float,
+) -> dict:
+    return _staged_probe_impl(seed, stage1_panel_size, contest_panel_size, atol, rtol, required_matched_ratio)
 
 
 @app.local_entrypoint()
 def probe(
     seed: int = 1234,
-    panel_size: int = DEFAULT_PANEL_SIZE,
+    stage1_panel_size: int = DEFAULT_PANEL_SIZE,
+    contest_panel_size: int = 19,
     label: str = "",
     atol: float = DEFAULT_ATOL,
     rtol: float = DEFAULT_RTOL,
     required_matched_ratio: float = DEFAULT_REQUIRED_MATCHED_RATIO,
 ):
-    result = probe_b200.remote(seed, panel_size, atol, rtol, required_matched_ratio)
+    result = probe_b200.remote(seed, stage1_panel_size, contest_panel_size, atol, rtol, required_matched_ratio)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     suffix = f"_{label}" if label else ""
-    out_dir = PROJECT_ROOT / "experiments" / f"{ts}_B200_moe_precision_search{suffix}"
-    _write_outputs(
-        out_dir,
-        result["rows"],
-        result["meta"],
-        result["stage_summary"],
-        result["frontier"],
-    )
-    print(f"Wrote {out_dir / 'summary.md'}")
-    print(f"Stage summary: {out_dir / 'stage_summary.json'}")
-    print(f"Cumulative frontier: {out_dir / 'safe_frontier.json'}")
+    root_dir = PROJECT_ROOT / "experiments" / f"{ts}_B200_moe_precision_staged{suffix}"
+    root_dir.mkdir(parents=True, exist_ok=True)
+    for key in ("stage1", "fp8", "contest"):
+        run = result[key]
+        out_dir = root_dir / key
+        _write_outputs(
+            out_dir,
+            run["rows"],
+            run["meta"],
+            run["stage_summary"],
+            run["frontier"],
+            extra_json={
+                "pairwise_summary.json": run["pairwise_summary"],
+                "margin_summary.json": run["margin_summary"],
+                "stress_summary.json": run["stress_summary"],
+                "promotion_summary.json": run["promotion_summary"],
+            },
+        )
+        print(f"Wrote {out_dir / 'summary.md'}")

@@ -1,0 +1,62 @@
+[
+  {
+    "worst_matched_ratio_contest": 0.9967912946428571,
+    "worst_matched_ratio_strict": 0.9019252232142857,
+    "worst_max_rel": 111718752.0,
+    "worst_max_abs": 4096.0,
+    "status": "safe",
+    "candidate": "gemm1_accumulator__f16",
+    "stage": "gemm1_accumulator",
+    "mode": "f16",
+    "scale_mode": "none",
+    "scope": "storage_compute"
+  },
+  {
+    "worst_matched_ratio_contest": 0.9993024553571429,
+    "worst_matched_ratio_strict": 0.974609375,
+    "worst_max_rel": 12201.625,
+    "worst_max_abs": 8192.0,
+    "status": "safe",
+    "candidate": "gemm1_accumulator__f16+gemm1_operands__f16",
+    "stage": "gemm1_accumulator+gemm1_operands",
+    "mode": "f16+f16",
+    "scale_mode": "none+none",
+    "scope": "storage_compute+storage_compute"
+  },
+  {
+    "worst_matched_ratio_contest": 0.9990234375,
+    "worst_matched_ratio_strict": 0.9635881696428571,
+    "worst_max_rel": 1225000064.0,
+    "worst_max_abs": 4096.0,
+    "status": "safe",
+    "candidate": "gemm1_accumulator__f16+gemm1_operands__f16+gemm1_output__f16",
+    "stage": "gemm1_accumulator+gemm1_operands+gemm1_output",
+    "mode": "f16+f16+f16",
+    "scale_mode": "none+none+none",
+    "scope": "storage_compute+storage_compute+storage_compute"
+  },
+  {
+    "worst_matched_ratio_contest": 0.990234375,
+    "worst_matched_ratio_strict": 0.7479073660714286,
+    "worst_max_rel": 152134.359375,
+    "worst_max_abs": 12288.0,
+    "status": "safe",
+    "candidate": "gemm1_accumulator__f16+gemm1_operands__f16+gemm1_output__f16+gemm2_accumulator__bf16",
+    "stage": "gemm1_accumulator+gemm1_operands+gemm1_output+gemm2_accumulator",
+    "mode": "f16+f16+f16+bf16",
+    "scale_mode": "none+none+none+none",
+    "scope": "storage_compute+storage_compute+storage_compute+storage_compute"
+  },
+  {
+    "worst_matched_ratio_contest": 0.8745553152901786,
+    "worst_matched_ratio_strict": 0.8559831891741072,
+    "worst_max_rel": 349.64239501953125,
+    "worst_max_abs": 4096.0,
+    "status": "unsafe",
+    "candidate": "gemm1_accumulator__f16+gemm1_operands__f16+gemm1_output__f16+gemm2_accumulator__bf16+gemm2_operands__f16",
+    "stage": "gemm1_accumulator+gemm1_operands+gemm1_output+gemm2_accumulator+gemm2_operands",
+    "mode": "f16+f16+f16+bf16+f16",
+    "scale_mode": "none+none+none+none+none",
+    "scope": "storage_compute+storage_compute+storage_compute+storage_compute+storage_compute"
+  }
+]
