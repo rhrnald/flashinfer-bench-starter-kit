@@ -105,6 +105,19 @@ DEFAULT_FP8_TARGET_STAGES = (
 DEFAULT_PROMOTE_TOP_K_PER_STAGE = 1
 DEFAULT_ENABLE_KERNEL_VALIDATION = True
 DEFAULT_KERNEL_VALIDATION_LIMIT = 5
+DEFAULT_EXHAUSTIVE_CANDIDATE_NAMES = (
+    "gemm1_operands__f16",
+    "gemm1_accumulator__f16",
+    "gemm2_accumulator__bf16",
+    "swiglu_output__fp8__block",
+    "gemm2_operands__fp8__block",
+    "out_accumulator__fp8__tensor",
+    "swiglu_input__fp8__block",
+    "hidden_dequant__fp8__block",
+)
+DEFAULT_EXHAUSTIVE_TOP_K = 20
+DEFAULT_EXHAUSTIVE_NEAR_MISS_K = 10
+DEFAULT_EXHAUSTIVE_NEAR_MISS_THRESHOLD = 0.88
 EVIDENCE_SCOPE = "oracle_only"
 KERNEL_EVIDENCE_SCOPE = "kernel_validated"
 KERNEL_UNSUPPORTED_SCOPE = "kernel_not_supported"
@@ -366,6 +379,39 @@ def _parse_targeted_config_specs(config_specs: str) -> list[tuple[str, tuple[Can
     return configs
 
 
+def _exhaustive_sort_key(row: dict) -> tuple:
+    contest_safe = row["contest_status"] == "contest_safe"
+    strict_safe = row["strict_status"] == "strict_safe"
+    n_lowered = 0 if row["candidate"] == "baseline__fp32" else len(row["candidate"].split("+"))
+    return (
+        1 if contest_safe else 0,
+        row["worst_matched_ratio_contest"],
+        n_lowered,
+        row["worst_matched_ratio_strict"],
+        -row["worst_max_rel"],
+        1 if strict_safe else 0,
+    )
+
+
+def _build_exhaustive_candidates() -> list[Candidate]:
+    return [_candidate_from_name(name) for name in DEFAULT_EXHAUSTIVE_CANDIDATE_NAMES]
+
+
+def _build_exhaustive_configs(candidates: list[Candidate]) -> list[EvalConfig]:
+    configs = [_make_eval_config((), "exhaustive", "baseline__fp32")]
+    for subset_size in range(1, len(candidates) + 1):
+        for subset in itertools.combinations(candidates, subset_size):
+            configs.append(_make_eval_config(subset, "exhaustive"))
+    return configs
+
+
+def _best_row(rows: list[dict], predicate) -> dict | None:
+    matches = [row for row in rows if predicate(row)]
+    if not matches:
+        return None
+    return max(matches, key=_exhaustive_sort_key)
+
+
 def _combined_candidates(survivors: list[Candidate]) -> list[Candidate]:
     return [
         cand
@@ -607,6 +653,123 @@ def _write_targeted_outputs(out_dir: Path, rows: list[dict], meta: dict[str, Any
             f"{row['contest_status']} | {row['strict_status']} |"
         )
     lines.append("")
+    lines.append("## Sampled Results")
+    lines.append("")
+    lines.append("| candidate | phase | workload | seq_len | matched_contest | matched_strict | max_abs | max_rel | failure |")
+    lines.append("|---|---|---|---:|---:|---:|---:|---:|---|")
+    for row in rows:
+        lines.append(
+            f"| {row['candidate']} | {row['search_phase']} | "
+            f"{_canonical_short_uuid(row['workload_uuid'])} | {row['seq_len']} | "
+            f"{_fmt(row['matched_ratio_contest'], '.6f')} | {_fmt(row['matched_ratio_strict'], '.6f')} | "
+            f"{_fmt(row['max_abs'], '.4e')} | {_fmt(row['max_rel'], '.4e')} | {row['failure_label']} |"
+        )
+    (out_dir / "summary.md").write_text("\n".join(lines))
+
+
+def _write_exhaustive_outputs(
+    out_dir: Path,
+    rows: list[dict],
+    meta: dict[str, Any],
+    config_summary: list[dict],
+    leaderboard: dict[str, Any],
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "candidate",
+        "search_phase",
+        "workload_index",
+        "workload_uuid",
+        "seq_len",
+        "stage",
+        "mode",
+        "scale_mode",
+        "scope",
+        "max_abs",
+        "max_rel",
+        "mean_abs",
+        "matched_ratio_contest",
+        "matched_ratio_strict",
+        "selected_experts",
+        "failure_label",
+    ]
+    with (out_dir / "precision_candidates.csv").open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    (out_dir / "config_summary.json").write_text(json.dumps(config_summary, indent=2))
+    (out_dir / "leaderboard.json").write_text(json.dumps(leaderboard, indent=2))
+
+    lines = [f"# MoE Exhaustive Precision Search {meta['timestamp']}", ""]
+    lines.append("| metric | value |")
+    lines.append("|---|---|")
+    for k, v in meta.items():
+        lines.append(f"| {k} | {v} |")
+    lines.append("")
+
+    lines.append("## Summary")
+    lines.append("")
+    lines.append("| category | candidate | worst_matched_contest | worst_matched_strict | worst_max_rel | contest_status | strict_status |")
+    lines.append("|---|---|---:|---:|---:|---|---|")
+    for key in (
+        "best_safe_recipe",
+        "most_aggressive_safe_recipe",
+        "best_post_gemm1_safe_recipe",
+        "best_with_hidden_dequant",
+        "best_without_hidden_dequant",
+    ):
+        row = leaderboard.get(key)
+        if row is None:
+            lines.append(f"| {key} | - | - | - | - | - | - |")
+            continue
+        lines.append(
+            f"| {key} | {row['candidate']} | {_fmt(row['worst_matched_ratio_contest'], '.6f')} | "
+            f"{_fmt(row['worst_matched_ratio_strict'], '.6f')} | {_fmt(row['worst_max_rel'], '.4e')} | "
+            f"{row['contest_status']} | {row['strict_status']} |"
+        )
+    lines.append("")
+
+    if leaderboard.get("hidden_dequant_impact_summary"):
+        impact = leaderboard["hidden_dequant_impact_summary"]
+        lines.append("## Hidden Dequant Impact")
+        lines.append("")
+        lines.append("| comparison | candidate | worst_matched_contest | delta_vs_without |")
+        lines.append("|---|---|---:|---:|")
+        for label in ("best_with_hidden_dequant", "best_without_hidden_dequant"):
+            row = impact.get(label)
+            if row is None:
+                continue
+            lines.append(
+                f"| {label} | {row['candidate']} | {_fmt(row['worst_matched_ratio_contest'], '.6f')} | "
+                f"{_fmt(row.get('delta_vs_without'), '.6f')} |"
+            )
+        lines.append("")
+
+    lines.append("## Top Passing Recipes")
+    lines.append("")
+    lines.append("| rank | candidate | worst_matched_contest | worst_matched_strict | lowered_stages | worst_max_rel |")
+    lines.append("|---|---|---:|---:|---:|---:|")
+    for i, row in enumerate(leaderboard.get("top_passing_recipes", []), start=1):
+        lowered = 0 if row["candidate"] == "baseline__fp32" else len(row["candidate"].split("+"))
+        lines.append(
+            f"| {i} | {row['candidate']} | {_fmt(row['worst_matched_ratio_contest'], '.6f')} | "
+            f"{_fmt(row['worst_matched_ratio_strict'], '.6f')} | {lowered} | {_fmt(row['worst_max_rel'], '.4e')} |"
+        )
+    lines.append("")
+
+    lines.append("## Near-Miss Recipes")
+    lines.append("")
+    lines.append("| rank | candidate | worst_matched_contest | worst_matched_strict | lowered_stages | worst_max_rel |")
+    lines.append("|---|---|---:|---:|---:|---:|")
+    for i, row in enumerate(leaderboard.get("near_miss_recipes", []), start=1):
+        lowered = 0 if row["candidate"] == "baseline__fp32" else len(row["candidate"].split("+"))
+        lines.append(
+            f"| {i} | {row['candidate']} | {_fmt(row['worst_matched_ratio_contest'], '.6f')} | "
+            f"{_fmt(row['worst_matched_ratio_strict'], '.6f')} | {lowered} | {_fmt(row['worst_max_rel'], '.4e')} |"
+        )
+    lines.append("")
+
     lines.append("## Sampled Results")
     lines.append("")
     lines.append("| candidate | phase | workload | seq_len | matched_contest | matched_strict | max_abs | max_rel | failure |")
@@ -1258,6 +1421,74 @@ def _analyze_eval_configs(
     }
 
 
+def _build_exhaustive_leaderboard(config_summary: list[dict]) -> dict[str, Any]:
+    sorted_rows = sorted(config_summary, key=_exhaustive_sort_key, reverse=True)
+    passing = [row for row in sorted_rows if row["contest_status"] == "contest_safe"]
+    near_misses = [
+        row for row in sorted_rows
+        if row["contest_status"] != "contest_safe"
+        and row["worst_matched_ratio_contest"] >= DEFAULT_EXHAUSTIVE_NEAR_MISS_THRESHOLD
+    ]
+
+    best_safe_recipe = passing[0] if passing else None
+    most_aggressive_safe_recipe = None
+    if passing:
+        most_aggressive_safe_recipe = max(
+            passing,
+            key=lambda row: (
+                0 if row["candidate"] == "baseline__fp32" else len(row["candidate"].split("+")),
+                row["worst_matched_ratio_contest"],
+                row["worst_matched_ratio_strict"],
+                -row["worst_max_rel"],
+            ),
+        )
+    post_gemm1_stages = {
+        "gemm1_operands",
+        "gemm1_accumulator",
+        "swiglu_input",
+        "swiglu_output",
+        "gemm2_operands",
+        "gemm2_accumulator",
+        "out_accumulator",
+    }
+
+    def _is_post_gemm1(row: dict) -> bool:
+        if row["candidate"] == "baseline__fp32":
+            return False
+        return all(stage in post_gemm1_stages for stage in row["stage"].split("+"))
+
+    best_post_gemm1_safe_recipe = _best_row(passing, _is_post_gemm1)
+    best_with_hidden = _best_row(
+        passing,
+        lambda row: row["candidate"] != "baseline__fp32" and "hidden_dequant__fp8__block" in row["candidate"].split("+"),
+    )
+    best_without_hidden = _best_row(
+        passing,
+        lambda row: "hidden_dequant__fp8__block" not in row["candidate"].split("+"),
+    )
+
+    hidden_impact = {
+        "best_with_hidden_dequant": None if best_with_hidden is None else dict(best_with_hidden),
+        "best_without_hidden_dequant": None if best_without_hidden is None else dict(best_without_hidden),
+    }
+    if best_with_hidden is not None and best_without_hidden is not None:
+        hidden_impact["best_with_hidden_dequant"]["delta_vs_without"] = (
+            best_with_hidden["worst_matched_ratio_contest"] - best_without_hidden["worst_matched_ratio_contest"]
+        )
+        hidden_impact["best_without_hidden_dequant"]["delta_vs_without"] = 0.0
+
+    return {
+        "best_safe_recipe": best_safe_recipe,
+        "most_aggressive_safe_recipe": most_aggressive_safe_recipe,
+        "best_post_gemm1_safe_recipe": best_post_gemm1_safe_recipe,
+        "best_with_hidden_dequant": best_with_hidden,
+        "best_without_hidden_dequant": best_without_hidden,
+        "hidden_dequant_impact_summary": hidden_impact,
+        "top_passing_recipes": passing[:DEFAULT_EXHAUSTIVE_TOP_K],
+        "near_miss_recipes": near_misses[:DEFAULT_EXHAUSTIVE_NEAR_MISS_K],
+    }
+
+
 def _candidate_from_stage_row(row: dict) -> Candidate | None:
     if row["status"] != "safe" or row["best_safe_mode"] == "-":
         return None
@@ -1488,6 +1719,59 @@ def _targeted_probe_impl(
     }
 
 
+def _exhaustive_probe_impl(
+    seed: int,
+    contest_panel_size: int,
+    atol: float,
+    rtol: float,
+    required_matched_ratio: float,
+) -> dict:
+    import torch
+    from flashinfer_bench import TraceSet
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    trace_set = TraceSet.from_path(TRACE_SET_PATH)
+    definition = trace_set.definitions[DEFINITION]
+    workloads = trace_set.workloads[DEFINITION]
+    contest_panel = _panel_indices(workloads, min(contest_panel_size, len(workloads)))
+    contest_records = _load_panel_records(trace_set, definition, workloads, contest_panel)
+
+    candidates = _build_exhaustive_candidates()
+    configs = _build_exhaustive_configs(candidates)
+    analysis = _analyze_eval_configs(
+        contest_records,
+        definition,
+        trace_set,
+        configs,
+        atol=atol,
+        rtol=rtol,
+        required_matched_ratio=required_matched_ratio,
+    )
+    leaderboard = _build_exhaustive_leaderboard(analysis["config_summary"])
+    return {
+        **analysis,
+        "leaderboard": leaderboard,
+        "meta": {
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "definition": DEFINITION,
+            "seed": seed,
+            "atol": atol,
+            "rtol": rtol,
+            "required_matched_ratio": required_matched_ratio,
+            "strict_atol": STRICT_ATOL,
+            "strict_rtol": STRICT_RTOL,
+            "panel_size": len(contest_panel),
+            "panel_indices": ",".join(str(i) for i in contest_panel),
+            "candidate_count": len(candidates),
+            "config_count": len(configs),
+            "candidate_names": ", ".join(cand.name for cand in candidates),
+            "ranking_goal": "safety_first",
+            "evidence_scope": EVIDENCE_SCOPE,
+        },
+    }
+
+
 def _run_moe_with_candidates(inputs: dict, candidates: list[Candidate]):
     import torch
 
@@ -1601,6 +1885,23 @@ def probe_targeted_b200(
     )
 
 
+@app.function(**_COMMON, gpu="B200:1")
+def probe_exhaustive_b200(
+    seed: int,
+    contest_panel_size: int,
+    atol: float,
+    rtol: float,
+    required_matched_ratio: float,
+) -> dict:
+    return _exhaustive_probe_impl(
+        seed,
+        contest_panel_size,
+        atol,
+        rtol,
+        required_matched_ratio,
+    )
+
+
 @app.local_entrypoint()
 def probe(
     seed: int = 1234,
@@ -1671,4 +1972,33 @@ def probe_targeted(
     suffix = f"_{label}" if label else ""
     out_dir = PROJECT_ROOT / "experiments" / f"{ts}_B200_moe_precision_targeted{suffix}"
     _write_targeted_outputs(out_dir, result["rows"], result["meta"], result["config_summary"])
+    print(f"Wrote {out_dir / 'summary.md'}")
+
+
+@app.local_entrypoint()
+def probe_exhaustive(
+    seed: int = 1234,
+    contest_panel_size: int = 19,
+    label: str = "",
+    atol: float = DEFAULT_ATOL,
+    rtol: float = DEFAULT_RTOL,
+    required_matched_ratio: float = DEFAULT_REQUIRED_MATCHED_RATIO,
+):
+    result = probe_exhaustive_b200.remote(
+        seed,
+        contest_panel_size,
+        atol,
+        rtol,
+        required_matched_ratio,
+    )
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    suffix = f"_{label}" if label else ""
+    out_dir = PROJECT_ROOT / "experiments" / f"{ts}_B200_moe_precision_exhaustive{suffix}"
+    _write_exhaustive_outputs(
+        out_dir,
+        result["rows"],
+        result["meta"],
+        result["config_summary"],
+        result["leaderboard"],
+    )
     print(f"Wrote {out_dir / 'summary.md'}")
