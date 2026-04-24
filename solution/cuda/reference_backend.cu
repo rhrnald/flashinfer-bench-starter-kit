@@ -228,6 +228,7 @@ __global__ void gemm1_permuted_kernel(const uint8_t* __restrict__ hidden_fp8,
                                       const float* __restrict__ hidden_scale,
                                       int64_t t, int hidden, int gemm1_out,
                                       int block, int hidden_blocks, int n_rows,
+                                      int local_expert_idx,
                                       const int* __restrict__ permuted_tok,
                                       const uint8_t* __restrict__ w13,
                                       const float* __restrict__ s13, bool emulate_fp8_unit,
@@ -306,6 +307,7 @@ __global__ void gemm2_scatter_accumulate_kernel(const float* __restrict__ c_perm
                                                 int intermediate_blocks, int n_rows,
                                                 const int* __restrict__ permuted_tok,
                                                 const float* __restrict__ permuted_w,
+                                                int local_expert_idx,
                                                 const uint8_t* __restrict__ w2,
                                                 const float* __restrict__ s2,
                                                 bool emulate_fp8_unit,
@@ -541,13 +543,13 @@ void ReferenceGemmModule::RunExpertPermuted(const uint8_t* hidden_fp8_dev,
 
   gemm1_permuted_kernel<<<b1, kThreads, 0, stream>>>(
       hidden_fp8_dev, hidden_scale_dev, t, hidden_, gemm1_out_, block_, hidden_blocks_, n_rows,
-      permuted_tok_e, w13_e, s13_e, emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_,
-      quantize_scale_e8m0_, g1_dev_);
+      local_expert_idx, permuted_tok_e, w13_e, s13_e, emulate_fp8_unit_, emulate_fp16_operands_,
+      emulate_acc_half_, quantize_scale_e8m0_, g1_dev_);
   swiglu_permuted_kernel<<<b2, kThreads, 0, stream>>>(g1_dev_, intermediate_, n_rows,
                                                       emulate_fp8_unit_, c_dev_);
   gemm2_scatter_accumulate_kernel<<<b3, kThreads, 0, stream>>>(
       c_dev_, hidden_, intermediate_, block_, intermediate_blocks_, n_rows, permuted_tok_e,
-      permuted_w_e, w2_e, s2_e, emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_,
+      permuted_w_e, local_expert_idx, w2_e, s2_e, emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_,
       quantize_scale_e8m0_, out_acc_dev);
 }
 
@@ -570,9 +572,12 @@ cudaError_t ReferenceGemmModule::RunStep1AllExpertsDirect(const uint8_t* hidden_
   UploadTensorMap(hidden_tmap, &step1_hidden_tma_desc_dev_);
   UploadTensorMap(w13_tmap, &step1_w13_tma_desc_dev_);
 
+  const bool use_step1_tma = std::getenv("FIB_MOE_COMM_USE_TMA") != nullptr;
   cudaError_t st = direct_backend::RunStep1AllExpertsDirect(
       hidden_fp8_dev, hidden_scale_dev, t, expert_t_valid, expert_offset, valid_token_idx,
-      gemm1_w_dev, gemm1_s_dev, c_perm_all_dev, stream);
+      gemm1_w_dev, gemm1_s_dev, use_step1_tma ? step1_w13_tma_desc_dev_ : nullptr,
+      0,
+      c_perm_all_dev, stream);
   if (st != cudaSuccess) return st;
   // Debug/stability guard: force surfacing async kernel faults at Step1 boundary
   // so they are not misattributed to later descriptor uploads.

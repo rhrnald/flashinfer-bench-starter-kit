@@ -5,16 +5,27 @@ cd /home/snu_avq1/workspace/chaewon/flashinfer-bench-starter-kit
 
 PYTHON=/home/snu_avq1/miniconda3/envs/fi-bench/bin/python
 export FIB_DATASET_PATH=/home/snu_avq1/workspace/mlsys26-contest
+export FIB_MOE_COMM_USE_TMA=1
+export FIB_MOE_DIRECT_TMA_SW128=1
+export FIB_MOE_DIRECT_B_SW128=1
+export FIB_MOE_COMM_H_TILES=8
+export FIB_STEP1_ABLATE_ACCUM56=1
 
-WORKLOAD_INDEXES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18
-REPORT_NAME=${1:-ncu_flashinfer_baseline_and_direct_19x1}
-if (($# > 0)); then
-    shift
+WORKLOAD_INDEXES=${WORKLOAD_INDEXES:-1}
+REPORT_NAME=${REPORT_NAME:-ex}
+
+if command -v gcsudo >/dev/null 2>&1; then
+    NCU_CMD=(gcsudo ncu)
+else
+    NCU_CMD=(ncu)
 fi
 
-ncu --set full \
+"${NCU_CMD[@]}" --set full \
     --target-processes all \
     --clock-control none \
+    --kernel-name-base function \
+    --kernel-name regex:step1_gemm1_swiglu_direct_kernel.* \
+    --launch-count 2 \
     -f \
     -o "${REPORT_NAME}" \
     "$@" \
@@ -24,7 +35,6 @@ ncu --set full \
         --warmup-runs 0 \
         --iterations 1 \
         --num-trials 1 \
-        --correctness-only \
         --workload-indexes "${WORKLOAD_INDEXES}" \
         --seed 1234
 

@@ -30,7 +30,7 @@ static constexpr int kStep1RowTile = 8;                                         
 static constexpr int kStep1OutRowsPerCta = 32;                                    // one CTA owns 32 gate rows + 32 up rows
 static constexpr int kStep1LocalExperts = 32;
 static constexpr int kStep1Threads = 32;                                          // one warp
-static constexpr int kStep1CommThreads = 256;                                     // eight warps for cooperative staging
+static constexpr int kStep1CommThreads = 128;                                     // four warps for cooperative staging
 static constexpr int kStep1CommWarps = kStep1CommThreads / kStep1Threads;
 static constexpr int kStep1HiddenBlocks = kStep1Hidden / kStep1Block;             // 56
 static constexpr int kStep1TmaChunkBlocks = 4;
@@ -52,6 +52,8 @@ static constexpr int kStep1TcgenTmemCols = 64;
 static constexpr int kStep1TcgenCompactKBytes = 32;
 static constexpr int kStep1TcgenACompactBytes = kStep1TcgenM * kStep1Block;                    // 8192
 static constexpr int kStep1TcgenBCompactBytes = kStep1TcgenN * kStep1Block;                    // 1024
+static constexpr int kStep1TcgenScaleDiagBytes =
+    2 * kStep1HiddenBlocks * 2 * kStep1TcgenN * 4 * sizeof(float);                              // 28672
 static constexpr uint32_t kStep1TcgenLayoutSwizzle128B = 2;
 static constexpr int kStep1PipelineStages = 2;
 
@@ -94,6 +96,15 @@ __device__ __forceinline__ float silu_device(float x) {
   return x / (1.0f + expf(-x));
 }
 
+__device__ __forceinline__ __half2 silu_half2_device(__half2 x) {
+  const __half2 one = __float2half2_rn(1.0f);
+  return __hmul2(x, h2rcp(__hadd2(one, h2exp(__hneg2(x)))));
+}
+
+__device__ __forceinline__ __half2 swiglu_half2_device(__half2 gate, __half2 up) {
+  return __hmul2(gate, silu_half2_device(up));
+}
+
 // Shared-memory layout for the restructured direct kernel:
 //   [ weight_group_combined | hidden_group ]
 // where weight_group_combined stores gate/up together:
@@ -112,6 +123,8 @@ __host__ __device__ __forceinline__ std::size_t step1_smem_bytes() {
   offset += kStep1TcgenACompactBytes;
   offset = align_up(offset, 1024);
   offset += kStep1TcgenBCompactBytes;
+  offset = align_up(offset, 1024);
+  offset += kStep1TcgenScaleDiagBytes;
   return align_up(offset + 1024, 1024);
 }
 
@@ -562,6 +575,12 @@ __device__ __forceinline__ constexpr uint32_t make_tcgen05_idesc_f8f6f4_dense(
                          : make_tcgen05_idesc_f8f6f4_f32_dense(m, n);
 }
 
+__device__ __forceinline__ constexpr uint32_t make_tcgen05_idesc_tf32_ts_f32_dense(int m, int n) {
+  return (1u << 4) | (2u << 7) | (2u << 10) |
+         (static_cast<uint32_t>(n >> 3) << 17) |
+         (static_cast<uint32_t>(m >> 4) << 24);
+}
+
 template <int AccumMode>
 __device__ __forceinline__ constexpr uint32_t make_tcgen05_idesc_f8f6f4_dense(int m, int n) {
   if constexpr (AccumMode == 1) {
@@ -605,6 +624,27 @@ __device__ __forceinline__ void tcgen05_mma_f8f6f4_cta1_ss(
       : "memory");
 }
 
+__device__ __forceinline__ void tcgen05_mma_tf32_cta1_ts(
+    uint32_t d_tmem,
+    uint32_t a_tmem,
+    uint64_t b_desc,
+    uint32_t idesc,
+    bool enable_input_d) {
+  uint32_t enable_u32 = enable_input_d ? 1u : 0u;
+  uint32_t disable_output_lane[4] = {0, 0, 0, 0};
+  asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.ne.u32 p, %8, 0;\n\t"
+      "tcgen05.mma.cta_group::1.kind::tf32 [%0], [%1], %2, %3, {%4, %5, %6, %7}, p;\n\t"
+      "}\n"
+      :
+      : "r"(d_tmem), "r"(a_tmem), "l"(b_desc), "r"(idesc),
+        "r"(disable_output_lane[0]), "r"(disable_output_lane[1]),
+        "r"(disable_output_lane[2]), "r"(disable_output_lane[3]), "r"(enable_u32)
+      : "memory");
+}
+
 __device__ __forceinline__ void tcgen05_commit_group1(uint64_t const* smem_ptr) {
   uint32_t bar_intptr = cute::cast_smem_ptr_to_uint(smem_ptr);
   asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
@@ -642,6 +682,44 @@ __device__ __forceinline__ void tcgen05_ld_16x64b_x4(float (&dst)[4], uint32_t t
   for (int i = 0; i < 4; ++i) {
     dst[i] = __uint_as_float(bits[i]);
   }
+}
+
+__device__ __forceinline__ float tcgen05_ld_16x64b_x1_to_f32(uint32_t taddr) {
+  uint32_t bits;
+  asm volatile("tcgen05.ld.sync.aligned.16x64b.x1.b32 "
+               "{%0}, [%1];"
+               : "=r"(bits)
+               : "r"(taddr)
+               : "memory");
+  return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ float tcgen05_ld_16x64b_x1_f16_to_f32(uint32_t taddr) {
+  uint32_t bits;
+  asm volatile("tcgen05.ld.sync.aligned.16x64b.x1.pack::16b.b32 "
+               "{%0}, [%1];"
+               : "=r"(bits)
+               : "r"(taddr)
+               : "memory");
+  return __half2float(__ushort_as_half(static_cast<unsigned short>(bits & 0xffffu)));
+}
+
+__device__ __forceinline__ __half2 tcgen05_ld_16x64b_x1_f16_to_half2(uint32_t taddr) {
+  uint32_t bits;
+  asm volatile("tcgen05.ld.sync.aligned.16x64b.x1.pack::16b.b32 "
+               "{%0}, [%1];"
+               : "=r"(bits)
+               : "r"(taddr)
+               : "memory");
+  return __halves2half2(
+      __ushort_as_half(static_cast<unsigned short>(bits & 0xffffu)),
+      __ushort_as_half(static_cast<unsigned short>((bits >> 16) & 0xffffu)));
+}
+
+__device__ __forceinline__ float tcgen05_ld_16x64b_x1_accum_to_f32(
+    uint32_t taddr, int accum_mode) {
+  return accum_mode == 1 ? tcgen05_ld_16x64b_x1_f16_to_f32(taddr)
+                         : tcgen05_ld_16x64b_x1_to_f32(taddr);
 }
 
 __device__ __forceinline__ void tcgen05_ld_16x64b_x4_f16_to_f32(
@@ -922,6 +1000,237 @@ __device__ __forceinline__ uint64_t make_tcgen05_core_matrix_desc_group8_k128(co
   desc |= static_cast<uint64_t>(0xb0u) << 53;
   desc |= static_cast<uint64_t>(kStep1TcgenLayoutSwizzle128B & 0x7u) << 61;
   return desc;
+}
+
+__device__ __forceinline__ uint64_t make_tcgen05_tf32_diag_desc(const void* smem) {
+  const uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem);
+  const uint32_t matrix_start_aligned = smem_addr & ~0xFu;
+  const uint32_t lbo = kStep1TcgenN * 16u;
+  const uint32_t sbo = kStep1TcgenN * 16u;
+  uint64_t desc = 0;
+  desc |= static_cast<uint64_t>(matrix_start_aligned >> 4);
+  desc |= static_cast<uint64_t>((lbo & 0x3ffffu) >> 4) << 16;
+  desc |= static_cast<uint64_t>((sbo & 0x3ffffu) >> 4) << 32;
+  desc |= static_cast<uint64_t>(1u) << 46;
+  desc |= static_cast<uint64_t>(0xb0u) << 53;
+  return desc;
+}
+
+__device__ __forceinline__ void stage_tcgen05_tf32_diag_scale(
+    float* smem_diag,
+    float block_scale,
+    const float* __restrict__ hidden_scale_dev,
+    int64_t t,
+    const int* __restrict__ valid_token_idx,
+    int packed_base,
+    int row_tile,
+    int n_rows,
+    int k_blk) {
+  constexpr int kDiagElems = 2 * kStep1TcgenN * 4;
+#pragma unroll
+  for (int iter = 0; iter < (kDiagElems + kStep1CommThreads - 1) / kStep1CommThreads; ++iter) {
+    const int linear = threadIdx.x + iter * kStep1CommThreads;
+    if (linear >= kDiagElems) continue;
+    const int slice = linear / (kStep1TcgenN * 4);
+    const int rem = linear - slice * kStep1TcgenN * 4;
+    const int n = rem / 4;
+    const int k_in_slice = rem - n * 4;
+    const int k = slice * 4 + k_in_slice;
+    float value = 0.0f;
+    if (n == k && n < n_rows) {
+      const int packed_idx = packed_base + row_tile + n;
+      const int token_idx = valid_token_idx[packed_idx];
+      value = block_scale * hidden_scale_dev[static_cast<int64_t>(k_blk) * t + token_idx];
+    }
+    smem_diag[linear] = value;
+  }
+}
+
+__device__ __forceinline__ void zero_tcgen05_tf32_scale_buffers(float* smem_diag) {
+  constexpr int kScaleElems = kStep1TcgenScaleDiagBytes / sizeof(float);
+#pragma unroll
+  for (int iter = 0; iter < (kScaleElems + kStep1CommThreads - 1) / kStep1CommThreads; ++iter) {
+    const int linear = threadIdx.x + iter * kStep1CommThreads;
+    if (linear < kScaleElems) {
+      smem_diag[linear] = 0.0f;
+    }
+  }
+}
+
+__device__ __forceinline__ void stage_tcgen05_tf32_all_diag_scales(
+    float* smem_diag,
+    const float* __restrict__ s13_all_dev,
+    const float* __restrict__ hidden_scale_dev,
+    int64_t t,
+    const int* __restrict__ valid_token_idx,
+    int expert,
+    int out_block128,
+    int packed_base,
+    int row_tile,
+    int n_rows) {
+  constexpr int kScaleElems = kStep1TcgenScaleDiagBytes / sizeof(float);
+#pragma unroll
+  for (int iter = 0; iter < (kScaleElems + kStep1CommThreads - 1) / kStep1CommThreads; ++iter) {
+    const int linear = threadIdx.x + iter * kStep1CommThreads;
+    if (linear >= kScaleElems) continue;
+    const int elems_per_matrix = 2 * kStep1TcgenN * 4;
+    const int matrix = linear / elems_per_matrix;
+    const int rem = linear - matrix * elems_per_matrix;
+    const int k_blk = matrix >> 1;
+    const int is_up = matrix & 1;
+    const int slice = rem / (kStep1TcgenN * 4);
+    const int rem2 = rem - slice * kStep1TcgenN * 4;
+    const int n = rem2 / 4;
+    const int k_in_slice = rem2 - n * 4;
+    const int logical_k = slice * 4 + k_in_slice;
+    float value = 0.0f;
+    if (n == logical_k && n < n_rows) {
+      const int packed_idx = packed_base + row_tile + n;
+      const int token_idx = valid_token_idx[packed_idx];
+      const int scale_block =
+          is_up ? (out_block128 + kStep1IntermediateBlocks) : out_block128;
+      const float block_scale =
+          s13_all_dev[(expert * kStep1Gemm1OutBlocks + scale_block) *
+                          kStep1HiddenBlocks +
+                      k_blk];
+      value = block_scale * hidden_scale_dev[static_cast<int64_t>(k_blk) * t + token_idx];
+    }
+    smem_diag[linear] = value;
+  }
+}
+
+__device__ __forceinline__ void update_tcgen05_tf32_all_diag_values(
+    float* smem_diag,
+    const float* __restrict__ s13_all_dev,
+    const float* __restrict__ hidden_scale_dev,
+    int64_t t,
+    const int* __restrict__ valid_token_idx,
+    int expert,
+    int out_block128,
+    int packed_base,
+    int row_tile,
+    int n_rows) {
+  constexpr int kDiagValues = 2 * kStep1HiddenBlocks * kStep1TcgenN;
+#pragma unroll
+  for (int iter = 0; iter < (kDiagValues + kStep1CommThreads - 1) / kStep1CommThreads; ++iter) {
+    const int linear = threadIdx.x + iter * kStep1CommThreads;
+    if (linear >= kDiagValues) continue;
+    const int matrix = linear / kStep1TcgenN;
+    const int n = linear - matrix * kStep1TcgenN;
+    const int k_blk = matrix >> 1;
+    const int is_up = matrix & 1;
+    float value = 0.0f;
+    if (n < n_rows) {
+      const int packed_idx = packed_base + row_tile + n;
+      const int token_idx = valid_token_idx[packed_idx];
+      const int scale_block =
+          is_up ? (out_block128 + kStep1IntermediateBlocks) : out_block128;
+      const float block_scale =
+          s13_all_dev[(expert * kStep1Gemm1OutBlocks + scale_block) *
+                          kStep1HiddenBlocks +
+                      k_blk];
+      value = block_scale * hidden_scale_dev[static_cast<int64_t>(k_blk) * t + token_idx];
+    }
+    const int slice = n >> 2;
+    const int k_in_slice = n & 3;
+    smem_diag[matrix * (2 * kStep1TcgenN * 4) +
+              slice * kStep1TcgenN * 4 + n * 4 + k_in_slice] = value;
+  }
+}
+
+__device__ __forceinline__ void update_tcgen05_tf32_diag_only(
+    float* smem_diag,
+    float block_scale,
+    const float* __restrict__ hidden_scale_dev,
+    int64_t t,
+    const int* __restrict__ valid_token_idx,
+    int packed_base,
+    int row_tile,
+    int n_rows,
+    int k_blk) {
+  if (threadIdx.x < kStep1TcgenN) {
+    const int n = threadIdx.x;
+    float value = 0.0f;
+    if (n < n_rows) {
+      const int packed_idx = packed_base + row_tile + n;
+      const int token_idx = valid_token_idx[packed_idx];
+      value = block_scale * hidden_scale_dev[static_cast<int64_t>(k_blk) * t + token_idx];
+    }
+    const int slice = n >> 2;
+    const int k_in_slice = n & 3;
+    smem_diag[slice * kStep1TcgenN * 4 + n * 4 + k_in_slice] = value;
+  }
+}
+#else
+__device__ __forceinline__ void zero_tcgen05_tf32_scale_buffers(float* smem_diag) {
+  (void)smem_diag;
+}
+
+__device__ __forceinline__ void stage_tcgen05_tf32_all_diag_scales(
+    float* smem_diag,
+    const float* __restrict__ s13_all_dev,
+    const float* __restrict__ hidden_scale_dev,
+    int64_t t,
+    const int* __restrict__ valid_token_idx,
+    int expert,
+    int out_block128,
+    int packed_base,
+    int row_tile,
+    int n_rows) {
+  (void)smem_diag;
+  (void)s13_all_dev;
+  (void)hidden_scale_dev;
+  (void)t;
+  (void)valid_token_idx;
+  (void)expert;
+  (void)out_block128;
+  (void)packed_base;
+  (void)row_tile;
+  (void)n_rows;
+}
+
+__device__ __forceinline__ void update_tcgen05_tf32_all_diag_values(
+    float* smem_diag,
+    const float* __restrict__ s13_all_dev,
+    const float* __restrict__ hidden_scale_dev,
+    int64_t t,
+    const int* __restrict__ valid_token_idx,
+    int expert,
+    int out_block128,
+    int packed_base,
+    int row_tile,
+    int n_rows) {
+  (void)smem_diag;
+  (void)s13_all_dev;
+  (void)hidden_scale_dev;
+  (void)t;
+  (void)valid_token_idx;
+  (void)expert;
+  (void)out_block128;
+  (void)packed_base;
+  (void)row_tile;
+  (void)n_rows;
+}
+
+__device__ __forceinline__ void update_tcgen05_tf32_diag_only(
+    float* smem_diag,
+    float block_scale,
+    const float* __restrict__ hidden_scale_dev,
+    int64_t t,
+    const int* __restrict__ valid_token_idx,
+    int packed_base,
+    int row_tile,
+    int n_rows,
+    int k_blk) {
+  (void)smem_diag;
+  (void)block_scale;
+  (void)hidden_scale_dev;
+  (void)t;
+  (void)valid_token_idx;
+  (void)packed_base;
+  (void)row_tile;
+  (void)n_rows;
+  (void)k_blk;
 }
 #endif
 
@@ -1485,6 +1794,8 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
   const std::size_t tcgen_a_offset =
       align_up(hidden_group_offset + 2 * hidden_group_bytes, 1024);
   const std::size_t tcgen_b_offset = align_up(tcgen_a_offset + kStep1TcgenACompactBytes, 1024);
+  const std::size_t tcgen_scale_offset =
+      align_up(tcgen_b_offset + kStep1TcgenBCompactBytes, 1024);
   uint32_t* smem_A_group = reinterpret_cast<uint32_t*>(smem_raw + smem_align_pad);
   uint32_t* smem_A_group_alt =
       reinterpret_cast<uint32_t*>(smem_raw + smem_align_pad + weight_group_bytes);
@@ -1493,8 +1804,11 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
       reinterpret_cast<uint32_t*>(smem_raw + hidden_group_offset + hidden_group_bytes);
   uint8_t* smem_A_tcgen = smem_raw + tcgen_a_offset;
   uint8_t* smem_B_tcgen = smem_raw + tcgen_b_offset;
+  float* smem_tcgen_scale = reinterpret_cast<float*>(smem_raw + tcgen_scale_offset);
   alignas(16) __shared__ float tcgen_gate_acc_smem[kStep1OutRowsPerCta * kStep1RowTile];
   alignas(16) __shared__ float tcgen_up_acc_smem[kStep1OutRowsPerCta * kStep1RowTile];
+  alignas(16) __shared__ unsigned short tcgen_gate_acc_h_smem[kStep1OutRowsPerCta];
+  alignas(16) __shared__ unsigned short tcgen_up_acc_h_smem[kStep1OutRowsPerCta];
 
 #if defined(MXFP_ENABLE_TCGEN05_PTX_ACTIVE) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   alignas(16) __shared__ uint64_t weight_group_barrier[kStep1PipelineStages];
@@ -1524,10 +1838,16 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
       tcgen_gate_acc_smem[acc_clear_idx] = 0.0f;
       tcgen_up_acc_smem[acc_clear_idx] = 0.0f;
     }
+    if (acc_clear_idx < kStep1OutRowsPerCta) {
+      tcgen_gate_acc_h_smem[acc_clear_idx] = 0;
+      tcgen_up_acc_h_smem[acc_clear_idx] = 0;
+    }
     __syncthreads();
 
     LaneAccum8x1 gate_acc;
     LaneAccum8x1 up_acc;
+    __half2 gate_acc_h2 = __float2half2_rn(0.0f);
+    __half2 up_acc_h2 = __float2half2_rn(0.0f);
     if (warp_id < 4) {
       gate_acc.clear();
       up_acc.clear();
@@ -1535,8 +1855,12 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
 
     constexpr bool kFastTcgen = (kFastTcgenAccumMode >= 0);
     const int effective_debug_output_mode = kFastTcgen ? 0 : debug_output_mode;
-    const int effective_tcgen_accum_mode =
+    const int requested_tcgen_accum_mode =
         kFastTcgen ? kFastTcgenAccumMode : tcgen_accum_mode;
+    const int effective_tcgen_accum_mode =
+        (requested_tcgen_accum_mode == 1 && t != 1) ? 0 : requested_tcgen_accum_mode;
+    const bool use_half2_n1 =
+        (requested_tcgen_accum_mode == 1) && (effective_debug_output_mode == 0) && (t == 1);
     const bool use_tma = kFastTcgen ? true : (w13_tma_desc != nullptr);
     const bool use_direct_tma_sw128 = kFastTcgen ? true : (use_tma && direct_tma_sw128);
     const bool use_direct_b_sw128 = kFastTcgen ? true : direct_b_sw128;
@@ -1544,6 +1868,11 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
         (!kFastTcgen) &&
         (effective_debug_output_mode == 98 || effective_debug_output_mode == 99) &&
         use_direct_tma_sw128 && use_direct_b_sw128;
+    const bool use_tmem_scale_mma =
+        (effective_tcgen_accum_mode == 2 || effective_tcgen_accum_mode == 3) &&
+        (effective_debug_output_mode == 0) &&
+        use_direct_tma_sw128 && use_direct_b_sw128;
+    const bool ablate_tmem_scale_staging = effective_tcgen_accum_mode == 3;
     int tcgen_mma_phase_bit = 0;
     bool ablate_first_mma = true;
 
@@ -1552,12 +1881,22 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
       issue_weight_tma_sw128_64x1024(
           reinterpret_cast<uint8_t*>(smem_A_group), w13_tma_desc, expert,
           out_row_base, 0, &weight_group_barrier[0]);
+      if (use_tmem_scale_mma && !ablate_tmem_scale_staging) {
+        stage_tcgen05_tf32_all_diag_scales(
+            smem_tcgen_scale, s13_all_dev, hidden_scale_dev, t, valid_token_idx,
+            expert, out_block128, packed_base, row_tile, n_rows);
+      }
       load_hidden_wordtiles_group_sw128<kStep1CommThreads>(
           reinterpret_cast<uint8_t*>(smem_B_group), hidden_vec_dev, valid_token_idx,
           packed_base, row_tile, n_rows, 0, kStep1TmaRawChunkBlocks);
       __syncthreads();
       wait_weight_group_tma_combined(&weight_group_barrier[0]);
 
+      bool tmem_scale_first = true;
+      const uint32_t tcgen_partial_tmem = tcgen_tmem_base_ptr;
+      const uint32_t tcgen_gate_scaled_tmem =
+          tcgen_tmem_base_ptr + kStep1TmaRawChunkBlocks * kStep1TcgenN;
+      const uint32_t tcgen_up_scaled_tmem = tcgen_gate_scaled_tmem + kStep1TcgenN;
       for (int k_group = 0; k_group < kStep1TmaRawChunkGroups; ++k_group) {
         const int cur = k_group & 1;
         const int next = cur ^ 1;
@@ -1573,7 +1912,69 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
               out_row_base, k_group + 1, &weight_group_barrier[0]);
         }
 
-        if (ablate_accum56) {
+        if (use_tmem_scale_mma) {
+#pragma unroll
+          for (int k_blk_local = 0; k_blk_local < kStep1TmaRawChunkBlocks; ++k_blk_local) {
+            const int k_blk = k_group * kStep1TmaRawChunkBlocks + k_blk_local;
+            uint8_t* smem_A_for_mma =
+                reinterpret_cast<uint8_t*>(A_cur) +
+                static_cast<int64_t>(k_blk_local) * kStep1TcgenACompactBytes;
+            issue_mma_64x8x128_tcgen05_no_wait(
+                smem_A_for_mma, B_cur, k_blk_local, lane, warp_id,
+                tcgen_partial_tmem + static_cast<uint32_t>(k_blk_local * kStep1TcgenN),
+                false, 0);
+
+          }
+          if (warp_id == 0 && lane == 0) {
+            tcgen05_commit_group1(&tcgen_mma_barrier);
+          }
+          if (threadIdx.x == 0) {
+            tcgen05_wait_mma_barrier_single(&tcgen_mma_barrier, tcgen_mma_phase_bit);
+          }
+          __syncthreads();
+          if (threadIdx.x == 0) {
+            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          }
+          __syncthreads();
+          tcgen_mma_phase_bit ^= 1;
+
+          const uint32_t ts_idesc =
+              make_tcgen05_idesc_tf32_ts_f32_dense(kStep1TcgenM, kStep1TcgenN);
+#pragma unroll
+          for (int k_blk_local = 0; k_blk_local < kStep1TmaRawChunkBlocks; ++k_blk_local) {
+            const int k_blk = k_group * kStep1TmaRawChunkBlocks + k_blk_local;
+            const uint32_t partial_tmem =
+                tcgen_partial_tmem + static_cast<uint32_t>(k_blk_local * kStep1TcgenN);
+            const bool enable_acc = !tmem_scale_first || (k_blk_local != 0);
+            float* gate_diag =
+                smem_tcgen_scale +
+                (2 * k_blk + 0) * (2 * kStep1TcgenN * 4);
+            float* up_diag =
+                smem_tcgen_scale +
+                (2 * k_blk + 1) * (2 * kStep1TcgenN * 4);
+            const uint64_t gate_desc = make_tcgen05_tf32_diag_desc(gate_diag);
+            const uint64_t up_desc = make_tcgen05_tf32_diag_desc(up_diag);
+            if (warp_id == 0 && lane == 0) {
+              tcgen05_mma_tf32_cta1_ts(
+                  tcgen_gate_scaled_tmem, partial_tmem, gate_desc, ts_idesc, enable_acc);
+              tcgen05_mma_tf32_cta1_ts(
+                  tcgen_up_scaled_tmem, partial_tmem, up_desc, ts_idesc, enable_acc);
+            }
+          }
+          if (warp_id == 0 && lane == 0) {
+            tcgen05_commit_group1(&tcgen_mma_barrier);
+          }
+          if (threadIdx.x == 0) {
+            tcgen05_wait_mma_barrier_single(&tcgen_mma_barrier, tcgen_mma_phase_bit);
+          }
+          __syncthreads();
+          if (threadIdx.x == 0) {
+            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+          }
+          __syncthreads();
+          tcgen_mma_phase_bit ^= 1;
+          tmem_scale_first = false;
+        } else if (ablate_accum56) {
 #pragma unroll
           for (int k_blk_local = 0; k_blk_local < kStep1TmaRawChunkBlocks; ++k_blk_local) {
             uint8_t* smem_A_for_mma =
@@ -1648,6 +2049,59 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
               for (int slot = 0; slot < kStep1TmaRawChunkBlocks; ++slot) {
                 const int k_blk_local = batch_base + slot;
                 const int k_blk = k_group * kStep1TmaRawChunkBlocks + k_blk_local;
+                if (n_rows == 1) {
+                  if (use_half2_n1) {
+                    const __half2 result_h2 = tcgen05_ld_16x64b_x1_f16_to_half2(
+                        tcgen_group_tmem_base + static_cast<uint32_t>(slot * kStep1TcgenN));
+                    tcgen05_wait_ld_sync();
+                    if (col_parity == 0) {
+                      const int token_idx = valid_token_idx[packed_base + row_tile];
+                      const float hidden_block_scale =
+                          hidden_scale_dev[static_cast<int64_t>(k_blk) * t + token_idx];
+                      if (result_row < kStep1OutRowsPerCta) {
+                        const float gate_scale =
+                            s13_all_dev[(expert * kStep1Gemm1OutBlocks + out_block128) *
+                                            kStep1HiddenBlocks +
+                                        k_blk];
+                        const __half2 scale_h2 = __float2half2_rn(gate_scale * hidden_block_scale);
+                        gate_acc_h2 = __hadd2(gate_acc_h2, __hmul2(result_h2, scale_h2));
+                      } else {
+                        const float up_scale =
+                            s13_all_dev[(expert * kStep1Gemm1OutBlocks +
+                                         (out_block128 + kStep1IntermediateBlocks)) *
+                                            kStep1HiddenBlocks +
+                                        k_blk];
+                        const __half2 scale_h2 = __float2half2_rn(up_scale * hidden_block_scale);
+                        up_acc_h2 = __hadd2(up_acc_h2, __hmul2(result_h2, scale_h2));
+                      }
+                    }
+                  } else {
+                    const float result0 = tcgen05_ld_16x64b_x1_accum_to_f32(
+                        tcgen_group_tmem_base + static_cast<uint32_t>(slot * kStep1TcgenN),
+                        effective_tcgen_accum_mode);
+                    tcgen05_wait_ld_sync();
+                    if (col_parity == 0) {
+                      const int token_idx = valid_token_idx[packed_base + row_tile];
+                      const float hidden_block_scale =
+                          hidden_scale_dev[static_cast<int64_t>(k_blk) * t + token_idx];
+                      if (result_row < kStep1OutRowsPerCta) {
+                        const float gate_scale =
+                            s13_all_dev[(expert * kStep1Gemm1OutBlocks + out_block128) *
+                                            kStep1HiddenBlocks +
+                                        k_blk];
+                        gate_acc.v[0] += result0 * gate_scale * hidden_block_scale;
+                      } else {
+                        const float up_scale =
+                            s13_all_dev[(expert * kStep1Gemm1OutBlocks +
+                                         (out_block128 + kStep1IntermediateBlocks)) *
+                                            kStep1HiddenBlocks +
+                                        k_blk];
+                        up_acc.v[0] += result0 * up_scale * hidden_block_scale;
+                      }
+                    }
+                  }
+                  continue;
+                }
                 float result_bits[4];
                 tcgen05_ld_16x64b_x4_accum_to_f32(
                     result_bits,
@@ -1699,6 +2153,25 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
             __syncthreads();
           }
           wait_weight_group_tma_combined(&weight_group_barrier[0]);
+        }
+      }
+      if (use_tmem_scale_mma && warp_id < 4) {
+        const int result_row = warp_id * 16 + (lane >> 2) + ((lane & 1) ? 8 : 0);
+        const int col_parity = (lane >> 1) & 1;
+        float result_bits[4];
+        const uint32_t read_tmem =
+            result_row < kStep1OutRowsPerCta ? tcgen_gate_scaled_tmem : tcgen_up_scaled_tmem;
+        tcgen05_ld_16x64b_x4(result_bits, read_tmem);
+        tcgen05_wait_ld_sync();
+#pragma unroll
+        for (int reg = 0; reg < 4; ++reg) {
+          const int rr = 2 * reg + col_parity;
+          if (rr >= n_rows) continue;
+          if (result_row < kStep1OutRowsPerCta) {
+            gate_acc.v[rr] += result_bits[reg];
+          } else {
+            up_acc.v[rr] += result_bits[reg];
+          }
         }
       }
 #endif
@@ -1942,14 +2415,25 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
     if (warp_id < 4) {
       const int result_row = warp_id * 16 + (lane >> 2) + ((lane & 1) ? 8 : 0);
       const int col_parity = (lane >> 1) & 1;
+      if (use_half2_n1) {
+        if (col_parity == 0) {
+          if (result_row < kStep1OutRowsPerCta) {
+            tcgen_gate_acc_h_smem[result_row] = __half_as_ushort(__low2half(gate_acc_h2));
+          } else {
+            tcgen_up_acc_h_smem[result_row - kStep1OutRowsPerCta] =
+                __half_as_ushort(__low2half(up_acc_h2));
+          }
+        }
+      } else {
 #pragma unroll
-      for (int reg = 0; reg < 4; ++reg) {
-        const int rr = 2 * reg + col_parity;
-        if (rr >= n_rows) continue;
-        if (result_row < kStep1OutRowsPerCta) {
-          tcgen_gate_acc_smem[result_row * kStep1RowTile + rr] = gate_acc.v[rr];
-        } else {
-          tcgen_up_acc_smem[(result_row - kStep1OutRowsPerCta) * kStep1RowTile + rr] = up_acc.v[rr];
+        for (int reg = 0; reg < 4; ++reg) {
+          const int rr = 2 * reg + col_parity;
+          if (rr >= n_rows) continue;
+          if (result_row < kStep1OutRowsPerCta) {
+            tcgen_gate_acc_smem[result_row * kStep1RowTile + rr] = gate_acc.v[rr];
+          } else {
+            tcgen_up_acc_smem[(result_row - kStep1OutRowsPerCta) * kStep1RowTile + rr] = up_acc.v[rr];
+          }
         }
       }
     }
@@ -1958,7 +2442,17 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
     const int out_col = out_row_base + lane;
     const bool do_store = (warp_id == 0);
 
-    if (do_store) {
+    if (do_store && use_half2_n1) {
+      const int packed_row = packed_base + row_tile;
+      const int tcgen_row = lane;
+      const __half gate_h = __ushort_as_half(tcgen_gate_acc_h_smem[tcgen_row]);
+      const __half up_h = __ushort_as_half(tcgen_up_acc_h_smem[tcgen_row]);
+      const __half2 gate_h2 = __halves2half2(gate_h, gate_h);
+      const __half2 up_h2 = __halves2half2(up_h, up_h);
+      const __half value_h = __low2half(swiglu_half2_device(gate_h2, up_h2));
+      c_perm_all_dev[static_cast<int64_t>(packed_row) * kStep1Intermediate + out_col] =
+          __half2float(value_h);
+    } else if (do_store) {
 #pragma unroll
       for (int rr = 0; rr < kStep1RowTile; ++rr) {
         if (rr >= n_rows) break;
@@ -2007,7 +2501,9 @@ inline cudaError_t RunStep1AllExpertsDirect(
   const std::size_t smem_bytes = step1_smem_bytes();
   const bool use_fast_tcgen =
       (w13_tma_desc != nullptr) && direct_tma_sw128 && direct_b_sw128 &&
-      debug_output_mode == 0 && tcgen_accum_mode == 0;
+      debug_output_mode == 0 &&
+      (tcgen_accum_mode == 0 || tcgen_accum_mode == 1 ||
+       tcgen_accum_mode == 2 || tcgen_accum_mode == 3);
 
   cudaError_t st = cudaFuncSetAttribute(
       step1_gemm1_swiglu_direct_kernel<-1>,
@@ -2025,6 +2521,20 @@ inline cudaError_t RunStep1AllExpertsDirect(
   }
   st = cudaFuncSetAttribute(
       step1_gemm1_swiglu_direct_kernel<1>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(smem_bytes));
+  if (st != cudaSuccess) {
+    return st;
+  }
+  st = cudaFuncSetAttribute(
+      step1_gemm1_swiglu_direct_kernel<2>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(smem_bytes));
+  if (st != cudaSuccess) {
+    return st;
+  }
+  st = cudaFuncSetAttribute(
+      step1_gemm1_swiglu_direct_kernel<3>,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
       static_cast<int>(smem_bytes));
   if (st != cudaSuccess) {
@@ -2066,6 +2576,40 @@ inline cudaError_t RunStep1AllExpertsDirect(
         true,
         0,
         1,
+        c_perm_all_dev);
+  } else if (use_fast_tcgen && tcgen_accum_mode == 2) {
+    step1_gemm1_swiglu_direct_kernel<2><<<grid, block, smem_bytes, stream>>>(
+        hidden_fp8_dev,
+        hidden_scale_dev,
+        t,
+        expert_counts_dev,
+        expert_offsets_dev,
+        permuted_token_ids_dev,
+        w13_all_dev,
+        s13_all_dev,
+        nullptr,
+        w13_tma_desc,
+        true,
+        true,
+        0,
+        2,
+        c_perm_all_dev);
+  } else if (use_fast_tcgen && tcgen_accum_mode == 3) {
+    step1_gemm1_swiglu_direct_kernel<3><<<grid, block, smem_bytes, stream>>>(
+        hidden_fp8_dev,
+        hidden_scale_dev,
+        t,
+        expert_counts_dev,
+        expert_offsets_dev,
+        permuted_token_ids_dev,
+        w13_all_dev,
+        s13_all_dev,
+        nullptr,
+        w13_tma_desc,
+        true,
+        true,
+        0,
+        3,
         c_perm_all_dev);
   } else {
     step1_gemm1_swiglu_direct_kernel<-1><<<grid, block, smem_bytes, stream>>>(

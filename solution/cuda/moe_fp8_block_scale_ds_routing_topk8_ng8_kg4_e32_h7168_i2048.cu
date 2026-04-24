@@ -811,6 +811,12 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
     if (const char* accum_env = std::getenv("FIB_TCGEN_ACCUM")) {
       if (std::strcmp(accum_env, "f16") == 0 || std::strcmp(accum_env, "fp16") == 0) {
         step1_tcgen_accum_mode = 1;
+      } else if (std::strcmp(accum_env, "tf32_scale") == 0 ||
+                 std::strcmp(accum_env, "tmem_scale") == 0) {
+        step1_tcgen_accum_mode = 2;
+      } else if (std::strcmp(accum_env, "tf32_scale_garbage") == 0 ||
+                 std::strcmp(accum_env, "tmem_scale_garbage") == 0) {
+        step1_tcgen_accum_mode = 3;
       }
     }
     cudaError_t st1 = direct_backend::RunStep1AllExpertsDirect(
