@@ -59,6 +59,36 @@ __device__ __forceinline__ float fp8_e4m3fn_to_float_device(uint8_t x) {
   return sign * ldexpf(frac, exp - 7);
 }
 
+__constant__ float kFp8DecodeTable[256];
+
+inline float fp8_e4m3fn_to_float_table_host(uint8_t x) {
+  int sign = (x & 0x80) ? -1 : 1;
+  int exp = (x >> 3) & 0x0f;
+  int mant = x & 0x07;
+  if (exp == 0) {
+    if (mant == 0) return sign == 1 ? 0.0f : -0.0f;
+    float frac = static_cast<float>(mant) * 0.125f;
+    return sign * std::ldexp(frac, -6);
+  }
+  float frac = 1.0f + static_cast<float>(mant) * 0.125f;
+  return sign * std::ldexp(frac, exp - 7);
+}
+
+void initialize_fp8_decode_table_once() {
+  static bool initialized = false;
+  if (initialized) return;
+  float table[256];
+  for (int i = 0; i < 256; ++i) {
+    table[i] = fp8_e4m3fn_to_float_table_host(static_cast<uint8_t>(i));
+  }
+  cudaMemcpyToSymbol(kFp8DecodeTable, table, sizeof(table));
+  initialized = true;
+}
+
+__device__ __forceinline__ float fp8_e4m3fn_to_float_table_device(uint8_t x) {
+  return kFp8DecodeTable[x];
+}
+
 __device__ __forceinline__ uint16_t float_to_bf16_rne_device(float x) {
   uint32_t u32 = __float_as_uint(x);
   uint32_t lsb = (u32 >> 16) & 1u;
@@ -230,7 +260,8 @@ __global__ void scatter_placements_kernel(const float* __restrict__ local_weight
                                           const int* __restrict__ expert_offsets,
                                           int* __restrict__ running_counter,
                                           int* __restrict__ permuted_token_ids,
-                                          float* __restrict__ permuted_weights) {
+                                          float* __restrict__ permuted_weights,
+                                          int* __restrict__ permuted_experts) {
   int tok = blockIdx.x * blockDim.x + threadIdx.x;
   if (tok >= t) return;
   const float* row = local_weight + static_cast<int64_t>(tok) * kNumLocalExperts;
@@ -242,7 +273,94 @@ __global__ void scatter_placements_kernel(const float* __restrict__ local_weight
     int pos = expert_offsets[le] + slot;
     permuted_token_ids[pos] = tok;
     permuted_weights[pos] = w;
+    permuted_experts[pos] = le;
   }
+}
+
+__global__ void all_experts_step1_swiglu_kernel(
+    const float* __restrict__ a, const int* __restrict__ expert_offsets,
+    const int* __restrict__ permuted_token_ids, const int* __restrict__ permuted_experts,
+    const uint8_t* __restrict__ w13, const float* __restrict__ s13,
+    int64_t max_routed, float* __restrict__ c_all) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int total_routed = expert_offsets[kNumLocalExperts];
+  int64_t total = static_cast<int64_t>(total_routed) * kIntermediate;
+  if (idx >= total || idx >= max_routed * kIntermediate) return;
+
+  int pos = static_cast<int>(idx / kIntermediate);
+  int i = static_cast<int>(idx - static_cast<int64_t>(pos) * kIntermediate);
+  int tok = permuted_token_ids[pos];
+  int le = permuted_experts[pos];
+
+  const float* a_row = a + static_cast<int64_t>(tok) * kHidden;
+  const uint8_t* w13_e = w13 + static_cast<int64_t>(le) * (2 * kIntermediate) * kHidden;
+  const float* s13_e = s13 + static_cast<int64_t>(le) * ((2 * kIntermediate) / kBlock) *
+                                 (kHidden / kBlock);
+  int ib = i / kBlock;
+  int j1 = i;
+  int j2 = i + kIntermediate;
+  float acc1 = 0.0f;
+  float acc2 = 0.0f;
+  #pragma unroll
+  for (int hb = 0; hb < kHidden / kBlock; ++hb) {
+    float scale1 = s13_e[ib * (kHidden / kBlock) + hb];
+    float scale2 = s13_e[(ib + kIntermediate / kBlock) * (kHidden / kBlock) + hb];
+    int h0 = hb * kBlock;
+    float block_raw1 = 0.0f;
+    float block_raw2 = 0.0f;
+    #pragma unroll
+    for (int u = 0; u < kBlock; ++u) {
+      int h = h0 + u;
+      float av = a_row[h];
+      float w1 = fp8_e4m3fn_to_float_table_device(w13_e[static_cast<int64_t>(j1) * kHidden + h]);
+      float w2 = fp8_e4m3fn_to_float_table_device(w13_e[static_cast<int64_t>(j2) * kHidden + h]);
+      block_raw1 += av * w1;
+      block_raw2 += av * w2;
+    }
+    acc1 += block_raw1 * scale1;
+    acc2 += block_raw2 * scale2;
+  }
+  c_all[static_cast<int64_t>(pos) * kIntermediate + i] =
+      acc1 * (acc2 / (1.0f + expf(-acc2)));
+}
+
+__global__ void all_experts_step2_scatter_kernel(
+    const float* __restrict__ c_all, const int* __restrict__ expert_offsets,
+    const int* __restrict__ permuted_token_ids, const float* __restrict__ permuted_weights,
+    const int* __restrict__ permuted_experts, const uint8_t* __restrict__ w2,
+    const float* __restrict__ s2, int64_t max_routed, float* __restrict__ out_acc) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int total_routed = expert_offsets[kNumLocalExperts];
+  int64_t total = static_cast<int64_t>(total_routed) * kHidden;
+  if (idx >= total || idx >= max_routed * kHidden) return;
+
+  int pos = static_cast<int>(idx / kHidden);
+  int h = static_cast<int>(idx - static_cast<int64_t>(pos) * kHidden);
+  int tok = permuted_token_ids[pos];
+  int le = permuted_experts[pos];
+  float route_w = permuted_weights[pos];
+
+  const float* c_row = c_all + static_cast<int64_t>(pos) * kIntermediate;
+  const uint8_t* w2_e = w2 + static_cast<int64_t>(le) * kHidden * kIntermediate;
+  const float* s2_e = s2 + static_cast<int64_t>(le) * (kHidden / kBlock) *
+                               (kIntermediate / kBlock);
+  int hb = h / kBlock;
+  float acc = 0.0f;
+  #pragma unroll
+  for (int ib = 0; ib < kIntermediate / kBlock; ++ib) {
+    float scale = s2_e[hb * (kIntermediate / kBlock) + ib];
+    int i0 = ib * kBlock;
+    float block_raw = 0.0f;
+    #pragma unroll
+    for (int u = 0; u < kBlock; ++u) {
+      int i = i0 + u;
+      float cv = c_row[i];
+      float wv = fp8_e4m3fn_to_float_table_device(w2_e[static_cast<int64_t>(h) * kIntermediate + i]);
+      block_raw += cv * wv;
+    }
+    acc += block_raw * scale;
+  }
+  atomicAdd(out_acc + static_cast<int64_t>(tok) * kHidden + h, route_w * acc);
 }
 
 // Persistent per-process workspace: all transient device buffers grow on
@@ -253,6 +371,7 @@ __global__ void scatter_placements_kernel(const float* __restrict__ local_weight
 struct MoeWorkspace {
   int64_t cap_t = 0;
   int64_t cap_t_grouped = 0;
+  int64_t cap_t_small = 0;
   float* local_weight_dev = nullptr;
   uint8_t* expert_used_dev = nullptr;
   float* a_dev = nullptr;
@@ -262,6 +381,8 @@ struct MoeWorkspace {
   int* running_counter_dev = nullptr;
   int* permuted_token_ids_dev = nullptr;
   float* permuted_weights_dev = nullptr;
+  int* permuted_experts_dev = nullptr;
+  float* small_c_all_dev = nullptr;
 
   void ensure_core(int64_t t) {
     if (t <= cap_t && local_weight_dev != nullptr) return;
@@ -283,6 +404,7 @@ struct MoeWorkspace {
     if (running_counter_dev) cudaFree(running_counter_dev);
     if (permuted_token_ids_dev) cudaFree(permuted_token_ids_dev);
     if (permuted_weights_dev) cudaFree(permuted_weights_dev);
+    if (permuted_experts_dev) cudaFree(permuted_experts_dev);
     cap_t_grouped = t;
     const int64_t max_routed = t * kTopK;
     cudaMalloc(&expert_counts_dev, kNumLocalExperts * sizeof(int));
@@ -290,6 +412,16 @@ struct MoeWorkspace {
     cudaMalloc(&running_counter_dev, kNumLocalExperts * sizeof(int));
     cudaMalloc(&permuted_token_ids_dev, static_cast<size_t>(max_routed) * sizeof(int));
     cudaMalloc(&permuted_weights_dev, static_cast<size_t>(max_routed) * sizeof(float));
+    cudaMalloc(&permuted_experts_dev, static_cast<size_t>(max_routed) * sizeof(int));
+  }
+
+  void ensure_small(int64_t t) {
+    if (t <= cap_t_small && small_c_all_dev != nullptr) return;
+    if (small_c_all_dev) cudaFree(small_c_all_dev);
+    cap_t_small = t;
+    const int64_t max_routed = t * kTopK;
+    cudaMalloc(&small_c_all_dev,
+               static_cast<size_t>(max_routed) * kIntermediate * sizeof(float));
   }
 };
 
@@ -373,6 +505,7 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   int* running_counter_dev = nullptr;
   int* permuted_token_ids_dev = nullptr;
   float* permuted_weights_dev = nullptr;
+  int* permuted_experts_dev = nullptr;
   if (kGrouped) {
     ws.ensure_grouped(t);
     expert_counts_dev = ws.expert_counts_dev;
@@ -380,6 +513,7 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
     running_counter_dev = ws.running_counter_dev;
     permuted_token_ids_dev = ws.permuted_token_ids_dev;
     permuted_weights_dev = ws.permuted_weights_dev;
+    permuted_experts_dev = ws.permuted_experts_dev;
     cudaMemsetAsync(expert_counts_dev, 0, kNumLocalExperts * sizeof(int), stream);
     cudaMemsetAsync(running_counter_dev, 0, kNumLocalExperts * sizeof(int), stream);
   }
@@ -417,7 +551,17 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
 
   if (kProfile) t0_expert = std::chrono::high_resolution_clock::now();
 
-  if (!kTc) {
+  // Small-T workloads are launch-count dominated. A single all-expert Step1
+  // kernel plus one scatter Step2 kernel avoids the 32-way host expert loop and
+  // wins through T=80 on B200; set FIB_MOE_ALL_EXPERT_SMALL_MAX_T=0 to disable.
+  int all_expert_small_max_t = 80;
+  if (const char* env = std::getenv("FIB_MOE_ALL_EXPERT_SMALL_MAX_T")) {
+    all_expert_small_max_t = std::atoi(env);
+  }
+  const bool kAllExpertSmall =
+      kGrouped && !kTc && all_expert_small_max_t > 0 && t <= all_expert_small_max_t;
+
+  if (!kTc && !kAllExpertSmall) {
     gemm_mod.EnsureWorkspace(t, stream);
   }
 
@@ -434,34 +578,62 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
     scan_offsets_kernel<<<1, 32, 0, stream>>>(expert_counts_dev, expert_offsets_dev);
     scatter_placements_kernel<<<meta_blocks, kMetaThreads, 0, stream>>>(
         local_weight_dev, t, expert_offsets_dev, running_counter_dev, permuted_token_ids_dev,
-        permuted_weights_dev);
+        permuted_weights_dev, permuted_experts_dev);
 
-    cudaMemcpyAsync(expert_counts_host.data(), expert_counts_dev,
-                    kNumLocalExperts * sizeof(int), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(expert_offsets_host.data(), expert_offsets_dev,
-                    (kNumLocalExperts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+    if (kAllExpertSmall) {
+      initialize_fp8_decode_table_once();
+      ws.ensure_small(t);
+      int all_expert_threads = 32;
+      if (const char* env = std::getenv("FIB_MOE_ALL_EXPERT_THREADS")) {
+        int parsed = std::atoi(env);
+        if (parsed == 32 || parsed == 64 || parsed == 128 || parsed == 256 || parsed == 512) {
+          all_expert_threads = parsed;
+        }
+      }
+      const int64_t max_routed = t * kTopK;
+      const int64_t step1_total = max_routed * kIntermediate;
+      const int64_t step2_total = max_routed * kHidden;
+      int step1_blocks = static_cast<int>((step1_total + all_expert_threads - 1) /
+                                          all_expert_threads);
+      int step2_blocks = static_cast<int>((step2_total + all_expert_threads - 1) /
+                                          all_expert_threads);
+      all_experts_step1_swiglu_kernel<<<step1_blocks, all_expert_threads, 0, stream>>>(
+          a_dev, expert_offsets_dev, permuted_token_ids_dev, permuted_experts_dev,
+          static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
+          static_cast<const float*>(gemm1_weights_scale.data_ptr()), max_routed,
+          ws.small_c_all_dev);
+      all_experts_step2_scatter_kernel<<<step2_blocks, all_expert_threads, 0, stream>>>(
+          ws.small_c_all_dev, expert_offsets_dev, permuted_token_ids_dev, permuted_weights_dev,
+          permuted_experts_dev, static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
+          static_cast<const float*>(gemm2_weights_scale.data_ptr()), max_routed, out_acc_dev);
+    } else {
+      cudaMemcpyAsync(expert_counts_host.data(), expert_counts_dev,
+                      kNumLocalExperts * sizeof(int), cudaMemcpyDeviceToHost, stream);
+      cudaMemcpyAsync(expert_offsets_host.data(), expert_offsets_dev,
+                      (kNumLocalExperts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
+      cudaStreamSynchronize(stream);
 
-    for (int le = 0; le < kNumLocalExperts; ++le) {
-      int n_rows = expert_counts_host[le];
-      if (n_rows == 0) continue;
-      int start = expert_offsets_host[le];
-      if (kTc) {
-        gemm_mod.RunExpertPermutedTc(
-            static_cast<const uint8_t*>(hidden_states.data_ptr()),
-            static_cast<const float*>(hidden_states_scale.data_ptr()), t, n_rows,
-            permuted_token_ids_dev + start, permuted_weights_dev + start, le,
-            static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
-            static_cast<const float*>(gemm1_weights_scale.data_ptr()),
-            static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
-            static_cast<const float*>(gemm2_weights_scale.data_ptr()), out_acc_dev, stream);
-      } else {
-        gemm_mod.RunExpertPermuted(
-            a_dev, t, n_rows, permuted_token_ids_dev + start, permuted_weights_dev + start, le,
-            static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
-            static_cast<const float*>(gemm1_weights_scale.data_ptr()),
-            static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
-            static_cast<const float*>(gemm2_weights_scale.data_ptr()), out_acc_dev, stream);
+      for (int le = 0; le < kNumLocalExperts; ++le) {
+        int n_rows = expert_counts_host[le];
+        if (n_rows == 0) continue;
+        int start = expert_offsets_host[le];
+        if (kTc) {
+          gemm_mod.RunExpertPermutedTc(
+              static_cast<const uint8_t*>(hidden_states.data_ptr()),
+              static_cast<const float*>(hidden_states_scale.data_ptr()), t, n_rows,
+              permuted_token_ids_dev + start, permuted_weights_dev + start, le,
+              static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
+              static_cast<const float*>(gemm1_weights_scale.data_ptr()),
+              static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
+              static_cast<const float*>(gemm2_weights_scale.data_ptr()), out_acc_dev, stream);
+        } else {
+          gemm_mod.RunExpertPermuted(
+              a_dev, t, n_rows, permuted_token_ids_dev + start, permuted_weights_dev + start, le,
+              static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
+              static_cast<const float*>(gemm1_weights_scale.data_ptr()),
+              static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
+              static_cast<const float*>(gemm2_weights_scale.data_ptr()), out_acc_dev, stream);
+        }
       }
     }
   } else {

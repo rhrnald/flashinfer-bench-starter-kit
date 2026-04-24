@@ -28,23 +28,26 @@ __device__ __forceinline__ float fp8_e4m3fn_to_float_device(uint8_t x) {
 __device__ __forceinline__ float siluf_device(float x) { return x / (1.0f + expf(-x)); }
 
 constexpr int kTile = 128;
+constexpr int kBlock = 128;
 constexpr int kRowsPerCta = 16;
+constexpr int kRowsPerCtaLarge = 32;
+constexpr int kRowsPerCtaXLarge = 64;
 constexpr int kThreads = 256;
 constexpr int kLanesPerRow = kThreads / kRowsPerCta;  // 16
+constexpr int kLanesPerRowLarge = kThreads / kRowsPerCtaLarge;  // 8
+constexpr int kLanesPerRowXLarge = kThreads / kRowsPerCtaXLarge;  // 4
 
 // TODO(B200): Replace with real TMA copy + tcgen05 warpgroup GEMM1 path.
-__global__ void step1_gemm1_swiglu_fused_direct_kernel(const float* __restrict__ a_dev, int hidden,
-                                                       int intermediate, int block,
-                                                       int hidden_blocks, int intermediate_blocks,
-                                                       int n_rows,
-                                                       const int* __restrict__ permuted_tok_e,
-                                                       const uint8_t* __restrict__ w13_e,
-                                                       const float* __restrict__ s13_e,
-                                                       float* __restrict__ c_perm_dev) {
+__global__ void step1_gemm1_swiglu_fused_direct_kernel(
+    const float* __restrict__ a_dev, int hidden, int intermediate, int block, int hidden_blocks,
+    int intermediate_blocks, int n_rows, const int* __restrict__ permuted_tok_e,
+    const uint8_t* __restrict__ w13_e, const float* __restrict__ s13_e,
+    float* __restrict__ c_perm_dev) {
   int row = blockIdx.x * kRowsPerCta + (threadIdx.x / kLanesPerRow);
   int lane = threadIdx.x % kLanesPerRow;
   int ib = blockIdx.y;  // [0, I/128)
   if (ib >= intermediate_blocks || row >= n_rows) return;
+  (void)block;
 
   int tok = permuted_tok_e[row];
   const float* a_row = a_dev + static_cast<int64_t>(tok) * hidden;
@@ -54,7 +57,7 @@ __global__ void step1_gemm1_swiglu_fused_direct_kernel(const float* __restrict__
   // TODO(B200): Revisit accumulator placement when switching to tcgen05 fragments.
   for (int i_chunk = 0; i_chunk < (kTile / kLanesPerRow); ++i_chunk) {
     int i_local = lane + i_chunk * kLanesPerRow;
-    int i = ib * block + i_local;
+    int i = ib * kBlock + i_local;
     int j1 = i;
     int j2 = i + intermediate;
 
@@ -65,10 +68,11 @@ __global__ void step1_gemm1_swiglu_fused_direct_kernel(const float* __restrict__
       float scale2 =
           s13_e[static_cast<int64_t>(ib + intermediate_blocks) * hidden_blocks + hb];
 
-      int h0 = hb * block;
+      int h0 = hb * kBlock;
       float block_raw1 = 0.0f;
       float block_raw2 = 0.0f;
-      for (int u = 0; u < block; ++u) {
+      #pragma unroll
+      for (int u = 0; u < kBlock; ++u) {
         int h = h0 + u;
         float av = a_row[h];
         float w1 = fp8_e4m3fn_to_float_device(w13_e[static_cast<int64_t>(j1) * hidden + h]);
@@ -80,7 +84,7 @@ __global__ void step1_gemm1_swiglu_fused_direct_kernel(const float* __restrict__
       acc2 += block_raw2 * scale2;
     }
 
-    c_row[i] = acc1 * siluf_device(acc2);
+    c_perm_dev[static_cast<int64_t>(row) * intermediate + i] = acc1 * siluf_device(acc2);
   }
 }
 
@@ -102,21 +106,21 @@ __global__ void step1_gemm1_swiglu_fused_tma_stage_kernel(
   int row = row_base + row_local;
   int ib = blockIdx.y;
   if (ib >= intermediate_blocks) return;
+  (void)block;
 
   for (int i_chunk = 0; i_chunk < (kTile / kLanesPerRow); ++i_chunk) {
     int i_local = lane + i_chunk * kLanesPerRow;
-    int i = ib * block + i_local;
+    int i = ib * kBlock + i_local;
     int j1 = i;
     int j2 = i + intermediate;
     float acc1 = 0.0f;
     float acc2 = 0.0f;
 
     for (int hb = 0; hb < hidden_blocks; ++hb) {
-      int h0 = hb * block;
-
-      for (int idx = tid; idx < kRowsPerCta * block; idx += kThreads) {
-        int rl = idx / block;
-        int u = idx - rl * block;
+      int h0 = hb * kBlock;
+      for (int idx = tid; idx < kRowsPerCta * kBlock; idx += kThreads) {
+        int rl = idx / kBlock;
+        int u = idx - rl * kBlock;
         int r = row_base + rl;
         float v = 0.0f;
         if (r < n_rows) {
@@ -126,11 +130,11 @@ __global__ void step1_gemm1_swiglu_fused_tma_stage_kernel(
         smem_a[idx] = v;
       }
 
-      for (int idx = tid; idx < block * block; idx += kThreads) {
-        int n = idx / block;
-        int u = idx - n * block;
+      for (int idx = tid; idx < kBlock * kBlock; idx += kThreads) {
+        int n = idx / kBlock;
+        int u = idx - n * kBlock;
         int h = h0 + u;
-        int jw1 = ib * block + n;
+        int jw1 = ib * kBlock + n;
         int jw2 = jw1 + intermediate;
         smem_w1[idx] = w13_e[static_cast<int64_t>(jw1) * hidden + h];
         smem_w2[idx] = w13_e[static_cast<int64_t>(jw2) * hidden + h];
@@ -142,9 +146,166 @@ __global__ void step1_gemm1_swiglu_fused_tma_stage_kernel(
         float scale2 = s13_e[static_cast<int64_t>(ib + intermediate_blocks) * hidden_blocks + hb];
         float block_raw1 = 0.0f;
         float block_raw2 = 0.0f;
-        int a_off = row_local * block;
-        int w_off = i_local * block;
-        for (int u = 0; u < block; ++u) {
+        int a_off = row_local * kBlock;
+        int w_off = i_local * kBlock;
+        #pragma unroll
+        for (int u = 0; u < kBlock; ++u) {
+          float av = smem_a[a_off + u];
+          block_raw1 += av * fp8_e4m3fn_to_float_device(smem_w1[w_off + u]);
+          block_raw2 += av * fp8_e4m3fn_to_float_device(smem_w2[w_off + u]);
+        }
+        acc1 += block_raw1 * scale1;
+        acc2 += block_raw2 * scale2;
+      }
+      __syncthreads();
+    }
+
+    if (row < n_rows) {
+      c_perm_dev[static_cast<int64_t>(row) * intermediate + i] = acc1 * siluf_device(acc2);
+    }
+  }
+}
+
+__global__ void step1_gemm1_swiglu_fused_tma_stage_kernel_large(
+    const float* __restrict__ a_dev, int hidden, int intermediate, int block, int hidden_blocks,
+    int intermediate_blocks, int n_rows, const int* __restrict__ permuted_tok_e,
+    const uint8_t* __restrict__ w13_e, const float* __restrict__ s13_e,
+    float* __restrict__ c_perm_dev) {
+  extern __shared__ unsigned char smem_u8[];
+  float* smem_a = reinterpret_cast<float*>(smem_u8);  // [32, 128]
+  uint8_t* smem_w1 =
+      reinterpret_cast<uint8_t*>(smem_a + kRowsPerCtaLarge * kTile);  // [128, 128]
+  uint8_t* smem_w2 = smem_w1 + kTile * kTile;                         // [128, 128]
+
+  int tid = threadIdx.x;
+  int row_local = tid / kLanesPerRowLarge;
+  int lane = tid % kLanesPerRowLarge;
+  int row_base = blockIdx.x * kRowsPerCtaLarge;
+  int row = row_base + row_local;
+  int ib = blockIdx.y;
+  if (ib >= intermediate_blocks) return;
+  (void)block;
+
+  for (int i_chunk = 0; i_chunk < (kTile / kLanesPerRowLarge); ++i_chunk) {
+    int i_local = lane + i_chunk * kLanesPerRowLarge;
+    int i = ib * kBlock + i_local;
+    int j1 = i;
+    int j2 = i + intermediate;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+
+    for (int hb = 0; hb < hidden_blocks; ++hb) {
+      int h0 = hb * kBlock;
+      for (int idx = tid; idx < kRowsPerCtaLarge * kBlock; idx += kThreads) {
+        int rl = idx / kBlock;
+        int u = idx - rl * kBlock;
+        int r = row_base + rl;
+        float v = 0.0f;
+        if (r < n_rows) {
+          int tok = permuted_tok_e[r];
+          v = a_dev[static_cast<int64_t>(tok) * hidden + h0 + u];
+        }
+        smem_a[idx] = v;
+      }
+
+      for (int idx = tid; idx < kBlock * kBlock; idx += kThreads) {
+        int n = idx / kBlock;
+        int u = idx - n * kBlock;
+        int h = h0 + u;
+        int jw1 = ib * kBlock + n;
+        int jw2 = jw1 + intermediate;
+        smem_w1[idx] = w13_e[static_cast<int64_t>(jw1) * hidden + h];
+        smem_w2[idx] = w13_e[static_cast<int64_t>(jw2) * hidden + h];
+      }
+      __syncthreads();
+
+      if (row < n_rows) {
+        float scale1 = s13_e[static_cast<int64_t>(ib) * hidden_blocks + hb];
+        float scale2 = s13_e[static_cast<int64_t>(ib + intermediate_blocks) * hidden_blocks + hb];
+        float block_raw1 = 0.0f;
+        float block_raw2 = 0.0f;
+        int a_off = row_local * kBlock;
+        int w_off = i_local * kBlock;
+        #pragma unroll
+        for (int u = 0; u < kBlock; ++u) {
+          float av = smem_a[a_off + u];
+          block_raw1 += av * fp8_e4m3fn_to_float_device(smem_w1[w_off + u]);
+          block_raw2 += av * fp8_e4m3fn_to_float_device(smem_w2[w_off + u]);
+        }
+        acc1 += block_raw1 * scale1;
+        acc2 += block_raw2 * scale2;
+      }
+      __syncthreads();
+    }
+
+    if (row < n_rows) {
+      c_perm_dev[static_cast<int64_t>(row) * intermediate + i] = acc1 * siluf_device(acc2);
+    }
+  }
+}
+
+__global__ void step1_gemm1_swiglu_fused_tma_stage_kernel_xlarge(
+    const float* __restrict__ a_dev, int hidden, int intermediate, int block, int hidden_blocks,
+    int intermediate_blocks, int n_rows, const int* __restrict__ permuted_tok_e,
+    const uint8_t* __restrict__ w13_e, const float* __restrict__ s13_e,
+    float* __restrict__ c_perm_dev) {
+  extern __shared__ unsigned char smem_u8[];
+  float* smem_a = reinterpret_cast<float*>(smem_u8);  // [64, 128]
+  uint8_t* smem_w1 =
+      reinterpret_cast<uint8_t*>(smem_a + kRowsPerCtaXLarge * kTile);  // [128, 128]
+  uint8_t* smem_w2 = smem_w1 + kTile * kTile;                          // [128, 128]
+
+  int tid = threadIdx.x;
+  int row_local = tid / kLanesPerRowXLarge;
+  int lane = tid % kLanesPerRowXLarge;
+  int row_base = blockIdx.x * kRowsPerCtaXLarge;
+  int row = row_base + row_local;
+  int ib = blockIdx.y;
+  if (ib >= intermediate_blocks) return;
+  (void)block;
+
+  for (int i_chunk = 0; i_chunk < (kTile / kLanesPerRowXLarge); ++i_chunk) {
+    int i_local = lane + i_chunk * kLanesPerRowXLarge;
+    int i = ib * kBlock + i_local;
+    int j1 = i;
+    int j2 = i + intermediate;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+
+    for (int hb = 0; hb < hidden_blocks; ++hb) {
+      int h0 = hb * kBlock;
+      for (int idx = tid; idx < kRowsPerCtaXLarge * kBlock; idx += kThreads) {
+        int rl = idx / kBlock;
+        int u = idx - rl * kBlock;
+        int r = row_base + rl;
+        float v = 0.0f;
+        if (r < n_rows) {
+          int tok = permuted_tok_e[r];
+          v = a_dev[static_cast<int64_t>(tok) * hidden + h0 + u];
+        }
+        smem_a[idx] = v;
+      }
+
+      for (int idx = tid; idx < kBlock * kBlock; idx += kThreads) {
+        int n = idx / kBlock;
+        int u = idx - n * kBlock;
+        int h = h0 + u;
+        int jw1 = ib * kBlock + n;
+        int jw2 = jw1 + intermediate;
+        smem_w1[idx] = w13_e[static_cast<int64_t>(jw1) * hidden + h];
+        smem_w2[idx] = w13_e[static_cast<int64_t>(jw2) * hidden + h];
+      }
+      __syncthreads();
+
+      if (row < n_rows) {
+        float scale1 = s13_e[static_cast<int64_t>(ib) * hidden_blocks + hb];
+        float scale2 = s13_e[static_cast<int64_t>(ib + intermediate_blocks) * hidden_blocks + hb];
+        float block_raw1 = 0.0f;
+        float block_raw2 = 0.0f;
+        int a_off = row_local * kBlock;
+        int w_off = i_local * kBlock;
+        #pragma unroll
+        for (int u = 0; u < kBlock; ++u) {
           float av = smem_a[a_off + u];
           block_raw1 += av * fp8_e4m3fn_to_float_device(smem_w1[w_off + u]);
           block_raw2 += av * fp8_e4m3fn_to_float_device(smem_w2[w_off + u]);
@@ -174,6 +335,7 @@ __global__ void step2_gemm2_scatter_direct_kernel(const float* __restrict__ c_pe
   int lane = threadIdx.x % kLanesPerRow;
   int hb = blockIdx.y;  // [0, H/128)
   if (row >= n_rows) return;
+  (void)block;
 
   int tok = permuted_tok_e[row];
   float w_tok = permuted_w_e[row];
@@ -181,15 +343,16 @@ __global__ void step2_gemm2_scatter_direct_kernel(const float* __restrict__ c_pe
 
   for (int h_chunk = 0; h_chunk < (kTile / kLanesPerRow); ++h_chunk) {
     int h_local = lane + h_chunk * kLanesPerRow;
-    int h = hb * block + h_local;
+    int h = hb * kBlock + h_local;
     if (h >= hidden) continue;
 
     float acc = 0.0f;
     for (int ib = 0; ib < intermediate_blocks; ++ib) {
       float scale = s2_e[static_cast<int64_t>(hb) * intermediate_blocks + ib];
-      int i0 = ib * block;
+      int i0 = ib * kBlock;
       float block_raw = 0.0f;
-      for (int u = 0; u < block; ++u) {
+      #pragma unroll
+      for (int u = 0; u < kBlock; ++u) {
         int i = i0 + u;
         float cv = c_row[i];
         float wv = fp8_e4m3fn_to_float_device(w2_e[static_cast<int64_t>(h) * intermediate + i]);
@@ -218,25 +381,25 @@ __global__ void step2_gemm2_scatter_tma_stage_kernel(
   int row_base = blockIdx.x * kRowsPerCta;
   int row = row_base + row_local;
   int hb = blockIdx.y;
-  if (hb >= hidden / block) return;
+  if (hb >= hidden / kBlock) return;
+  (void)block;
 
   float acc[kTile / kLanesPerRow] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
   for (int ib = 0; ib < intermediate_blocks; ++ib) {
-    int i0 = ib * block;
-
-    for (int idx = tid; idx < kRowsPerCta * block; idx += kThreads) {
-      int rl = idx / block;
-      int u = idx - rl * block;
+    int i0 = ib * kBlock;
+    for (int idx = tid; idx < kRowsPerCta * kBlock; idx += kThreads) {
+      int rl = idx / kBlock;
+      int u = idx - rl * kBlock;
       int r = row_base + rl;
       float v = 0.0f;
       if (r < n_rows) v = c_perm_dev[static_cast<int64_t>(r) * intermediate + i0 + u];
       smem_c[idx] = v;
     }
 
-    for (int idx = tid; idx < block * block; idx += kThreads) {
-      int h_local = idx / block;
-      int u = idx - h_local * block;
-      int h = hb * block + h_local;
+    for (int idx = tid; idx < kBlock * kBlock; idx += kThreads) {
+      int h_local = idx / kBlock;
+      int u = idx - h_local * kBlock;
+      int h = hb * kBlock + h_local;
       int i = i0 + u;
       smem_w[idx] = w2_e[static_cast<int64_t>(h) * intermediate + i];
     }
@@ -244,12 +407,13 @@ __global__ void step2_gemm2_scatter_tma_stage_kernel(
 
     if (row < n_rows) {
       float scale_base = s2_e[static_cast<int64_t>(hb) * intermediate_blocks + ib];
-      int a_off = row_local * block;
+      int a_off = row_local * kBlock;
       for (int h_chunk = 0; h_chunk < (kTile / kLanesPerRow); ++h_chunk) {
         int h_local = lane + h_chunk * kLanesPerRow;
-        int w_off = h_local * block;
+        int w_off = h_local * kBlock;
         float block_raw = 0.0f;
-        for (int u = 0; u < block; ++u) {
+        #pragma unroll
+        for (int u = 0; u < kBlock; ++u) {
           block_raw += smem_c[a_off + u] * fp8_e4m3fn_to_float_device(smem_w[w_off + u]);
         }
         acc[h_chunk] += block_raw * scale_base;
@@ -263,7 +427,143 @@ __global__ void step2_gemm2_scatter_tma_stage_kernel(
     float w_tok = permuted_w_e[row];
     for (int h_chunk = 0; h_chunk < (kTile / kLanesPerRow); ++h_chunk) {
       int h_local = lane + h_chunk * kLanesPerRow;
-      int h = hb * block + h_local;
+      int h = hb * kBlock + h_local;
+      out_acc_dev[static_cast<int64_t>(tok) * hidden + h] += w_tok * acc[h_chunk];
+    }
+  }
+}
+
+__global__ void step2_gemm2_scatter_tma_stage_kernel_large(
+    const float* __restrict__ c_perm_dev, int hidden, int intermediate, int block,
+    int intermediate_blocks, int n_rows, const int* __restrict__ permuted_tok_e,
+    const float* __restrict__ permuted_w_e, const uint8_t* __restrict__ w2_e,
+    const float* __restrict__ s2_e, float* __restrict__ out_acc_dev) {
+  extern __shared__ unsigned char smem_u8[];
+  float* smem_c = reinterpret_cast<float*>(smem_u8);  // [32, 128]
+  uint8_t* smem_w =
+      reinterpret_cast<uint8_t*>(smem_c + kRowsPerCtaLarge * kTile);  // [128, 128]
+
+  int tid = threadIdx.x;
+  int row_local = tid / kLanesPerRowLarge;
+  int lane = tid % kLanesPerRowLarge;
+  int row_base = blockIdx.x * kRowsPerCtaLarge;
+  int row = row_base + row_local;
+  int hb = blockIdx.y;
+  if (hb >= hidden / kBlock) return;
+  (void)block;
+
+  float acc[kTile / kLanesPerRowLarge] = {0.0f};
+  for (int ib = 0; ib < intermediate_blocks; ++ib) {
+    int i0 = ib * kBlock;
+    for (int idx = tid; idx < kRowsPerCtaLarge * kBlock; idx += kThreads) {
+      int rl = idx / kBlock;
+      int u = idx - rl * kBlock;
+      int r = row_base + rl;
+      float v = 0.0f;
+      if (r < n_rows) v = c_perm_dev[static_cast<int64_t>(r) * intermediate + i0 + u];
+      smem_c[idx] = v;
+    }
+
+    for (int idx = tid; idx < kBlock * kBlock; idx += kThreads) {
+      int h_local = idx / kBlock;
+      int u = idx - h_local * kBlock;
+      int h = hb * kBlock + h_local;
+      int i = i0 + u;
+      smem_w[idx] = w2_e[static_cast<int64_t>(h) * intermediate + i];
+    }
+    __syncthreads();
+
+    if (row < n_rows) {
+      float scale_base = s2_e[static_cast<int64_t>(hb) * intermediate_blocks + ib];
+      int a_off = row_local * kBlock;
+      for (int h_chunk = 0; h_chunk < (kTile / kLanesPerRowLarge); ++h_chunk) {
+        int h_local = lane + h_chunk * kLanesPerRowLarge;
+        int w_off = h_local * kBlock;
+        float block_raw = 0.0f;
+        #pragma unroll
+        for (int u = 0; u < kBlock; ++u) {
+          block_raw += smem_c[a_off + u] * fp8_e4m3fn_to_float_device(smem_w[w_off + u]);
+        }
+        acc[h_chunk] += block_raw * scale_base;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (row < n_rows) {
+    int tok = permuted_tok_e[row];
+    float w_tok = permuted_w_e[row];
+    for (int h_chunk = 0; h_chunk < (kTile / kLanesPerRowLarge); ++h_chunk) {
+      int h_local = lane + h_chunk * kLanesPerRowLarge;
+      int h = hb * kBlock + h_local;
+      out_acc_dev[static_cast<int64_t>(tok) * hidden + h] += w_tok * acc[h_chunk];
+    }
+  }
+}
+
+__global__ void step2_gemm2_scatter_tma_stage_kernel_xlarge(
+    const float* __restrict__ c_perm_dev, int hidden, int intermediate, int block,
+    int intermediate_blocks, int n_rows, const int* __restrict__ permuted_tok_e,
+    const float* __restrict__ permuted_w_e, const uint8_t* __restrict__ w2_e,
+    const float* __restrict__ s2_e, float* __restrict__ out_acc_dev) {
+  extern __shared__ unsigned char smem_u8[];
+  float* smem_c = reinterpret_cast<float*>(smem_u8);  // [64, 128]
+  uint8_t* smem_w =
+      reinterpret_cast<uint8_t*>(smem_c + kRowsPerCtaXLarge * kTile);  // [128, 128]
+
+  int tid = threadIdx.x;
+  int row_local = tid / kLanesPerRowXLarge;
+  int lane = tid % kLanesPerRowXLarge;
+  int row_base = blockIdx.x * kRowsPerCtaXLarge;
+  int row = row_base + row_local;
+  int hb = blockIdx.y;
+  if (hb >= hidden / kBlock) return;
+  (void)block;
+
+  float acc[kTile / kLanesPerRowXLarge] = {0.0f};
+  for (int ib = 0; ib < intermediate_blocks; ++ib) {
+    int i0 = ib * kBlock;
+    for (int idx = tid; idx < kRowsPerCtaXLarge * kBlock; idx += kThreads) {
+      int rl = idx / kBlock;
+      int u = idx - rl * kBlock;
+      int r = row_base + rl;
+      float v = 0.0f;
+      if (r < n_rows) v = c_perm_dev[static_cast<int64_t>(r) * intermediate + i0 + u];
+      smem_c[idx] = v;
+    }
+
+    for (int idx = tid; idx < kBlock * kBlock; idx += kThreads) {
+      int h_local = idx / kBlock;
+      int u = idx - h_local * kBlock;
+      int h = hb * kBlock + h_local;
+      int i = i0 + u;
+      smem_w[idx] = w2_e[static_cast<int64_t>(h) * intermediate + i];
+    }
+    __syncthreads();
+
+    if (row < n_rows) {
+      float scale_base = s2_e[static_cast<int64_t>(hb) * intermediate_blocks + ib];
+      int a_off = row_local * kBlock;
+      for (int h_chunk = 0; h_chunk < (kTile / kLanesPerRowXLarge); ++h_chunk) {
+        int h_local = lane + h_chunk * kLanesPerRowXLarge;
+        int w_off = h_local * kBlock;
+        float block_raw = 0.0f;
+        #pragma unroll
+        for (int u = 0; u < kBlock; ++u) {
+          block_raw += smem_c[a_off + u] * fp8_e4m3fn_to_float_device(smem_w[w_off + u]);
+        }
+        acc[h_chunk] += block_raw * scale_base;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (row < n_rows) {
+    int tok = permuted_tok_e[row];
+    float w_tok = permuted_w_e[row];
+    for (int h_chunk = 0; h_chunk < (kTile / kLanesPerRowXLarge); ++h_chunk) {
+      int h_local = lane + h_chunk * kLanesPerRowXLarge;
+      int h = hb * kBlock + h_local;
       out_acc_dev[static_cast<int64_t>(tok) * hidden + h] += w_tok * acc[h_chunk];
     }
   }
@@ -272,18 +572,43 @@ __global__ void step2_gemm2_scatter_tma_stage_kernel(
 class MoeTcBackend5090Temp final : public MoeTcBackend {
  public:
   explicit MoeTcBackend5090Temp(const MoeTcBackendConfig& cfg)
-      : cfg_(cfg), available_(false), use_tma_stage_(false) {
+      : cfg_(cfg),
+        available_(false),
+        use_tma_stage_(false),
+        rows_per_cta_(kRowsPerCtaLarge),
+        step1_direct_max_rows_(744),
+        step2_direct_max_rows_(-1) {
     int dev = 0;
     cudaDeviceProp prop;
     if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
       available_ = true;
     }
     const char* env_tma = std::getenv("FIB_MOE_TC5090_TMA");
-    use_tma_stage_ = (env_tma != nullptr && env_tma[0] == '1');
+    use_tma_stage_ = true;
+    if (env_tma != nullptr) {
+      use_tma_stage_ = (env_tma[0] == '1');
+    }
+    const char* env_rows = std::getenv("FIB_MOE_TC5090_ROWS_PER_CTA");
+    if (env_rows != nullptr && env_rows[0] != '\0') {
+      int parsed = std::atoi(env_rows);
+      if (parsed == kRowsPerCta || parsed == kRowsPerCtaLarge || parsed == kRowsPerCtaXLarge) {
+        rows_per_cta_ = parsed;
+      }
+    }
+    const char* env_step1_direct = std::getenv("FIB_MOE_TC5090_STEP1_DIRECT_MAX_ROWS");
+    if (env_step1_direct != nullptr && env_step1_direct[0] != '\0') {
+      step1_direct_max_rows_ = std::atoi(env_step1_direct);
+    }
+    const char* env_step2_direct = std::getenv("FIB_MOE_TC5090_STEP2_DIRECT_MAX_ROWS");
+    if (env_step2_direct != nullptr && env_step2_direct[0] != '\0') {
+      step2_direct_max_rows_ = std::atoi(env_step2_direct);
+    }
     if (use_tma_stage_) {
       std::fprintf(stderr,
-                   "[mxfp][5090-temp] FIB_MOE_TC5090_TMA=1: using TMA-style staged copy kernels "
-                   "(TODO(B200): switch to real TMA ops)\n");
+                   "[mxfp][5090-temp] using TMA-style staged copy kernels rows_per_cta=%d "
+                   "step1_direct_max_rows=%d step2_direct_max_rows=%d "
+                   "(TODO(B200): switch to real TMA ops)\n",
+                   rows_per_cta_, step1_direct_max_rows_, step2_direct_max_rows_);
     }
   }
 
@@ -297,12 +622,38 @@ class MoeTcBackend5090Temp final : public MoeTcBackend {
                             float* c_perm_dev, cudaStream_t stream) override {
     if (!available_ || n_rows <= 0) return available_ ? cudaSuccess : cudaErrorNotSupported;
     dim3 grid((n_rows + kRowsPerCta - 1) / kRowsPerCta, cfg_.intermediate_blocks);
-    if (use_tma_stage_) {
-      size_t smem = static_cast<size_t>(kRowsPerCta * kTile * sizeof(float)) +
-                    static_cast<size_t>(2 * kTile * kTile * sizeof(uint8_t));
-      step1_gemm1_swiglu_fused_tma_stage_kernel<<<grid, kThreads, smem, stream>>>(
+    if (step1_direct_max_rows_ >= 0 && n_rows <= step1_direct_max_rows_) {
+      step1_gemm1_swiglu_fused_direct_kernel<<<grid, kThreads, 0, stream>>>(
           a_dev, cfg_.hidden, cfg_.intermediate, cfg_.block, cfg_.hidden_blocks,
           cfg_.intermediate_blocks, n_rows, permuted_tok_e, w13_e, s13_e, c_perm_dev);
+      return cudaPeekAtLastError();
+    }
+    if (use_tma_stage_) {
+      if (rows_per_cta_ == kRowsPerCtaXLarge) {
+        dim3 grid_xlarge((n_rows + kRowsPerCtaXLarge - 1) / kRowsPerCtaXLarge,
+                         cfg_.intermediate_blocks);
+        size_t smem_xlarge = static_cast<size_t>(kRowsPerCtaXLarge * kTile * sizeof(float)) +
+                             static_cast<size_t>(2 * kTile * kTile * sizeof(uint8_t));
+        step1_gemm1_swiglu_fused_tma_stage_kernel_xlarge<<<grid_xlarge, kThreads, smem_xlarge,
+                                                           stream>>>(
+            a_dev, cfg_.hidden, cfg_.intermediate, cfg_.block, cfg_.hidden_blocks,
+            cfg_.intermediate_blocks, n_rows, permuted_tok_e, w13_e, s13_e, c_perm_dev);
+      } else if (rows_per_cta_ == kRowsPerCtaLarge) {
+        dim3 grid_large((n_rows + kRowsPerCtaLarge - 1) / kRowsPerCtaLarge,
+                        cfg_.intermediate_blocks);
+        size_t smem_large = static_cast<size_t>(kRowsPerCtaLarge * kTile * sizeof(float)) +
+                            static_cast<size_t>(2 * kTile * kTile * sizeof(uint8_t));
+        step1_gemm1_swiglu_fused_tma_stage_kernel_large<<<grid_large, kThreads, smem_large,
+                                                          stream>>>(
+            a_dev, cfg_.hidden, cfg_.intermediate, cfg_.block, cfg_.hidden_blocks,
+            cfg_.intermediate_blocks, n_rows, permuted_tok_e, w13_e, s13_e, c_perm_dev);
+      } else {
+        size_t smem = static_cast<size_t>(kRowsPerCta * kTile * sizeof(float)) +
+                      static_cast<size_t>(2 * kTile * kTile * sizeof(uint8_t));
+        step1_gemm1_swiglu_fused_tma_stage_kernel<<<grid, kThreads, smem, stream>>>(
+            a_dev, cfg_.hidden, cfg_.intermediate, cfg_.block, cfg_.hidden_blocks,
+            cfg_.intermediate_blocks, n_rows, permuted_tok_e, w13_e, s13_e, c_perm_dev);
+      }
       cudaError_t st = cudaPeekAtLastError();
       if (st == cudaSuccess) return st;
       std::fprintf(stderr,
@@ -321,12 +672,37 @@ class MoeTcBackend5090Temp final : public MoeTcBackend {
                        float* out_acc_dev, cudaStream_t stream) override {
     if (!available_ || n_rows <= 0) return available_ ? cudaSuccess : cudaErrorNotSupported;
     dim3 grid((n_rows + kRowsPerCta - 1) / kRowsPerCta, cfg_.hidden_blocks);
-    if (use_tma_stage_) {
-      size_t smem = static_cast<size_t>(kRowsPerCta * kTile * sizeof(float)) +
-                    static_cast<size_t>(kTile * kTile * sizeof(uint8_t));
-      step2_gemm2_scatter_tma_stage_kernel<<<grid, kThreads, smem, stream>>>(
+    if (step2_direct_max_rows_ >= 0 && n_rows <= step2_direct_max_rows_) {
+      step2_gemm2_scatter_direct_kernel<<<grid, kThreads, 0, stream>>>(
           c_perm_dev, cfg_.hidden, cfg_.intermediate, cfg_.block, cfg_.intermediate_blocks,
           n_rows, permuted_tok_e, permuted_w_e, w2_e, s2_e, out_acc_dev);
+      return cudaPeekAtLastError();
+    }
+    if (use_tma_stage_) {
+      if (rows_per_cta_ == kRowsPerCtaXLarge) {
+        dim3 grid_xlarge((n_rows + kRowsPerCtaXLarge - 1) / kRowsPerCtaXLarge,
+                         cfg_.hidden_blocks);
+        size_t smem_xlarge = static_cast<size_t>(kRowsPerCtaXLarge * kTile * sizeof(float)) +
+                             static_cast<size_t>(kTile * kTile * sizeof(uint8_t));
+        step2_gemm2_scatter_tma_stage_kernel_xlarge<<<grid_xlarge, kThreads, smem_xlarge,
+                                                      stream>>>(
+            c_perm_dev, cfg_.hidden, cfg_.intermediate, cfg_.block, cfg_.intermediate_blocks,
+            n_rows, permuted_tok_e, permuted_w_e, w2_e, s2_e, out_acc_dev);
+      } else if (rows_per_cta_ == kRowsPerCtaLarge) {
+        dim3 grid_large((n_rows + kRowsPerCtaLarge - 1) / kRowsPerCtaLarge, cfg_.hidden_blocks);
+        size_t smem_large = static_cast<size_t>(kRowsPerCtaLarge * kTile * sizeof(float)) +
+                            static_cast<size_t>(kTile * kTile * sizeof(uint8_t));
+        step2_gemm2_scatter_tma_stage_kernel_large<<<grid_large, kThreads, smem_large,
+                                                     stream>>>(
+            c_perm_dev, cfg_.hidden, cfg_.intermediate, cfg_.block, cfg_.intermediate_blocks,
+            n_rows, permuted_tok_e, permuted_w_e, w2_e, s2_e, out_acc_dev);
+      } else {
+        size_t smem = static_cast<size_t>(kRowsPerCta * kTile * sizeof(float)) +
+                      static_cast<size_t>(kTile * kTile * sizeof(uint8_t));
+        step2_gemm2_scatter_tma_stage_kernel<<<grid, kThreads, smem, stream>>>(
+            c_perm_dev, cfg_.hidden, cfg_.intermediate, cfg_.block, cfg_.intermediate_blocks,
+            n_rows, permuted_tok_e, permuted_w_e, w2_e, s2_e, out_acc_dev);
+      }
       cudaError_t st = cudaPeekAtLastError();
       if (st == cudaSuccess) return st;
       std::fprintf(stderr,
@@ -344,6 +720,9 @@ class MoeTcBackend5090Temp final : public MoeTcBackend {
   MoeTcBackendConfig cfg_;
   bool available_;
   bool use_tma_stage_;
+  int rows_per_cta_;
+  int step1_direct_max_rows_;
+  int step2_direct_max_rows_;
 };
 
 }  // namespace

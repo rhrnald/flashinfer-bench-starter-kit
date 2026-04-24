@@ -14,6 +14,7 @@
 #endif
 
 #include <cmath>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +25,33 @@ namespace mxfp {
 namespace {
 
 inline float siluf_host(float x) { return x / (1.0f + std::exp(-x)); }
+
+__constant__ float kFp8E4m3fnDecodeTable[256];
+
+inline float fp8_e4m3fn_to_float_table_host(uint8_t x) {
+  int sign = (x & 0x80) ? -1 : 1;
+  int exp = (x >> 3) & 0x0f;
+  int mant = x & 0x07;
+
+  if (exp == 0) {
+    if (mant == 0) {
+      return sign == 1 ? 0.0f : -0.0f;
+    }
+    float frac = static_cast<float>(mant) * 0.125f;
+    return sign * std::ldexp(frac, -6);
+  }
+
+  float frac = 1.0f + static_cast<float>(mant) * 0.125f;
+  return sign * std::ldexp(frac, exp - 7);
+}
+
+void initialize_fp8_decode_table() {
+  float table[256];
+  for (int i = 0; i < 256; ++i) {
+    table[i] = fp8_e4m3fn_to_float_table_host(static_cast<uint8_t>(i));
+  }
+  cudaMemcpyToSymbol(kFp8E4m3fnDecodeTable, table, sizeof(table));
+}
 
 __device__ __forceinline__ float fp8_e4m3fn_to_float_device(uint8_t x) {
   int sign = (x & 0x80) ? -1 : 1;
@@ -40,6 +68,10 @@ __device__ __forceinline__ float fp8_e4m3fn_to_float_device(uint8_t x) {
 
   float frac = 1.0f + static_cast<float>(mant) * 0.125f;
   return sign * ldexpf(frac, exp - 7);
+}
+
+__device__ __forceinline__ float fp8_e4m3fn_to_float_table_device(uint8_t x) {
+  return kFp8E4m3fnDecodeTable[x];
 }
 
 __device__ __forceinline__ float siluf_device(float x) { return x / (1.0f + expf(-x)); }
@@ -233,6 +265,51 @@ __global__ void gemm1_permuted_kernel(const float* __restrict__ a, int hidden, i
   g1_perm[idx] = emulate_acc_half ? __half2float(acc_h) : acc;
 }
 
+// Specialized hot path for the active contest shape:
+// hidden=7168, intermediate=2048, gemm1_out=4096, block=128.
+// Hard-coding the block width lets the compiler fully unroll the inner dot
+// product and removes generic precision-mode branches from the common path.
+template <bool UseDecodeTable>
+__global__ void gemm1_permuted_kernel_block128(const float* __restrict__ a, int n_rows,
+                                               const int* __restrict__ permuted_tok,
+                                               const uint8_t* __restrict__ w13,
+                                               const float* __restrict__ s13,
+                                               float* __restrict__ g1_perm) {
+  constexpr int kHidden = 7168;
+  constexpr int kGemm1Out = 4096;
+  constexpr int kBlock = 128;
+  constexpr int kHiddenBlocks = kHidden / kBlock;
+
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = static_cast<int64_t>(n_rows) * kGemm1Out;
+  if (idx >= total) return;
+
+  int pr = static_cast<int>(idx / kGemm1Out);
+  int j = static_cast<int>(idx - static_cast<int64_t>(pr) * kGemm1Out);
+  int tok = permuted_tok[pr];
+  int jb = j / kBlock;
+
+  const float* a_row = a + static_cast<int64_t>(tok) * kHidden;
+  const uint8_t* w_row = w13 + static_cast<int64_t>(j) * kHidden;
+  float acc = 0.0f;
+  for (int hb = 0; hb < kHiddenBlocks; ++hb) {
+    const float scale = s13[jb * kHiddenBlocks + hb];
+    const int h0 = hb * kBlock;
+    const float* a_ptr = a_row + h0;
+    const uint8_t* w_ptr = w_row + h0;
+    float block_raw = 0.0f;
+    #pragma unroll
+    for (int u = 0; u < kBlock; ++u) {
+      const uint8_t wb = w_ptr[u];
+      const float wv = UseDecodeTable ? fp8_e4m3fn_to_float_table_device(wb)
+                                      : fp8_e4m3fn_to_float_device(wb);
+      block_raw += a_ptr[u] * wv;
+    }
+    acc += block_raw * scale;
+  }
+  g1_perm[idx] = acc;
+}
+
 // Permuted swiglu: input/output are both compact n_rows-indexed, no masking.
 __global__ void swiglu_permuted_kernel(const float* __restrict__ g1_perm, int intermediate,
                                        int n_rows, bool emulate_fp8_unit,
@@ -308,6 +385,52 @@ __global__ void gemm2_scatter_accumulate_kernel(const float* __restrict__ c_perm
   }
   acc = emulate_acc_half ? __half2float(acc_h) : acc;
   out_acc[static_cast<int64_t>(tok) * hidden + h] += w_tok * acc;
+}
+
+// Specialized hot path for the active contest shape:
+// hidden=7168, intermediate=2048, block=128.
+template <bool UseDecodeTable>
+__global__ void gemm2_scatter_accumulate_kernel_block128(const float* __restrict__ c_perm,
+                                                         int n_rows,
+                                                         const int* __restrict__ permuted_tok,
+                                                         const float* __restrict__ permuted_w,
+                                                         const uint8_t* __restrict__ w2,
+                                                         const float* __restrict__ s2,
+                                                         float* __restrict__ out_acc) {
+  constexpr int kHidden = 7168;
+  constexpr int kIntermediate = 2048;
+  constexpr int kBlock = 128;
+  constexpr int kIntermediateBlocks = kIntermediate / kBlock;
+
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = static_cast<int64_t>(n_rows) * kHidden;
+  if (idx >= total) return;
+
+  int pr = static_cast<int>(idx / kHidden);
+  int h = static_cast<int>(idx - static_cast<int64_t>(pr) * kHidden);
+  int tok = permuted_tok[pr];
+  float w_tok = permuted_w[pr];
+  int hb = h / kBlock;
+
+  const float* c_row = c_perm + static_cast<int64_t>(pr) * kIntermediate;
+  const uint8_t* w_row = w2 + static_cast<int64_t>(h) * kIntermediate;
+  float acc = 0.0f;
+  for (int ib = 0; ib < kIntermediateBlocks; ++ib) {
+    const float scale = s2[hb * kIntermediateBlocks + ib];
+    const int i0 = ib * kBlock;
+    const float* c_ptr = c_row + i0;
+    const uint8_t* w_ptr = w_row + i0;
+    float block_raw = 0.0f;
+    #pragma unroll
+    for (int u = 0; u < kBlock; ++u) {
+      const uint8_t wb = w_ptr[u];
+      const float wv = UseDecodeTable ? fp8_e4m3fn_to_float_table_device(wb)
+                                      : fp8_e4m3fn_to_float_device(wb);
+      block_raw += c_ptr[u] * wv;
+    }
+    acc += block_raw * scale;
+  }
+  out_acc[static_cast<int64_t>(tok) * kHidden + h] += w_tok * acc;
 }
 
 __global__ void gemm2_acc_kernel(const float* __restrict__ c, int64_t t, int hidden, int intermediate,
@@ -653,6 +776,7 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
       emulate_fp16_operands_(false),
       emulate_acc_half_(false),
       tc5090_env_(false),
+      tc5090_min_rows_(0),
       tc5090_backend_(nullptr),
       g1_dev_(nullptr),
       c_dev_(nullptr),
@@ -669,6 +793,7 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
       tc_m_indptr_dev_(nullptr),
       tc_int_workspace_dev_(nullptr),
       tc_float_workspace_dev_(nullptr) {
+  initialize_fp8_decode_table();
   const char* env = std::getenv("FIB_EMULATE_FP8_UNIT");
   emulate_fp8_unit_ = (env != nullptr && env[0] == '1');
   const char* env_fp16_op = std::getenv("FIB_EMULATE_FP16_OPERANDS");
@@ -686,17 +811,32 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
     std::fprintf(stderr, "[mxfp] FIB_EMULATE_FP16_OPERANDS=1 (fp16*fp16 multiply emulation enabled)\n");
   }
   const char* env_tc5090 = std::getenv("FIB_MOE_TC5090");
-  tc5090_env_ = (env_tc5090 != nullptr && env_tc5090[0] == '1');
+  int dev = 0;
+  cudaDeviceProp prop;
+  bool blackwell_or_newer = false;
+  if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+    blackwell_or_newer = prop.major >= 10;
+  }
+  tc5090_env_ = blackwell_or_newer;
+  if (env_tc5090 != nullptr) {
+    tc5090_env_ = (env_tc5090[0] == '1');
+  }
+  const char* env_tc5090_min_rows = std::getenv("FIB_MOE_TC5090_MIN_ROWS");
+  if (env_tc5090_min_rows != nullptr && env_tc5090_min_rows[0] != '\0') {
+    tc5090_min_rows_ = std::max(0, std::atoi(env_tc5090_min_rows));
+  } else if (blackwell_or_newer) {
+    tc5090_min_rows_ = 128;
+  }
   if (tc5090_env_) {
     MoeTcBackendConfig cfg = {
         hidden_, intermediate_, block_, hidden_blocks_, intermediate_blocks_, gemm1_out_blocks_};
     tc5090_backend_ = CreateMoeTcBackend5090Temp(cfg);
     if (tc5090_backend_ != nullptr && tc5090_backend_->IsAvailable()) {
-      std::fprintf(stderr, "[mxfp] FIB_MOE_TC5090=1 using backend=%s\n",
-                   tc5090_backend_->BackendName());
+      std::fprintf(stderr, "[mxfp] grouped staged backend=%s enabled min_rows=%d\n",
+                   tc5090_backend_->BackendName(), tc5090_min_rows_);
     } else {
       std::fprintf(stderr,
-                   "[mxfp] FIB_MOE_TC5090=1 requested but backend unavailable; falling back\n");
+                   "[mxfp] grouped staged backend requested but unavailable; falling back\n");
       tc5090_backend_.reset();
     }
   }
@@ -851,14 +991,51 @@ void DeviceMxfpGemmModule::RunExpertPermuted(const float* a_dev, int64_t /*t*/, 
   const float* s13_e = gemm1_s_dev + static_cast<size_t>(local_expert_idx) * w13s_elems;
   const uint8_t* w2_e = gemm2_w_dev + static_cast<size_t>(local_expert_idx) * w2_elems;
   const float* s2_e = gemm2_s_dev + static_cast<size_t>(local_expert_idx) * w2s_elems;
+  const bool kExpertProfile = std::getenv("FIB_MOE_EXPERT_PROFILE") != nullptr;
+  float gemm1_ms = 0.0f;
+  float swiglu_ms = 0.0f;
+  float gemm2_ms = 0.0f;
+  float total_ms = 0.0f;
+  const char* prof_path = "default";
+  cudaEvent_t prof_start = nullptr;
+  cudaEvent_t prof_mid1 = nullptr;
+  cudaEvent_t prof_mid2 = nullptr;
+  cudaEvent_t prof_end = nullptr;
+  if (kExpertProfile) {
+    cudaEventCreate(&prof_start);
+    cudaEventCreate(&prof_mid1);
+    cudaEventCreate(&prof_mid2);
+    cudaEventCreate(&prof_end);
+  }
 
-  if (tc5090_backend_ != nullptr) {
+  if (tc5090_backend_ != nullptr && n_rows >= tc5090_min_rows_) {
+    if (kExpertProfile) cudaEventRecord(prof_start, stream);
     cudaError_t st1 = tc5090_backend_->RunStep1Fused(a_dev, n_rows, permuted_tok_e, w13_e, s13_e,
                                                      c_dev_, stream);
     if (st1 == cudaSuccess) {
+      if (kExpertProfile) cudaEventRecord(prof_mid1, stream);
       cudaError_t st2 = tc5090_backend_->RunStep2(c_dev_, n_rows, permuted_tok_e, permuted_w_e,
                                                   w2_e, s2_e, out_acc_dev, stream);
       if (st2 == cudaSuccess) {
+        if (kExpertProfile) {
+          prof_path = "5090_temp";
+          cudaEventRecord(prof_mid2, stream);
+          cudaEventRecord(prof_end, stream);
+          cudaEventSynchronize(prof_end);
+          cudaEventElapsedTime(&gemm1_ms, prof_start, prof_mid1);
+          swiglu_ms = 0.0f;
+          cudaEventElapsedTime(&gemm2_ms, prof_mid1, prof_mid2);
+          cudaEventElapsedTime(&total_ms, prof_start, prof_end);
+          std::fprintf(stderr,
+                       "[expert_kernel_timing] path=%s expert=%d rows=%d gemm1=%.3fms "
+                       "swiglu=%.3fms gemm2=%.3fms total=%.3fms\n",
+                       prof_path, local_expert_idx, n_rows, gemm1_ms, swiglu_ms, gemm2_ms,
+                       total_ms);
+          cudaEventDestroy(prof_start);
+          cudaEventDestroy(prof_mid1);
+          cudaEventDestroy(prof_mid2);
+          cudaEventDestroy(prof_end);
+        }
         return;
       }
       std::fprintf(stderr,
@@ -873,23 +1050,85 @@ void DeviceMxfpGemmModule::RunExpertPermuted(const float* a_dev, int64_t /*t*/, 
   }
 
   constexpr int kThreads = 128;
+  constexpr int kSpecializedThreads = 64;
+  bool use_specialized_legacy =
+      hidden_ == 7168 && intermediate_ == 2048 && block_ == 128 && !emulate_fp8_unit_ &&
+      !emulate_fp16_operands_ && !emulate_acc_half_;
+  if (const char* env_specialized_legacy = std::getenv("FIB_MOE_SPECIALIZED_LEGACY")) {
+    use_specialized_legacy = env_specialized_legacy[0] == '1';
+  }
+  int specialized_threads = kSpecializedThreads;
+  if (const char* env_specialized_threads = std::getenv("FIB_MOE_SPECIALIZED_THREADS")) {
+    int parsed = std::atoi(env_specialized_threads);
+    if (parsed == 32 || parsed == 64 || parsed == 128 || parsed == 256 || parsed == 512) {
+      specialized_threads = parsed;
+    }
+  }
+  int fp8_decode_table_max_rows = 16;
+  if (const char* env_table_max_rows = std::getenv("FIB_MOE_FP8_TABLE_MAX_ROWS")) {
+    fp8_decode_table_max_rows = std::max(0, std::atoi(env_table_max_rows));
+  }
+  const bool use_specialized_decode_table =
+      use_specialized_legacy && fp8_decode_table_max_rows > 0 &&
+      n_rows <= fp8_decode_table_max_rows;
   int64_t n_g1 = static_cast<int64_t>(n_rows) * gemm1_out_;
   int64_t n_c = static_cast<int64_t>(n_rows) * intermediate_;
   int64_t n_out = static_cast<int64_t>(n_rows) * hidden_;
 
-  int b1 = static_cast<int>((n_g1 + kThreads - 1) / kThreads);
+  int b1 = static_cast<int>((n_g1 + (use_specialized_legacy ? specialized_threads : kThreads) - 1) /
+                            (use_specialized_legacy ? specialized_threads : kThreads));
   int b2 = static_cast<int>((n_c + kThreads - 1) / kThreads);
-  int b3 = static_cast<int>((n_out + kThreads - 1) / kThreads);
+  int b3 = static_cast<int>((n_out + (use_specialized_legacy ? specialized_threads : kThreads) - 1) /
+                            (use_specialized_legacy ? specialized_threads : kThreads));
 
-  gemm1_permuted_kernel<<<b1, kThreads, 0, stream>>>(
-      a_dev, hidden_, gemm1_out_, block_, hidden_blocks_, n_rows, permuted_tok_e, w13_e, s13_e,
-      emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_, g1_dev_);
+  if (kExpertProfile) cudaEventRecord(prof_start, stream);
+  if (use_specialized_legacy) {
+    if (use_specialized_decode_table) {
+      gemm1_permuted_kernel_block128<true><<<b1, specialized_threads, 0, stream>>>(
+          a_dev, n_rows, permuted_tok_e, w13_e, s13_e, g1_dev_);
+    } else {
+      gemm1_permuted_kernel_block128<false><<<b1, specialized_threads, 0, stream>>>(
+          a_dev, n_rows, permuted_tok_e, w13_e, s13_e, g1_dev_);
+    }
+  } else {
+    gemm1_permuted_kernel<<<b1, kThreads, 0, stream>>>(
+        a_dev, hidden_, gemm1_out_, block_, hidden_blocks_, n_rows, permuted_tok_e, w13_e, s13_e,
+        emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_, g1_dev_);
+  }
+  if (kExpertProfile) cudaEventRecord(prof_mid1, stream);
   swiglu_permuted_kernel<<<b2, kThreads, 0, stream>>>(g1_dev_, intermediate_, n_rows,
                                                       emulate_fp8_unit_, c_dev_);
-  gemm2_scatter_accumulate_kernel<<<b3, kThreads, 0, stream>>>(
-      c_dev_, hidden_, intermediate_, block_, intermediate_blocks_, n_rows, permuted_tok_e,
-      permuted_w_e, w2_e, s2_e, emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_,
-      out_acc_dev);
+  if (kExpertProfile) cudaEventRecord(prof_mid2, stream);
+  if (use_specialized_legacy) {
+    if (use_specialized_decode_table) {
+      gemm2_scatter_accumulate_kernel_block128<true><<<b3, specialized_threads, 0, stream>>>(
+          c_dev_, n_rows, permuted_tok_e, permuted_w_e, w2_e, s2_e, out_acc_dev);
+    } else {
+      gemm2_scatter_accumulate_kernel_block128<false><<<b3, specialized_threads, 0, stream>>>(
+          c_dev_, n_rows, permuted_tok_e, permuted_w_e, w2_e, s2_e, out_acc_dev);
+    }
+  } else {
+    gemm2_scatter_accumulate_kernel<<<b3, kThreads, 0, stream>>>(
+        c_dev_, hidden_, intermediate_, block_, intermediate_blocks_, n_rows, permuted_tok_e,
+        permuted_w_e, w2_e, s2_e, emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_,
+        out_acc_dev);
+  }
+  if (kExpertProfile) {
+    cudaEventRecord(prof_end, stream);
+    cudaEventSynchronize(prof_end);
+    cudaEventElapsedTime(&gemm1_ms, prof_start, prof_mid1);
+    cudaEventElapsedTime(&swiglu_ms, prof_mid1, prof_mid2);
+    cudaEventElapsedTime(&gemm2_ms, prof_mid2, prof_end);
+    cudaEventElapsedTime(&total_ms, prof_start, prof_end);
+    std::fprintf(stderr,
+                 "[expert_kernel_timing] path=%s expert=%d rows=%d gemm1=%.3fms swiglu=%.3fms "
+                 "gemm2=%.3fms total=%.3fms\n",
+                 prof_path, local_expert_idx, n_rows, gemm1_ms, swiglu_ms, gemm2_ms, total_ms);
+    cudaEventDestroy(prof_start);
+    cudaEventDestroy(prof_mid1);
+    cudaEventDestroy(prof_mid2);
+    cudaEventDestroy(prof_end);
+  }
 }
 
 void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,

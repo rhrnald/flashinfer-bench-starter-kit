@@ -113,6 +113,7 @@ class DeviceMxfpGemmModule {
   bool emulate_fp16_operands_;
   bool emulate_acc_half_;
   bool tc5090_env_;
+  int tc5090_min_rows_;
   std::unique_ptr<MoeTcBackend> tc5090_backend_;
   float* g1_dev_;
   float* c_dev_;
