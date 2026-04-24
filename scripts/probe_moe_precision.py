@@ -327,6 +327,45 @@ def _pick_top_fp8_candidates(
     return chosen
 
 
+def _candidate_from_name(name: str) -> Candidate:
+    parts = name.split("__")
+    if len(parts) < 2:
+        raise ValueError(f"Invalid candidate name {name!r}")
+    stage = parts[0]
+    mode = parts[1]
+    scale_mode = "none"
+    scope = "storage_compute"
+    if len(parts) >= 3:
+        if parts[2] in {"tensor", "row", "block"}:
+            scale_mode = parts[2]
+            if len(parts) >= 4:
+                scope = parts[3]
+        else:
+            scope = parts[2]
+    return Candidate(stage, mode, scale_mode=scale_mode, scope=scope)
+
+
+def _parse_targeted_config_specs(config_specs: str) -> list[tuple[str, tuple[Candidate, ...]]]:
+    configs: list[tuple[str, tuple[Candidate, ...]]] = []
+    for raw_spec in config_specs.split(","):
+        spec = raw_spec.strip()
+        if not spec:
+            continue
+        if "=" in spec:
+            config_name, candidate_blob = spec.split("=", 1)
+            config_name = config_name.strip()
+        else:
+            config_name = spec
+            candidate_blob = spec
+        candidates = tuple(_candidate_from_name(part.strip()) for part in candidate_blob.split("+") if part.strip())
+        if not candidates:
+            raise ValueError(f"Targeted config {spec!r} did not include any candidates")
+        configs.append((config_name, candidates))
+    if not configs:
+        raise ValueError("No targeted configs were provided")
+    return configs
+
+
 def _combined_candidates(survivors: list[Candidate]) -> list[Candidate]:
     return [
         cand
@@ -520,6 +559,64 @@ def _write_outputs(
             f"{_fmt(row['matched_ratio_contest'], '.6f')} | {_fmt(row['matched_ratio_strict'], '.6f')} | "
             f"{_fmt(row['max_abs'], '.4e')} | "
             f"{_fmt(row['max_rel'], '.4e')} | {row['failure_label']} |"
+        )
+    (out_dir / "summary.md").write_text("\n".join(lines))
+
+
+def _write_targeted_outputs(out_dir: Path, rows: list[dict], meta: dict[str, Any], config_summary: list[dict]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "candidate",
+        "search_phase",
+        "workload_index",
+        "workload_uuid",
+        "seq_len",
+        "stage",
+        "mode",
+        "scale_mode",
+        "scope",
+        "max_abs",
+        "max_rel",
+        "mean_abs",
+        "matched_ratio_contest",
+        "matched_ratio_strict",
+        "selected_experts",
+        "failure_label",
+    ]
+    with (out_dir / "precision_candidates.csv").open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    (out_dir / "config_summary.json").write_text(json.dumps(config_summary, indent=2))
+
+    lines = [f"# MoE Targeted Precision Search {meta['timestamp']}", ""]
+    lines.append("| metric | value |")
+    lines.append("|---|---|")
+    for k, v in meta.items():
+        lines.append(f"| {k} | {v} |")
+    lines.append("")
+    lines.append("## Config Summary")
+    lines.append("")
+    lines.append("| config | worst_matched_contest | worst_matched_strict | worst_max_rel | contest_status | strict_status |")
+    lines.append("|---|---:|---:|---:|---|---|")
+    for row in config_summary:
+        lines.append(
+            f"| {row['candidate']} | {_fmt(row['worst_matched_ratio_contest'], '.6f')} | "
+            f"{_fmt(row['worst_matched_ratio_strict'], '.6f')} | {_fmt(row['worst_max_rel'], '.4e')} | "
+            f"{row['contest_status']} | {row['strict_status']} |"
+        )
+    lines.append("")
+    lines.append("## Sampled Results")
+    lines.append("")
+    lines.append("| candidate | phase | workload | seq_len | matched_contest | matched_strict | max_abs | max_rel | failure |")
+    lines.append("|---|---|---|---:|---:|---:|---:|---:|---|")
+    for row in rows:
+        lines.append(
+            f"| {row['candidate']} | {row['search_phase']} | "
+            f"{_canonical_short_uuid(row['workload_uuid'])} | {row['seq_len']} | "
+            f"{_fmt(row['matched_ratio_contest'], '.6f')} | {_fmt(row['matched_ratio_strict'], '.6f')} | "
+            f"{_fmt(row['max_abs'], '.4e')} | {_fmt(row['max_rel'], '.4e')} | {row['failure_label']} |"
         )
     (out_dir / "summary.md").write_text("\n".join(lines))
 
@@ -1125,6 +1222,42 @@ def _analyze_candidates(
     }
 
 
+def _analyze_eval_configs(
+    panel_records: list[tuple[int, Any]],
+    definition,
+    trace_set,
+    configs: list[EvalConfig],
+    *,
+    atol: float,
+    rtol: float,
+    required_matched_ratio: float,
+) -> dict[str, Any]:
+    rows = _evaluate_configs(
+        panel_records,
+        definition,
+        trace_set,
+        configs,
+        atol=atol,
+        rtol=rtol,
+        required_matched_ratio=required_matched_ratio,
+    )
+    config_aggs = _aggregate_configs(rows, configs, required_matched_ratio=required_matched_ratio)
+    config_summary = list(config_aggs.values())
+    config_summary.sort(
+        key=lambda row: (
+            row["worst_matched_ratio_contest"],
+            row["worst_matched_ratio_strict"],
+            -row["worst_max_rel"],
+        ),
+        reverse=True,
+    )
+    return {
+        "rows": rows,
+        "config_summary": config_summary,
+        "config_aggs": config_aggs,
+    }
+
+
 def _candidate_from_stage_row(row: dict) -> Candidate | None:
     if row["status"] != "safe" or row["best_safe_mode"] == "-":
         return None
@@ -1306,6 +1439,55 @@ def _staged_probe_impl(
     }
 
 
+def _targeted_probe_impl(
+    seed: int,
+    contest_panel_size: int,
+    config_specs: str,
+    atol: float,
+    rtol: float,
+    required_matched_ratio: float,
+) -> dict:
+    import torch
+    from flashinfer_bench import TraceSet
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    trace_set = TraceSet.from_path(TRACE_SET_PATH)
+    definition = trace_set.definitions[DEFINITION]
+    workloads = trace_set.workloads[DEFINITION]
+    contest_panel = _panel_indices(workloads, min(contest_panel_size, len(workloads)))
+    contest_records = _load_panel_records(trace_set, definition, workloads, contest_panel)
+
+    parsed_configs = _parse_targeted_config_specs(config_specs)
+    eval_configs = [_make_eval_config(candidates, "targeted", config_name) for config_name, candidates in parsed_configs]
+    analysis = _analyze_eval_configs(
+        contest_records,
+        definition,
+        trace_set,
+        eval_configs,
+        atol=atol,
+        rtol=rtol,
+        required_matched_ratio=required_matched_ratio,
+    )
+    return {
+        **analysis,
+        "meta": {
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "definition": DEFINITION,
+            "seed": seed,
+            "atol": atol,
+            "rtol": rtol,
+            "required_matched_ratio": required_matched_ratio,
+            "strict_atol": STRICT_ATOL,
+            "strict_rtol": STRICT_RTOL,
+            "panel_size": len(contest_panel),
+            "panel_indices": ",".join(str(i) for i in contest_panel),
+            "targeted_configs": ", ".join(name for name, _ in parsed_configs),
+            "evidence_scope": EVIDENCE_SCOPE,
+        },
+    }
+
+
 def _run_moe_with_candidates(inputs: dict, candidates: list[Candidate]):
     import torch
 
@@ -1400,6 +1582,25 @@ def probe_b200(
     )
 
 
+@app.function(**_COMMON, gpu="B200:1")
+def probe_targeted_b200(
+    seed: int,
+    contest_panel_size: int,
+    config_specs: str,
+    atol: float,
+    rtol: float,
+    required_matched_ratio: float,
+) -> dict:
+    return _targeted_probe_impl(
+        seed,
+        contest_panel_size,
+        config_specs,
+        atol,
+        rtol,
+        required_matched_ratio,
+    )
+
+
 @app.local_entrypoint()
 def probe(
     seed: int = 1234,
@@ -1446,3 +1647,28 @@ def probe(
             },
         )
         print(f"Wrote {out_dir / 'summary.md'}")
+
+
+@app.local_entrypoint()
+def probe_targeted(
+    config_specs: str,
+    seed: int = 1234,
+    contest_panel_size: int = 19,
+    label: str = "",
+    atol: float = DEFAULT_ATOL,
+    rtol: float = DEFAULT_RTOL,
+    required_matched_ratio: float = DEFAULT_REQUIRED_MATCHED_RATIO,
+):
+    result = probe_targeted_b200.remote(
+        seed,
+        contest_panel_size,
+        config_specs,
+        atol,
+        rtol,
+        required_matched_ratio,
+    )
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    suffix = f"_{label}" if label else ""
+    out_dir = PROJECT_ROOT / "experiments" / f"{ts}_B200_moe_precision_targeted{suffix}"
+    _write_targeted_outputs(out_dir, result["rows"], result["meta"], result["config_summary"])
+    print(f"Wrote {out_dir / 'summary.md'}")
