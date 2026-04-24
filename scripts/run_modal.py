@@ -21,6 +21,8 @@ Usage:
     modal run scripts/run_modal.py -- --gpu A10G --max-workloads 3 --iterations 10
 """
 
+from __future__ import annotations
+
 import sys
 from pathlib import Path
 
@@ -29,7 +31,6 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import modal
-from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 
 app = modal.App("flashinfer-bench")
 
@@ -184,6 +185,7 @@ def _run_impl(solution: Solution, config: BenchmarkConfig, max_workloads: int,
     `env_vars` is applied before the build+run so runtime-read env flags like
     `FIB_MOE_GROUPED` / `FIB_MOE_PROFILE` reach the CUDA kernel process.
     """
+    from flashinfer_bench import Benchmark, TraceSet
     from flashinfer_bench.compile import BuildError, BuilderRegistry
 
     _ensure_cuda_arch()
@@ -240,6 +242,7 @@ def _run_sweep_impl(solution: Solution, config: BenchmarkConfig, max_workloads: 
     `variants` is a list of {"name": str, "env": dict}. Returns
     {variant_name: {definition_name: {workload_uuid: entry, ...}}}.
     """
+    from flashinfer_bench import Benchmark, TraceSet
     from flashinfer_bench.compile import BuildError, BuilderRegistry
 
     _ensure_cuda_arch()
@@ -413,6 +416,7 @@ def main(
     `max_workloads=0` means "all workloads".
     """
     from scripts.pack_solution import pack_solution
+    from flashinfer_bench import BenchmarkConfig, Solution
 
     print("Packing solution from source files...")
     solution_path = pack_solution()

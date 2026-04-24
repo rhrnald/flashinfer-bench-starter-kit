@@ -17,10 +17,6 @@ try:
 except ImportError:
     import tomli as tomllib
 
-from flashinfer_bench import BuildSpec
-from flashinfer_bench.agents import pack_solution_from_files
-
-
 def load_config() -> dict:
     """Load configuration from config.toml."""
     config_path = PROJECT_ROOT / "config.toml"
@@ -33,6 +29,9 @@ def load_config() -> dict:
 
 def pack_solution(output_path: Path = None) -> Path:
     """Pack solution files into a Solution JSON."""
+    from flashinfer_bench import BuildSpec
+    from flashinfer_bench.agents import pack_solution_from_files
+
     config = load_config()
 
     solution_config = config["solution"]
