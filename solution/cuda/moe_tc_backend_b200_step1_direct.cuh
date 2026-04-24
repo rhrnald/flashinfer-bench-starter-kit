@@ -56,6 +56,7 @@ static constexpr int kStep1TcgenScaleDiagBytes =
     2 * kStep1HiddenBlocks * 2 * kStep1TcgenN * 4 * sizeof(float);                              // 28672
 static constexpr uint32_t kStep1TcgenLayoutSwizzle128B = 2;
 static constexpr int kStep1PipelineStages = 2;
+static constexpr int kStep1ExchangeSmemElems = kStep1RowTile * kStep1OutRowsPerCta;
 
 static_assert(kStep1Hidden % kStep1Block == 0, "Hidden size must be divisible by 128.");
 static_assert(kStep1Block % kStep1TcgenK == 0, "128-block must be divisible by tcgen05 K=32.");
@@ -704,18 +705,6 @@ __device__ __forceinline__ float tcgen05_ld_16x64b_x1_f16_to_f32(uint32_t taddr)
   return __half2float(__ushort_as_half(static_cast<unsigned short>(bits & 0xffffu)));
 }
 
-__device__ __forceinline__ __half2 tcgen05_ld_16x64b_x1_f16_to_half2(uint32_t taddr) {
-  uint32_t bits;
-  asm volatile("tcgen05.ld.sync.aligned.16x64b.x1.pack::16b.b32 "
-               "{%0}, [%1];"
-               : "=r"(bits)
-               : "r"(taddr)
-               : "memory");
-  return __halves2half2(
-      __ushort_as_half(static_cast<unsigned short>(bits & 0xffffu)),
-      __ushort_as_half(static_cast<unsigned short>((bits >> 16) & 0xffffu)));
-}
-
 __device__ __forceinline__ float tcgen05_ld_16x64b_x1_accum_to_f32(
     uint32_t taddr, int accum_mode) {
   return accum_mode == 1 ? tcgen05_ld_16x64b_x1_f16_to_f32(taddr)
@@ -1016,6 +1005,15 @@ __device__ __forceinline__ uint64_t make_tcgen05_tf32_diag_desc(const void* smem
   return desc;
 }
 
+__device__ __forceinline__ float tf32_rne_prebias(float value) {
+  const uint32_t bits = __float_as_uint(value);
+  // const uint32_t exp = bits & 0x7f800000u;
+  // if ((bits & 0x7fffffffu) == 0u || exp == 0x7f800000u) {
+  //   return value;
+  // }
+  return __uint_as_float(bits + 0x1000u);
+}
+
 __device__ __forceinline__ void stage_tcgen05_tf32_diag_scale(
     float* smem_diag,
     float block_scale,
@@ -1042,7 +1040,7 @@ __device__ __forceinline__ void stage_tcgen05_tf32_diag_scale(
       const int token_idx = valid_token_idx[packed_idx];
       value = block_scale * hidden_scale_dev[static_cast<int64_t>(k_blk) * t + token_idx];
     }
-    smem_diag[linear] = value;
+    smem_diag[linear] = tf32_rne_prebias(value);
   }
 }
 
@@ -1095,7 +1093,7 @@ __device__ __forceinline__ void stage_tcgen05_tf32_all_diag_scales(
                       k_blk];
       value = block_scale * hidden_scale_dev[static_cast<int64_t>(k_blk) * t + token_idx];
     }
-    smem_diag[linear] = value;
+    smem_diag[linear] = tf32_rne_prebias(value);
   }
 }
 
@@ -1134,7 +1132,7 @@ __device__ __forceinline__ void update_tcgen05_tf32_all_diag_values(
     const int slice = n >> 2;
     const int k_in_slice = n & 3;
     smem_diag[matrix * (2 * kStep1TcgenN * 4) +
-              slice * kStep1TcgenN * 4 + n * 4 + k_in_slice] = value;
+              slice * kStep1TcgenN * 4 + n * 4 + k_in_slice] = tf32_rne_prebias(value);
   }
 }
 
@@ -1158,7 +1156,7 @@ __device__ __forceinline__ void update_tcgen05_tf32_diag_only(
     }
     const int slice = n >> 2;
     const int k_in_slice = n & 3;
-    smem_diag[slice * kStep1TcgenN * 4 + n * 4 + k_in_slice] = value;
+    smem_diag[slice * kStep1TcgenN * 4 + n * 4 + k_in_slice] = tf32_rne_prebias(value);
   }
 }
 #else
@@ -1805,10 +1803,7 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
   uint8_t* smem_A_tcgen = smem_raw + tcgen_a_offset;
   uint8_t* smem_B_tcgen = smem_raw + tcgen_b_offset;
   float* smem_tcgen_scale = reinterpret_cast<float*>(smem_raw + tcgen_scale_offset);
-  alignas(16) __shared__ float tcgen_gate_acc_smem[kStep1OutRowsPerCta * kStep1RowTile];
-  alignas(16) __shared__ float tcgen_up_acc_smem[kStep1OutRowsPerCta * kStep1RowTile];
-  alignas(16) __shared__ unsigned short tcgen_gate_acc_h_smem[kStep1OutRowsPerCta];
-  alignas(16) __shared__ unsigned short tcgen_up_acc_h_smem[kStep1OutRowsPerCta];
+  alignas(16) __shared__ float tcgen_up_acc_smem[kStep1ExchangeSmemElems];
 
 #if defined(MXFP_ENABLE_TCGEN05_PTX_ACTIVE) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   alignas(16) __shared__ uint64_t weight_group_barrier[kStep1PipelineStages];
@@ -1834,44 +1829,31 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
     const int n_rows = min_int(t_valid - row_tile, kStep1RowTile);
 
     const int acc_clear_idx = threadIdx.x;
-    if (acc_clear_idx < kStep1OutRowsPerCta * kStep1RowTile) {
-      tcgen_gate_acc_smem[acc_clear_idx] = 0.0f;
+    if (acc_clear_idx < kStep1ExchangeSmemElems) {
       tcgen_up_acc_smem[acc_clear_idx] = 0.0f;
-    }
-    if (acc_clear_idx < kStep1OutRowsPerCta) {
-      tcgen_gate_acc_h_smem[acc_clear_idx] = 0;
-      tcgen_up_acc_h_smem[acc_clear_idx] = 0;
     }
     __syncthreads();
 
     LaneAccum8x1 gate_acc;
     LaneAccum8x1 up_acc;
-    __half2 gate_acc_h2 = __float2half2_rn(0.0f);
-    __half2 up_acc_h2 = __float2half2_rn(0.0f);
     if (warp_id < 4) {
       gate_acc.clear();
       up_acc.clear();
     }
 
     constexpr bool kFastTcgen = (kFastTcgenAccumMode >= 0);
-    const int effective_debug_output_mode = kFastTcgen ? 0 : debug_output_mode;
-    const int requested_tcgen_accum_mode =
-        kFastTcgen ? kFastTcgenAccumMode : tcgen_accum_mode;
-    const int effective_tcgen_accum_mode =
-        (requested_tcgen_accum_mode == 1 && t != 1) ? 0 : requested_tcgen_accum_mode;
-    const bool use_half2_n1 =
-        (requested_tcgen_accum_mode == 1) && (effective_debug_output_mode == 0) && (t == 1);
-    const bool use_tma = kFastTcgen ? true : (w13_tma_desc != nullptr);
-    const bool use_direct_tma_sw128 = kFastTcgen ? true : (use_tma && direct_tma_sw128);
-    const bool use_direct_b_sw128 = kFastTcgen ? true : direct_b_sw128;
+    const int effective_tcgen_accum_mode = kFastTcgen ? kFastTcgenAccumMode :
+        ((tcgen_accum_mode == 1 && t != 1) ? 0 : tcgen_accum_mode);
+    const bool use_tma = (w13_tma_desc != nullptr);
+    const bool use_direct_tma_sw128 = use_tma && direct_tma_sw128;
+    const bool use_direct_b_sw128 = direct_b_sw128;
     const bool ablate_accum56 =
         (!kFastTcgen) &&
-        (effective_debug_output_mode == 98 || effective_debug_output_mode == 99) &&
+        (debug_output_mode == 98 || debug_output_mode == 99) &&
         use_direct_tma_sw128 && use_direct_b_sw128;
-    const bool use_tmem_scale_mma =
+    const bool use_tmem_scale_mma = kFastTcgen ? true :
         (effective_tcgen_accum_mode == 2 || effective_tcgen_accum_mode == 3) &&
-        (effective_debug_output_mode == 0) &&
-        use_direct_tma_sw128 && use_direct_b_sw128;
+        (debug_output_mode == 0) && use_direct_tma_sw128 && use_direct_b_sw128;
     const bool ablate_tmem_scale_staging = effective_tcgen_accum_mode == 3;
     int tcgen_mma_phase_bit = 0;
     bool ablate_first_mma = true;
@@ -2050,54 +2032,27 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
                 const int k_blk_local = batch_base + slot;
                 const int k_blk = k_group * kStep1TmaRawChunkBlocks + k_blk_local;
                 if (n_rows == 1) {
-                  if (use_half2_n1) {
-                    const __half2 result_h2 = tcgen05_ld_16x64b_x1_f16_to_half2(
-                        tcgen_group_tmem_base + static_cast<uint32_t>(slot * kStep1TcgenN));
-                    tcgen05_wait_ld_sync();
-                    if (col_parity == 0) {
-                      const int token_idx = valid_token_idx[packed_base + row_tile];
-                      const float hidden_block_scale =
-                          hidden_scale_dev[static_cast<int64_t>(k_blk) * t + token_idx];
-                      if (result_row < kStep1OutRowsPerCta) {
-                        const float gate_scale =
-                            s13_all_dev[(expert * kStep1Gemm1OutBlocks + out_block128) *
-                                            kStep1HiddenBlocks +
-                                        k_blk];
-                        const __half2 scale_h2 = __float2half2_rn(gate_scale * hidden_block_scale);
-                        gate_acc_h2 = __hadd2(gate_acc_h2, __hmul2(result_h2, scale_h2));
-                      } else {
-                        const float up_scale =
-                            s13_all_dev[(expert * kStep1Gemm1OutBlocks +
-                                         (out_block128 + kStep1IntermediateBlocks)) *
-                                            kStep1HiddenBlocks +
-                                        k_blk];
-                        const __half2 scale_h2 = __float2half2_rn(up_scale * hidden_block_scale);
-                        up_acc_h2 = __hadd2(up_acc_h2, __hmul2(result_h2, scale_h2));
-                      }
-                    }
-                  } else {
-                    const float result0 = tcgen05_ld_16x64b_x1_accum_to_f32(
-                        tcgen_group_tmem_base + static_cast<uint32_t>(slot * kStep1TcgenN),
-                        effective_tcgen_accum_mode);
-                    tcgen05_wait_ld_sync();
-                    if (col_parity == 0) {
-                      const int token_idx = valid_token_idx[packed_base + row_tile];
-                      const float hidden_block_scale =
-                          hidden_scale_dev[static_cast<int64_t>(k_blk) * t + token_idx];
-                      if (result_row < kStep1OutRowsPerCta) {
-                        const float gate_scale =
-                            s13_all_dev[(expert * kStep1Gemm1OutBlocks + out_block128) *
-                                            kStep1HiddenBlocks +
-                                        k_blk];
-                        gate_acc.v[0] += result0 * gate_scale * hidden_block_scale;
-                      } else {
-                        const float up_scale =
-                            s13_all_dev[(expert * kStep1Gemm1OutBlocks +
-                                         (out_block128 + kStep1IntermediateBlocks)) *
-                                            kStep1HiddenBlocks +
-                                        k_blk];
-                        up_acc.v[0] += result0 * up_scale * hidden_block_scale;
-                      }
+                  const float result0 = tcgen05_ld_16x64b_x1_accum_to_f32(
+                      tcgen_group_tmem_base + static_cast<uint32_t>(slot * kStep1TcgenN),
+                      effective_tcgen_accum_mode);
+                  tcgen05_wait_ld_sync();
+                  if (col_parity == 0) {
+                    const int token_idx = valid_token_idx[packed_base + row_tile];
+                    const float hidden_block_scale =
+                        hidden_scale_dev[static_cast<int64_t>(k_blk) * t + token_idx];
+                    if (result_row < kStep1OutRowsPerCta) {
+                      const float gate_scale =
+                          s13_all_dev[(expert * kStep1Gemm1OutBlocks + out_block128) *
+                                          kStep1HiddenBlocks +
+                                      k_blk];
+                      gate_acc.v[0] += result0 * gate_scale * hidden_block_scale;
+                    } else {
+                      const float up_scale =
+                          s13_all_dev[(expert * kStep1Gemm1OutBlocks +
+                                       (out_block128 + kStep1IntermediateBlocks)) *
+                                          kStep1HiddenBlocks +
+                                      k_blk];
+                      up_acc.v[0] += result0 * up_scale * hidden_block_scale;
                     }
                   }
                   continue;
@@ -2117,15 +2072,15 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
                   const int token_idx = valid_token_idx[packed_idx];
                   const float hidden_block_scale =
                       hidden_scale_dev[static_cast<int64_t>(k_blk) * t + token_idx];
-                  const bool dump_unscaled_gate = effective_debug_output_mode == 3;
-                  const bool dump_unscaled_up = effective_debug_output_mode == 4;
                   if (result_row < kStep1OutRowsPerCta) {
                     const float gate_scale =
                         s13_all_dev[(expert * kStep1Gemm1OutBlocks + out_block128) *
                                         kStep1HiddenBlocks +
                                     k_blk];
-                    const float scale =
-                        dump_unscaled_gate ? 1.0f : gate_scale * hidden_block_scale;
+                    float scale = gate_scale * hidden_block_scale;
+                    if constexpr (!kFastTcgen) {
+                      if (debug_output_mode == 3) scale = 1.0f;
+                    }
                     gate_acc.v[rr] += result_bits[reg] * scale;
                   } else {
                     const float up_scale =
@@ -2133,8 +2088,10 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
                                      (out_block128 + kStep1IntermediateBlocks)) *
                                         kStep1HiddenBlocks +
                                     k_blk];
-                    const float scale =
-                        dump_unscaled_up ? 1.0f : up_scale * hidden_block_scale;
+                    float scale = up_scale * hidden_block_scale;
+                    if constexpr (!kFastTcgen) {
+                      if (debug_output_mode == 4) scale = 1.0f;
+                    }
                     up_acc.v[rr] += result_bits[reg] * scale;
                   }
                 }
@@ -2303,15 +2260,15 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
                 const int token_idx = valid_token_idx[packed_idx];
                 const float hidden_block_scale =
                     hidden_scale_dev[static_cast<int64_t>(k_blk) * t + token_idx];
-                const bool dump_unscaled_gate = effective_debug_output_mode == 3;
-                const bool dump_unscaled_up = effective_debug_output_mode == 4;
                 if (result_row < kStep1OutRowsPerCta) {
                   const float gate_scale =
                       s13_all_dev[(expert * kStep1Gemm1OutBlocks + out_block128) *
                                       kStep1HiddenBlocks +
                                   k_blk];
-                  const float scale =
-                      dump_unscaled_gate ? 1.0f : gate_scale * hidden_block_scale;
+                  float scale = gate_scale * hidden_block_scale;
+                  if constexpr (!kFastTcgen) {
+                    if (debug_output_mode == 3) scale = 1.0f;
+                  }
                   gate_acc.v[rr] += result_bits[reg] * scale;
                 } else {
                   const float up_scale =
@@ -2319,8 +2276,10 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
                                    (out_block128 + kStep1IntermediateBlocks)) *
                                       kStep1HiddenBlocks +
                                   k_blk];
-                  const float scale =
-                      dump_unscaled_up ? 1.0f : up_scale * hidden_block_scale;
+                  float scale = up_scale * hidden_block_scale;
+                  if constexpr (!kFastTcgen) {
+                    if (debug_output_mode == 4) scale = 1.0f;
+                  }
                   up_acc.v[rr] += result_bits[reg] * scale;
                 }
               }
@@ -2367,7 +2326,7 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
               k_blk_local,
               lane,
               warp_id,
-              effective_debug_output_mode,
+              debug_output_mode,
 #if defined(MXFP_ENABLE_TCGEN05_PTX_ACTIVE) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
               tcgen_tmem_base_ptr,
               &tcgen_mma_barrier,
@@ -2412,58 +2371,40 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
 #endif
     }
 
-    if (warp_id < 4) {
+    if (warp_id >= 2 && warp_id < 4) {
       const int result_row = warp_id * 16 + (lane >> 2) + ((lane & 1) ? 8 : 0);
       const int col_parity = (lane >> 1) & 1;
-      if (use_half2_n1) {
-        if (col_parity == 0) {
-          if (result_row < kStep1OutRowsPerCta) {
-            tcgen_gate_acc_h_smem[result_row] = __half_as_ushort(__low2half(gate_acc_h2));
-          } else {
-            tcgen_up_acc_h_smem[result_row - kStep1OutRowsPerCta] =
-                __half_as_ushort(__low2half(up_acc_h2));
-          }
-        }
-      } else {
 #pragma unroll
-        for (int reg = 0; reg < 4; ++reg) {
-          const int rr = 2 * reg + col_parity;
-          if (rr >= n_rows) continue;
-          if (result_row < kStep1OutRowsPerCta) {
-            tcgen_gate_acc_smem[result_row * kStep1RowTile + rr] = gate_acc.v[rr];
-          } else {
-            tcgen_up_acc_smem[(result_row - kStep1OutRowsPerCta) * kStep1RowTile + rr] = up_acc.v[rr];
-          }
-        }
+      for (int reg = 0; reg < 4; ++reg) {
+        const int rr = 2 * reg + col_parity;
+        if (rr >= n_rows) continue;
+        const int exchange_row = result_row - kStep1OutRowsPerCta;
+        tcgen_up_acc_smem[rr * kStep1OutRowsPerCta + exchange_row] = up_acc.v[rr];
       }
     }
     __syncthreads();
 
-    const int out_col = out_row_base + lane;
-    const bool do_store = (warp_id == 0);
+    const bool do_store = (warp_id < 2);
 
-    if (do_store && use_half2_n1) {
-      const int packed_row = packed_base + row_tile;
-      const int tcgen_row = lane;
-      const __half gate_h = __ushort_as_half(tcgen_gate_acc_h_smem[tcgen_row]);
-      const __half up_h = __ushort_as_half(tcgen_up_acc_h_smem[tcgen_row]);
-      const __half2 gate_h2 = __halves2half2(gate_h, gate_h);
-      const __half2 up_h2 = __halves2half2(up_h, up_h);
-      const __half value_h = __low2half(swiglu_half2_device(gate_h2, up_h2));
-      c_perm_all_dev[static_cast<int64_t>(packed_row) * kStep1Intermediate + out_col] =
-          __half2float(value_h);
-    } else if (do_store) {
+    if (do_store) {
+      const int result_row = warp_id * 16 + (lane >> 2) + ((lane & 1) ? 8 : 0);
+      const int col_parity = (lane >> 1) & 1;
+      const int out_col = out_row_base + result_row;
 #pragma unroll
-      for (int rr = 0; rr < kStep1RowTile; ++rr) {
-        if (rr >= n_rows) break;
+      for (int reg = 0; reg < 4; ++reg) {
+        const int rr = 2 * reg + col_parity;
+        if (rr >= n_rows) continue;
         const int packed_row = packed_base + row_tile + rr;
-        const int tcgen_row = lane;
-        const float gate_v = tcgen_gate_acc_smem[tcgen_row * kStep1RowTile + rr];
-        const float up_v = tcgen_up_acc_smem[tcgen_row * kStep1RowTile + rr];
-        const float value = (effective_debug_output_mode == 1 || effective_debug_output_mode == 3 ||
-                             effective_debug_output_mode == 98) ? gate_v :
-                            (effective_debug_output_mode == 2 || effective_debug_output_mode == 4) ? up_v :
-                            gate_v * silu_device(up_v);
+        const float gate_v = gate_acc.v[rr];
+        const float up_v = tcgen_up_acc_smem[rr * kStep1OutRowsPerCta + result_row];
+        float value = gate_v * silu_device(up_v);
+        if constexpr (!kFastTcgen) {
+          if (debug_output_mode == 1 || debug_output_mode == 3 || debug_output_mode == 98) {
+            value = gate_v;
+          } else if (debug_output_mode == 2 || debug_output_mode == 4) {
+            value = up_v;
+          }
+        }
         c_perm_all_dev[static_cast<int64_t>(packed_row) * kStep1Intermediate + out_col] = value;
       }
     }
@@ -2501,26 +2442,10 @@ inline cudaError_t RunStep1AllExpertsDirect(
   const std::size_t smem_bytes = step1_smem_bytes();
   const bool use_fast_tcgen =
       (w13_tma_desc != nullptr) && direct_tma_sw128 && direct_b_sw128 &&
-      debug_output_mode == 0 &&
-      (tcgen_accum_mode == 0 || tcgen_accum_mode == 1 ||
-       tcgen_accum_mode == 2 || tcgen_accum_mode == 3);
+      debug_output_mode == 0 && tcgen_accum_mode == 2;
 
   cudaError_t st = cudaFuncSetAttribute(
       step1_gemm1_swiglu_direct_kernel<-1>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(smem_bytes));
-  if (st != cudaSuccess) {
-    return st;
-  }
-  st = cudaFuncSetAttribute(
-      step1_gemm1_swiglu_direct_kernel<0>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(smem_bytes));
-  if (st != cudaSuccess) {
-    return st;
-  }
-  st = cudaFuncSetAttribute(
-      step1_gemm1_swiglu_direct_kernel<1>,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
       static_cast<int>(smem_bytes));
   if (st != cudaSuccess) {
@@ -2533,51 +2458,9 @@ inline cudaError_t RunStep1AllExpertsDirect(
   if (st != cudaSuccess) {
     return st;
   }
-  st = cudaFuncSetAttribute(
-      step1_gemm1_swiglu_direct_kernel<3>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(smem_bytes));
-  if (st != cudaSuccess) {
-    return st;
-  }
-
   dim3 grid(kStep1OutTilesPerExpert, kStep1LocalExperts, 1);
   dim3 block(kStep1CommThreads, 1, 1);
-  if (use_fast_tcgen && tcgen_accum_mode == 0) {
-    step1_gemm1_swiglu_direct_kernel<0><<<grid, block, smem_bytes, stream>>>(
-        hidden_fp8_dev,
-        hidden_scale_dev,
-        t,
-        expert_counts_dev,
-        expert_offsets_dev,
-        permuted_token_ids_dev,
-        w13_all_dev,
-        s13_all_dev,
-        nullptr,
-        w13_tma_desc,
-        true,
-        true,
-        0,
-        0,
-        c_perm_all_dev);
-  } else if (use_fast_tcgen && tcgen_accum_mode == 1) {
-    step1_gemm1_swiglu_direct_kernel<1><<<grid, block, smem_bytes, stream>>>(
-        hidden_fp8_dev,
-        hidden_scale_dev,
-        t,
-        expert_counts_dev,
-        expert_offsets_dev,
-        permuted_token_ids_dev,
-        w13_all_dev,
-        s13_all_dev,
-        nullptr,
-        w13_tma_desc,
-        true,
-        true,
-        0,
-        1,
-        c_perm_all_dev);
-  } else if (use_fast_tcgen && tcgen_accum_mode == 2) {
+  if (use_fast_tcgen) {
     step1_gemm1_swiglu_direct_kernel<2><<<grid, block, smem_bytes, stream>>>(
         hidden_fp8_dev,
         hidden_scale_dev,
@@ -2593,23 +2476,6 @@ inline cudaError_t RunStep1AllExpertsDirect(
         true,
         0,
         2,
-        c_perm_all_dev);
-  } else if (use_fast_tcgen && tcgen_accum_mode == 3) {
-    step1_gemm1_swiglu_direct_kernel<3><<<grid, block, smem_bytes, stream>>>(
-        hidden_fp8_dev,
-        hidden_scale_dev,
-        t,
-        expert_counts_dev,
-        expert_offsets_dev,
-        permuted_token_ids_dev,
-        w13_all_dev,
-        s13_all_dev,
-        nullptr,
-        w13_tma_desc,
-        true,
-        true,
-        0,
-        3,
         c_perm_all_dev);
   } else {
     step1_gemm1_swiglu_direct_kernel<-1><<<grid, block, smem_bytes, stream>>>(

@@ -9,12 +9,14 @@ export FIB_MOE_COMM_USE_TMA=1
 export FIB_MOE_DIRECT_TMA_SW128=1
 export FIB_MOE_DIRECT_B_SW128=1
 export FIB_MOE_COMM_H_TILES=8
-export FIB_STEP1_ABLATE_ACCUM56=1
+export FIB_TCGEN_ACCUM=${FIB_TCGEN_ACCUM:-tf32_scale}
 
 WORKLOAD_INDEXES=${WORKLOAD_INDEXES:-1}
 REPORT_NAME=${REPORT_NAME:-ex}
 
-if command -v gcsudo >/dev/null 2>&1; then
+if [[ -x /engrid/ensh/gpubin/ctn_gcsudo ]]; then
+    NCU_CMD=(/engrid/ensh/gpubin/ctn_gcsudo ncu)
+elif command -v gcsudo >/dev/null 2>&1; then
     NCU_CMD=(gcsudo ncu)
 else
     NCU_CMD=(ncu)

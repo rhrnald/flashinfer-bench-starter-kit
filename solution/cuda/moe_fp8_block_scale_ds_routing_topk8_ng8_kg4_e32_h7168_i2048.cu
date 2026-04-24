@@ -807,7 +807,7 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
     if (std::getenv("FIB_STEP1_ABLATE_ACCUM56_RAW_GATE") != nullptr) {
       step1_debug_output_mode = 98;
     }
-    int step1_tcgen_accum_mode = 0;
+    int step1_tcgen_accum_mode = 2;
     if (const char* accum_env = std::getenv("FIB_TCGEN_ACCUM")) {
       if (std::strcmp(accum_env, "f16") == 0 || std::strcmp(accum_env, "fp16") == 0) {
         step1_tcgen_accum_mode = 1;
@@ -859,12 +859,26 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
         ws.c_perm_all_dev,
         stream);
 
+    cudaEvent_t step2_start = nullptr;
+    cudaEvent_t step2_end = nullptr;
+    cudaEventCreate(&step2_start);
+    cudaEventCreate(&step2_end);
+    cudaEventRecord(step2_start, stream);
     cudaError_t st2 = direct_backend::LaunchStep2DirectAllExperts(
         ws.c_perm_all_dev, expert_counts_dev, expert_offsets_dev, permuted_token_ids_dev,
         permuted_weights_dev, static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
         static_cast<const float*>(gemm2_weights_scale.data_ptr()), nullptr, out_acc_dev, stream);
     TVM_FFI_ICHECK_EQ(st2, cudaSuccess)
         << "direct Step2(all experts) launch failed: " << cudaGetErrorString(st2);
+    cudaEventRecord(step2_end, stream);
+    cudaEventSynchronize(step2_end);
+    float step2_ms = 0.0f;
+    cudaEventElapsedTime(&step2_ms, step2_start, step2_end);
+    std::fprintf(stderr, "[moe_step2_timing] impl=direct seq_len=%lld step2=%.3fms\n",
+                 static_cast<long long>(t), step2_ms);
+    std::fflush(stderr);
+    cudaEventDestroy(step2_start);
+    cudaEventDestroy(step2_end);
   } else {
     gemm_mod.EnsureWorkspace(t, stream);
     for (int le = 0; le < kNumLocalExperts; ++le) {
