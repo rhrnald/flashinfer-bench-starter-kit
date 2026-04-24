@@ -1,0 +1,12 @@
+{
+  "bf16_f16_survivors": [
+    "swiglu_output__fp8__block",
+    "swiglu_output__fp8__tensor",
+    "swiglu_output__fp8__row",
+    "hidden_dequant__fp8__block",
+    "hidden_dequant__fp8__tensor",
+    "hidden_dequant__fp8__row"
+  ],
+  "strict_survivors": [],
+  "pairwise_shortlist": []
+}

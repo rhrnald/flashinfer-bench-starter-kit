@@ -42,6 +42,50 @@ DEFAULT_VARIANTS = [
     {"name": "legacy_profile", "env": {"FIB_MOE_LEGACY": "1", "FIB_MOE_PROFILE": "1"}},
 ]
 
+PRECISION_VARIANTS = [
+    {"name": "baseline_profile", "env": {"FIB_MOE_PROFILE": "1"}},
+    {
+        "name": "hidden_dequant_bf16",
+        "env": {
+            "FIB_MOE_PROFILE": "1",
+            "FIB_MOE_PREC_STAGE": "hidden_dequant",
+            "FIB_MOE_PREC_MODE": "bf16",
+        },
+    },
+    {
+        "name": "gemm1_output_bf16",
+        "env": {
+            "FIB_MOE_PROFILE": "1",
+            "FIB_MOE_PREC_STAGE": "gemm1_output",
+            "FIB_MOE_PREC_MODE": "bf16",
+        },
+    },
+    {
+        "name": "swiglu_output_bf16",
+        "env": {
+            "FIB_MOE_PROFILE": "1",
+            "FIB_MOE_PREC_STAGE": "swiglu_output",
+            "FIB_MOE_PREC_MODE": "bf16",
+        },
+    },
+    {
+        "name": "gemm2_operands_f16",
+        "env": {
+            "FIB_MOE_PROFILE": "1",
+            "FIB_MOE_PREC_STAGE": "gemm2_operands",
+            "FIB_MOE_PREC_MODE": "f16",
+        },
+    },
+    {
+        "name": "out_accumulator_bf16",
+        "env": {
+            "FIB_MOE_PROFILE": "1",
+            "FIB_MOE_PREC_STAGE": "out_accumulator",
+            "FIB_MOE_PREC_MODE": "bf16",
+        },
+    },
+]
+
 
 def _experiments_root() -> Path:
     return PROJECT_ROOT / "experiments"
@@ -186,6 +230,7 @@ def sweep(
     iterations: int = 5,
     num_trials: int = 1,
     variants_json: str = "",
+    preset: str = "default",
     label: str = "",
 ):
     """Pack solution and sweep variants on Modal. Outputs CSV + markdown."""
@@ -193,8 +238,12 @@ def sweep(
 
     if variants_json:
         variants = json.loads(Path(variants_json).read_text())
-    else:
+    elif preset == "precision":
+        variants = PRECISION_VARIANTS
+    elif preset == "default":
         variants = DEFAULT_VARIANTS
+    else:
+        raise ValueError("Unsupported --preset; choose from default, precision")
 
     print("Packing solution from source files...")
     solution_path = pack_solution()

@@ -1,0 +1,13 @@
+[
+  {
+    "candidate": "gemm2_accumulator__bf16",
+    "worst_workload": "e05c6c03",
+    "worst_seq_len": 1,
+    "worst_matched_ratio_contest": 0.9909319196428571,
+    "worst_matched_ratio_strict": 0.7385602678571428,
+    "status": "safe",
+    "contest_status": "contest_safe",
+    "strict_status": "strict_unsafe",
+    "evidence_scope": "oracle_only"
+  }
+]

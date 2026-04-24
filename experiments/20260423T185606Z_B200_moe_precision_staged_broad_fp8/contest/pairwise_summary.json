@@ -1,0 +1,47 @@
+[
+  {
+    "worst_matched_ratio_contest": 0.9920479910714286,
+    "worst_matched_ratio_strict": 0.7398158482142857,
+    "worst_max_rel": 4575000064.0,
+    "worst_max_abs": 12288.0,
+    "status": "safe",
+    "evidence_scope": "oracle_only",
+    "candidate": "gemm1_operands__f16+gemm2_accumulator__bf16",
+    "stage": "gemm1_operands+gemm2_accumulator",
+    "mode": "f16+bf16",
+    "scale_mode": "none+none",
+    "scope": "storage_compute+storage_compute",
+    "contest_status": "contest_safe",
+    "strict_status": "strict_unsafe"
+  },
+  {
+    "worst_matched_ratio_contest": 0.9927455357142857,
+    "worst_matched_ratio_strict": 0.7154017857142857,
+    "worst_max_rel": 19100000256.0,
+    "worst_max_abs": 12288.0,
+    "status": "safe",
+    "evidence_scope": "oracle_only",
+    "candidate": "gemm1_accumulator__f16+gemm2_accumulator__bf16",
+    "stage": "gemm1_accumulator+gemm2_accumulator",
+    "mode": "f16+bf16",
+    "scale_mode": "none+none",
+    "scope": "storage_compute+storage_compute",
+    "contest_status": "contest_safe",
+    "strict_status": "strict_unsafe"
+  },
+  {
+    "worst_matched_ratio_contest": 0.99942626953125,
+    "worst_matched_ratio_strict": 0.9720982142857143,
+    "worst_max_rel": 3875000064.0,
+    "worst_max_abs": 4096.0,
+    "status": "safe",
+    "evidence_scope": "oracle_only",
+    "candidate": "gemm1_operands__f16+gemm1_accumulator__f16",
+    "stage": "gemm1_operands+gemm1_accumulator",
+    "mode": "f16+f16",
+    "scale_mode": "none+none",
+    "scope": "storage_compute+storage_compute",
+    "contest_status": "contest_safe",
+    "strict_status": "strict_safe"
+  }
+]

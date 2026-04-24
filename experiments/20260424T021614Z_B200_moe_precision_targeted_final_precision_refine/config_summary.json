@@ -1,0 +1,62 @@
+[
+  {
+    "worst_matched_ratio_contest": 0.9390345982142857,
+    "worst_matched_ratio_strict": 0.1307198660714286,
+    "worst_max_rel": 297599991808.0,
+    "worst_max_abs": 139264.0,
+    "status": "safe",
+    "evidence_scope": "oracle_only",
+    "candidate": "post_g1_no_g2in",
+    "stage": "gemm1_operands+swiglu_output+out_accumulator",
+    "mode": "f16+fp8+fp8",
+    "scale_mode": "none+block+tensor",
+    "scope": "storage_compute+storage_compute+storage_compute",
+    "contest_status": "contest_safe",
+    "strict_status": "strict_unsafe"
+  },
+  {
+    "worst_matched_ratio_contest": 0.9313616071428571,
+    "worst_matched_ratio_strict": 0.1821986607142857,
+    "worst_max_rel": 745599991808.0,
+    "worst_max_abs": 50176.0,
+    "status": "safe",
+    "evidence_scope": "oracle_only",
+    "candidate": "post_g1_no_outacc",
+    "stage": "gemm1_operands+swiglu_output+gemm2_operands",
+    "mode": "f16+fp8+fp8",
+    "scale_mode": "none+block+block",
+    "scope": "storage_compute+storage_compute+storage_compute",
+    "contest_status": "contest_safe",
+    "strict_status": "strict_unsafe"
+  },
+  {
+    "worst_matched_ratio_contest": 0.9211774553571429,
+    "worst_matched_ratio_strict": 0.1107700892857143,
+    "worst_max_rel": 675199975424.0,
+    "worst_max_abs": 139264.0,
+    "status": "safe",
+    "evidence_scope": "oracle_only",
+    "candidate": "post_g1_chain",
+    "stage": "gemm1_operands+swiglu_output+gemm2_operands+out_accumulator",
+    "mode": "f16+fp8+fp8+fp8",
+    "scale_mode": "none+block+block+tensor",
+    "scope": "storage_compute+storage_compute+storage_compute+storage_compute",
+    "contest_status": "contest_safe",
+    "strict_status": "strict_unsafe"
+  },
+  {
+    "worst_matched_ratio_contest": 0.8893694196428571,
+    "worst_matched_ratio_strict": 0.0901227678571429,
+    "worst_max_rel": 527999991808.0,
+    "worst_max_abs": 126976.0,
+    "status": "unsafe",
+    "evidence_scope": "oracle_only",
+    "candidate": "post_g1_plus_hidden",
+    "stage": "hidden_dequant+gemm1_operands+swiglu_output+gemm2_operands+out_accumulator",
+    "mode": "fp8+f16+fp8+fp8+fp8",
+    "scale_mode": "block+none+block+block+tensor",
+    "scope": "storage_compute+storage_compute+storage_compute+storage_compute+storage_compute",
+    "contest_status": "contest_unsafe",
+    "strict_status": "strict_unsafe"
+  }
+]

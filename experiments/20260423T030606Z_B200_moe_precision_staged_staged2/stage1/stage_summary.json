@@ -1,0 +1,92 @@
+[
+  {
+    "stage": "gemm1_accumulator",
+    "best_safe_mode": "f16",
+    "scale_mode": "none",
+    "scope": "storage_compute",
+    "worst_matched_ratio_contest": 0.9962332589285714,
+    "worst_matched_ratio_strict": 0.8938337053571429,
+    "worst_max_rel": 16000000000.0,
+    "status": "safe"
+  },
+  {
+    "stage": "gemm1_operands",
+    "best_safe_mode": "f16",
+    "scale_mode": "none",
+    "scope": "storage_compute",
+    "worst_matched_ratio_contest": 0.9994419642857143,
+    "worst_matched_ratio_strict": 0.9751674107142857,
+    "worst_max_rel": 3350000128.0,
+    "status": "safe"
+  },
+  {
+    "stage": "gemm1_output",
+    "best_safe_mode": "f16",
+    "scale_mode": "none",
+    "scope": "storage_compute",
+    "worst_matched_ratio_contest": 0.9995989118303571,
+    "worst_matched_ratio_strict": 0.9821428571428571,
+    "worst_max_rel": 837500032.0,
+    "status": "safe"
+  },
+  {
+    "stage": "gemm2_accumulator",
+    "best_safe_mode": "bf16",
+    "scale_mode": "none",
+    "scope": "storage_compute",
+    "worst_matched_ratio_contest": 0.9919084821428571,
+    "worst_matched_ratio_strict": 0.7472098214285714,
+    "worst_max_rel": 1243750016.0,
+    "status": "safe"
+  },
+  {
+    "stage": "gemm2_operands",
+    "best_safe_mode": "f16",
+    "scale_mode": "none",
+    "scope": "storage_compute",
+    "worst_matched_ratio_contest": 0.9561461836797082,
+    "worst_matched_ratio_strict": 0.9463280816453941,
+    "worst_max_rel": 1.4422110319137573,
+    "status": "safe"
+  },
+  {
+    "stage": "hidden_dequant",
+    "best_safe_mode": "f16",
+    "scale_mode": "none",
+    "scope": "storage_compute",
+    "worst_matched_ratio_contest": 0.9993024553571429,
+    "worst_matched_ratio_strict": 0.9835379464285714,
+    "worst_max_rel": 1875000064.0,
+    "status": "safe"
+  },
+  {
+    "stage": "out_accumulator",
+    "best_safe_mode": "bf16",
+    "scale_mode": "none",
+    "scope": "storage_compute",
+    "worst_matched_ratio_contest": 0.9984654017857143,
+    "worst_matched_ratio_strict": 0.9359654017857143,
+    "worst_max_rel": 22800001024.0,
+    "status": "safe"
+  },
+  {
+    "stage": "swiglu_input",
+    "best_safe_mode": "f16",
+    "scale_mode": "none",
+    "scope": "storage_compute",
+    "worst_matched_ratio_contest": 0.9995989118303571,
+    "worst_matched_ratio_strict": 0.9821428571428571,
+    "worst_max_rel": 837500032.0,
+    "status": "safe"
+  },
+  {
+    "stage": "swiglu_output",
+    "best_safe_mode": "f16",
+    "scale_mode": "none",
+    "scope": "storage_compute",
+    "worst_matched_ratio_contest": 0.9562376106340318,
+    "worst_matched_ratio_strict": 0.949299634917189,
+    "worst_max_rel": 2.614035129547119,
+    "status": "safe"
+  }
+]

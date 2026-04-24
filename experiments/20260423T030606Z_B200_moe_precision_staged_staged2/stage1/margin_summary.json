@@ -1,0 +1,92 @@
+[
+  {
+    "stage": "hidden_dequant",
+    "preferred_mode": "f16",
+    "bf16_contest": 0.9953962053571429,
+    "f16_contest": 0.9993024553571429,
+    "bf16_strict": 0.8473772321428572,
+    "f16_strict": 0.9835379464285714,
+    "bf16_margin": 0.09539620535714288,
+    "f16_margin": 0.09930245535714288
+  },
+  {
+    "stage": "gemm1_operands",
+    "preferred_mode": "f16",
+    "bf16_contest": 0.9940011160714286,
+    "f16_contest": 0.9994419642857143,
+    "bf16_strict": 0.7880859375,
+    "f16_strict": 0.9751674107142857,
+    "bf16_margin": 0.09400111607142858,
+    "f16_margin": 0.09944196428571428
+  },
+  {
+    "stage": "gemm1_accumulator",
+    "preferred_mode": "f16",
+    "bf16_contest": 0.9772600446428571,
+    "f16_contest": 0.9962332589285714,
+    "bf16_strict": 0.4222935267857143,
+    "f16_strict": 0.8938337053571429,
+    "bf16_margin": 0.07726004464285707,
+    "f16_margin": 0.09623325892857137
+  },
+  {
+    "stage": "gemm1_output",
+    "preferred_mode": "f16",
+    "bf16_contest": 0.9944196428571429,
+    "f16_contest": 0.9995989118303571,
+    "bf16_strict": 0.8479352678571428,
+    "f16_strict": 0.9821428571428571,
+    "bf16_margin": 0.09441964285714288,
+    "f16_margin": 0.09959891183035707
+  },
+  {
+    "stage": "swiglu_input",
+    "preferred_mode": "f16",
+    "bf16_contest": 0.9944196428571429,
+    "f16_contest": 0.9995989118303571,
+    "bf16_strict": 0.8479352678571428,
+    "f16_strict": 0.9821428571428571,
+    "bf16_margin": 0.09441964285714288,
+    "f16_margin": 0.09959891183035707
+  },
+  {
+    "stage": "swiglu_output",
+    "preferred_mode": "bf16",
+    "bf16_contest": 0.9965122767857143,
+    "f16_contest": 0.9562376106340318,
+    "bf16_strict": 0.8929966517857143,
+    "f16_strict": 0.949299634917189,
+    "bf16_margin": 0.09651227678571428,
+    "f16_margin": 0.056237610634031765
+  },
+  {
+    "stage": "gemm2_operands",
+    "preferred_mode": "bf16",
+    "bf16_contest": 0.994140625,
+    "f16_contest": 0.9561461836797082,
+    "bf16_strict": 0.8427734375,
+    "f16_strict": 0.9463280816453941,
+    "bf16_margin": 0.09414062499999998,
+    "f16_margin": 0.05614618367970814
+  },
+  {
+    "stage": "gemm2_accumulator",
+    "preferred_mode": "bf16",
+    "bf16_contest": 0.9919084821428571,
+    "f16_contest": 0.6263950892857143,
+    "bf16_strict": 0.7472098214285714,
+    "f16_strict": 0.6258370535714286,
+    "bf16_margin": 0.09190848214285707,
+    "f16_margin": -0.2736049107142857
+  },
+  {
+    "stage": "out_accumulator",
+    "preferred_mode": "bf16",
+    "bf16_contest": 0.9984654017857143,
+    "f16_contest": 0.5802176339285714,
+    "bf16_strict": 0.9359654017857143,
+    "f16_strict": 0.5733816964285714,
+    "bf16_margin": 0.09846540178571428,
+    "f16_margin": -0.3197823660714286
+  }
+]

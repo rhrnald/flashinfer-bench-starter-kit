@@ -1,0 +1,52 @@
+[
+  {
+    "candidate": "hidden_dequant__fp8__block",
+    "validation_status": "kernel_not_supported",
+    "workloads_passed": 0,
+    "total_workloads": 19,
+    "worst_max_abs": null,
+    "worst_max_rel": null,
+    "evidence_scope": "kernel_not_supported",
+    "notes": "kernel validation helper unavailable in Modal worker: ModuleNotFoundError"
+  },
+  {
+    "candidate": "gemm1_output__fp8__tensor",
+    "validation_status": "kernel_not_supported",
+    "workloads_passed": 0,
+    "total_workloads": 19,
+    "worst_max_abs": null,
+    "worst_max_rel": null,
+    "evidence_scope": "kernel_not_supported",
+    "notes": "kernel validation helper unavailable in Modal worker: ModuleNotFoundError"
+  },
+  {
+    "candidate": "swiglu_input__fp8__block",
+    "validation_status": "kernel_not_supported",
+    "workloads_passed": 0,
+    "total_workloads": 19,
+    "worst_max_abs": null,
+    "worst_max_rel": null,
+    "evidence_scope": "kernel_not_supported",
+    "notes": "kernel validation helper unavailable in Modal worker: ModuleNotFoundError"
+  },
+  {
+    "candidate": "swiglu_output__fp8__block",
+    "validation_status": "kernel_not_supported",
+    "workloads_passed": 0,
+    "total_workloads": 19,
+    "worst_max_abs": null,
+    "worst_max_rel": null,
+    "evidence_scope": "kernel_not_supported",
+    "notes": "kernel validation helper unavailable in Modal worker: ModuleNotFoundError"
+  },
+  {
+    "candidate": "gemm2_operands__fp8__block",
+    "validation_status": "kernel_not_supported",
+    "workloads_passed": 0,
+    "total_workloads": 19,
+    "worst_max_abs": null,
+    "worst_max_rel": null,
+    "evidence_scope": "kernel_not_supported",
+    "notes": "kernel validation helper unavailable in Modal worker: ModuleNotFoundError"
+  }
+]

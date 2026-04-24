@@ -1,0 +1,38 @@
+{
+  "bf16_f16_survivors": [
+    "gemm1_output__f16",
+    "swiglu_input__f16",
+    "gemm1_operands__f16",
+    "hidden_dequant__f16",
+    "out_accumulator__bf16",
+    "swiglu_output__bf16",
+    "gemm1_accumulator__f16",
+    "hidden_dequant__bf16",
+    "gemm1_output__bf16",
+    "swiglu_input__bf16",
+    "gemm2_operands__bf16",
+    "gemm1_operands__bf16",
+    "gemm2_accumulator__bf16",
+    "gemm1_accumulator__bf16",
+    "swiglu_output__f16",
+    "gemm2_operands__f16"
+  ],
+  "strict_survivors": [
+    "hidden_dequant__f16",
+    "gemm1_operands__f16",
+    "gemm1_output__f16",
+    "swiglu_input__f16",
+    "swiglu_output__f16",
+    "gemm2_operands__f16",
+    "out_accumulator__bf16"
+  ],
+  "pairwise_shortlist": [
+    "hidden_dequant__f16",
+    "gemm1_operands__f16",
+    "gemm1_accumulator__f16",
+    "gemm1_output__f16",
+    "swiglu_output__f16",
+    "gemm2_accumulator__bf16",
+    "out_accumulator__bf16"
+  ]
+}
