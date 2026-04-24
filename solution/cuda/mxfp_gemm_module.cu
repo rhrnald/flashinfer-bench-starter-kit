@@ -1,43 +1,15 @@
 #include "mxfp_gemm_module.h"
+#include "mxfp_cutlass_sm100.cuh"
+#include "mxfp_device_utils.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#if __has_include(<cuda_fp8.h>)
-#include <cuda_fp8.h>
-#define FIB_HAS_CUDA_FP8 1
-#else
-#define FIB_HAS_CUDA_FP8 0
-#endif
-
-#if __has_include(<cutlass/cutlass.h>) && __has_include(<cute/tensor.hpp>) && \
-    __has_include(<cutlass/gemm/device/gemm_universal_adapter.h>)
-#include <cute/tensor.hpp>
-#include <cutlass/cutlass.h>
-#include <cutlass/epilogue/collective/collective_builder.hpp>
-#include <cutlass/detail/sm100_mixed_dtype_blockwise_layout.hpp>
-#include <cutlass/gemm/collective/collective_builder.hpp>
-#include <cutlass/gemm/device/gemm_universal_adapter.h>
-#include <cutlass/gemm/dispatch_policy.hpp>
-#include <cutlass/gemm/group_array_problem_shape.hpp>
-#include <cutlass/gemm/kernel/gemm_universal.hpp>
-#include <cutlass/kernel_hardware_info.hpp>
-#include <cutlass/numeric_types.h>
-#include <cutlass/util/packed_stride.hpp>
-#define FIB_HAS_DIRECT_CUTLASS_SM100 1
-#else
-#define FIB_HAS_DIRECT_CUTLASS_SM100 0
-#endif
-
-#if __has_include(<flashinfer/gemm/group_gemm_fp8_groupwise_sm100.cuh>)
-#include <flashinfer/gemm/group_gemm_fp8_groupwise_sm100.cuh>
-#define FIB_HAS_FLASHINFER_FP8_GROUP_GEMM_SM100 1
-#else
-#define FIB_HAS_FLASHINFER_FP8_GROUP_GEMM_SM100 0
-#endif
+#include <nvtx3/nvToolsExt.h>
 
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -48,287 +20,121 @@ namespace mxfp {
 
 namespace {
 
-inline float siluf_host(float x) { return x / (1.0f + std::exp(-x)); }
+struct TcGemmDispatch {
+  int tile_m;
+  int mma_sms;
+};
 
-__device__ __forceinline__ float fp8_e4m3fn_to_float_device(uint8_t x) {
-  int sign = (x & 0x80) ? -1 : 1;
-  int exp = (x >> 3) & 0x0f;
-  int mant = x & 0x07;
+bool mxfp_nvtx_enabled() {
+  const char* env = std::getenv("FIB_MOE_NVTX");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
 
-  if (exp == 0) {
-    if (mant == 0) {
-      return sign == 1 ? 0.0f : -0.0f;
-    }
-    float frac = static_cast<float>(mant) * 0.125f;
-    return sign * ldexpf(frac, -6);
+struct ScopedMxfpNvtxRange {
+  bool enabled;
+  explicit ScopedMxfpNvtxRange(bool enabled, const char* name) : enabled(enabled) {
+    if (enabled) nvtxRangePushA(name);
   }
+  ~ScopedMxfpNvtxRange() {
+    if (enabled) nvtxRangePop();
+  }
+};
 
-  float frac = 1.0f + static_cast<float>(mant) * 0.125f;
-  return sign * ldexpf(frac, exp - 7);
+int next_power_of_two_int(int n) {
+  int v = std::max(1, n);
+  --v;
+  v |= v >> 1;
+  v |= v >> 2;
+  v |= v >> 4;
+  v |= v >> 8;
+  v |= v >> 16;
+  return v + 1;
 }
 
-__device__ __forceinline__ float siluf_device(float x) { return x / (1.0f + expf(-x)); }
-
-__device__ __forceinline__ float bf16_to_float_device(uint16_t bits) {
-  uint32_t u32 = static_cast<uint32_t>(bits) << 16;
-  return __uint_as_float(u32);
+int compute_trtllm_tile_tokens_dim(int total_rows, int num_experts = 32) {
+  int avg_rows = std::max(1, (total_rows + num_experts - 1) / num_experts);
+  int adjusted = (avg_rows * 13 + 9) / 10;
+  int tile = next_power_of_two_int(adjusted);
+  return std::min(std::max(tile, 8), 128);
 }
 
-__device__ __forceinline__ float f16_to_float_device(uint16_t bits) {
-  union {
-    uint16_t u;
-    __half h;
-  } v;
-  v.u = bits;
-  return __half2float(v.h);
+TcGemmDispatch select_trtllm_like_gemm1_dispatch(int total_rows, int padded_rows) {
+  if (padded_rows >= 256) return {256, 2};
+  (void)total_rows;
+  return {64, 1};
 }
 
-__device__ __forceinline__ uint8_t float_to_e4m3_device(float x) {
-#if FIB_HAS_CUDA_FP8
-  __nv_fp8_e4m3 y(x);
-  return *reinterpret_cast<uint8_t*>(&y);
-#else
-  (void)x;
-  return 0;
-#endif
+TcGemmDispatch select_trtllm_like_gemm2_dispatch(int total_rows, int padded_rows) {
+  (void)total_rows;
+  (void)padded_rows;
+  return {64, 1};
 }
 
-__device__ __forceinline__ float fp8_native_to_float_device(uint8_t x) {
-#if FIB_HAS_CUDA_FP8
-  __nv_fp8_e4m3 y = *reinterpret_cast<__nv_fp8_e4m3*>(&x);
-  return static_cast<float>(y);
-#else
-  (void)x;
-  return 0.0f;
-#endif
+int select_tile_m_from_env(const char* name, int fallback) {
+  const char* env = std::getenv(name);
+  if (env == nullptr) return fallback;
+  int v = std::atoi(env);
+  return (v == 64 || v == 128 || v == 256) ? v : fallback;
+}
+
+int select_mma_sm_from_env(const char* name, int fallback) {
+  const char* env = std::getenv(name);
+  if (env == nullptr) return fallback;
+  int v = std::atoi(env);
+  return (v == 1 || v == 2) ? v : fallback;
+}
+
+int select_swiglu_rows_per_cta(int total_rows, int padded_rows) {
+  const char* env = std::getenv("FIB_MOE_SWIGLU_ROWS_PER_CTA");
+  if (env != nullptr) {
+    int v = std::atoi(env);
+    if (v == 1 || v == 2 || v == 4) return v;
+  }
+  (void)total_rows;
+  (void)padded_rows;
+  return 1;
+}
+
+int select_grouped_swiglu_rows_per_cta(int total_rows, int padded_rows) {
+  const char* env = std::getenv("FIB_MOE_TC_GROUPED_SWIGLU_ROWS_PER_CTA");
+  if (env != nullptr) {
+    int v = std::atoi(env);
+    if (v == 1 || v == 2 || v == 4) return v;
+  }
+  (void)total_rows;
+  (void)padded_rows;
+  return 1;
+}
+
+int select_direct_output_vec(int64_t t) {
+  const char* env = std::getenv("FIB_MOE_DIRECT_OUTPUT_VEC");
+  if (env != nullptr) {
+    int v = std::atoi(env);
+    if (v == 1 || v == 2 || v == 4 || v == 8) return v;
+  }
+  const char* env_min_t = std::getenv("FIB_MOE_DIRECT_OUTPUT_VEC_MIN_T");
+  int min_t = env_min_t == nullptr ? 14 : std::max(0, std::atoi(env_min_t));
+  return t >= min_t ? 4 : 1;
 }
 
 #if FIB_HAS_DIRECT_CUTLASS_SM100
-
-inline char* align_ptr(char* ptr, size_t alignment) {
-  uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-  uintptr_t aligned = (addr + alignment - 1) & ~(alignment - 1);
-  return reinterpret_cast<char*>(aligned);
-}
-
-template <typename T>
-T* reserve_workspace(char*& cursor, size_t& remaining, size_t count = 1) {
-  char* aligned = align_ptr(cursor, 16);
-  size_t padding = static_cast<size_t>(aligned - cursor);
-  size_t bytes = sizeof(T) * count;
-  if (padding + bytes > remaining) {
-    return nullptr;
-  }
-  cursor = aligned + bytes;
-  remaining -= padding + bytes;
-  return reinterpret_cast<T*>(aligned);
-}
-
-inline cudaError_t cutlass_status_to_cuda(cutlass::Status status) {
-  return status == cutlass::Status::kSuccess ? cudaSuccess : cudaErrorUnknown;
-}
-
-template <int ScaleGranularityM, bool ScaleMajorK, int MmaSM, typename DTypeA, typename DTypeB,
-          typename DTypeOut>
-cudaError_t launch_cutlass_blockscaled_group_gemm_sm100(
-    void* arg_buffer, size_t arg_buffer_size_in_bytes, void* workspace,
-    size_t workspace_size_in_bytes, DTypeA* a_ptr, DTypeB* b_ptr, float* sfa_ptr,
-    float* sfb_ptr, DTypeOut* d_ptr, int m, int n, int k, cudaStream_t stream) {
-  using namespace cute;
-  using ElementA = DTypeA;
-  using LayoutA = cutlass::layout::RowMajor;
-  constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
-
-  using ElementB = DTypeB;
-  using LayoutB = cutlass::layout::ColumnMajor;
-  constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-
-  using ElementD = DTypeOut;
-  using LayoutD = cutlass::layout::RowMajor;
-  constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
-
-  using ElementC = void;
-  using LayoutC = void;
-  constexpr int AlignmentC = 0;
-  using ElementAccumulator = float;
-  using ElementCompute = float;
-
-  using MmaTileShape = Shape<Int<MmaSM * 128>, _128, _128>;
-  using ClusterShape = Shape<Int<MmaSM>, _1, _1>;
-  using ScaleConfig = std::conditional_t<
-      ScaleMajorK,
-      cutlass::detail::Sm1xxBlockwiseScaleConfig<ScaleGranularityM, 128, 128, UMMA::Major::K,
-                                                 UMMA::Major::K>,
-      cutlass::detail::Sm1xxBlockwiseScaleConfig<ScaleGranularityM, 128, 128,
-                                                 UMMA::Major::MN, UMMA::Major::MN>>;
-
-  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, MmaTileShape, ClusterShape,
-      cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute,
-      ElementC, LayoutC, AlignmentC, ElementD, LayoutD, AlignmentD,
-      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
-
-  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, ElementA,
-      cute::tuple<LayoutA, typename ScaleConfig::LayoutSFA>, AlignmentA, ElementB,
-      cute::tuple<LayoutB, typename ScaleConfig::LayoutSFB>, AlignmentB, ElementAccumulator,
-      MmaTileShape, ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<
-          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-      cutlass::gemm::KernelScheduleSm100Blockwise>::CollectiveOp;
-
-  using GemmKernel =
-      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
-                                           CollectiveEpilogue, void>;
-  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-  using StrideA = typename Gemm::GemmKernel::StrideA;
-  using StrideB = typename Gemm::GemmKernel::StrideB;
-  using StrideD = typename Gemm::GemmKernel::StrideD;
-
-  (void)arg_buffer;
-  (void)arg_buffer_size_in_bytes;
-
-  StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, make_shape(m, k, 1));
-  StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, 1));
-  StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, 1));
-  auto layout_sfa = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
-  auto layout_sfb = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
-
-  typename Gemm::Arguments arguments{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {m, n, k, 1},
-      {a_ptr, stride_a, b_ptr, stride_b, sfa_ptr, layout_sfa, sfb_ptr, layout_sfb},
-      {{}, d_ptr, stride_d, d_ptr, stride_d}};
-  arguments.epilogue.thread.alpha = 1.0f;
-  arguments.epilogue.thread.beta = 0.0f;
-
-  Gemm gemm;
-  size_t required_workspace = Gemm::get_workspace_size(arguments);
-  if (required_workspace > workspace_size_in_bytes) {
-    return cudaErrorMemoryAllocation;
-  }
-
-  cudaError_t status = cutlass_status_to_cuda(gemm.can_implement(arguments));
-  if (status != cudaSuccess) {
-    return status;
-  }
-  status = cutlass_status_to_cuda(gemm.initialize(arguments, workspace));
-  if (status != cudaSuccess) {
-    return status;
-  }
-  return cutlass_status_to_cuda(gemm.run(stream));
-}
-
-template <int MmaSM, typename DTypeA, typename DTypeB, typename DTypeOut>
-cudaError_t launch_cutlass_dense_gemm_sm100(void* workspace, size_t workspace_size_in_bytes,
-                                            DTypeA* a_ptr, DTypeB* b_ptr, DTypeOut* d_ptr,
-                                            int m, int n, int k, cudaStream_t stream) {
-  // GEMM2 path: materialize both operands and use a regular tensor-op GEMM.
-  using namespace cute;
-  using ElementA = DTypeA;
-  using LayoutA = cutlass::layout::RowMajor;
-  constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
-
-  using ElementB = DTypeB;
-  using LayoutB = cutlass::layout::ColumnMajor;
-  constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
-
-  using ElementD = DTypeOut;
-  using LayoutD = cutlass::layout::RowMajor;
-  constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
-
-  using ElementC = void;
-  using LayoutC = void;
-  constexpr int AlignmentC = 0;
-  using ElementAccumulator = float;
-  using ElementCompute = float;
-
-  using MmaTileShape = Shape<Int<MmaSM * 128>, _128, _64>;
-  using ClusterShape = Shape<Int<MmaSM>, _1, _1>;
-  using MainloopSchedule =
-      std::conditional_t<MmaSM == 2, cutlass::gemm::KernelTmaWarpSpecialized2SmSm100,
-                         cutlass::gemm::KernelTmaWarpSpecialized1SmSm100>;
-
-  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, MmaTileShape, ClusterShape,
-      cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute,
-      ElementC, LayoutC, AlignmentC, ElementD, LayoutD, AlignmentD,
-      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
-
-  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, ElementA, LayoutA, AlignmentA,
-      ElementB, LayoutB, AlignmentB, ElementAccumulator, MmaTileShape, ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<
-          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-      MainloopSchedule>::CollectiveOp;
-
-  using GemmKernel =
-      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop,
-                                           CollectiveEpilogue, void>;
-  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-  using StrideA = typename Gemm::GemmKernel::StrideA;
-  using StrideB = typename Gemm::GemmKernel::StrideB;
-  using StrideD = typename Gemm::GemmKernel::StrideD;
-
-  StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, make_shape(m, k, 1));
-  StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, 1));
-  StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, 1));
-
-  typename Gemm::Arguments arguments{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {m, n, k, 1},
-      {a_ptr, stride_a, b_ptr, stride_b},
-      {{}, d_ptr, stride_d, d_ptr, stride_d}};
-  arguments.epilogue.thread.alpha = 1.0f;
-  arguments.epilogue.thread.beta = 0.0f;
-
-  Gemm gemm;
-  size_t required_workspace = Gemm::get_workspace_size(arguments);
-  if (required_workspace > workspace_size_in_bytes) {
-    return cudaErrorMemoryAllocation;
-  }
-
-  cudaError_t status = cutlass_status_to_cuda(gemm.can_implement(arguments));
-  if (status != cudaSuccess) {
-    return status;
-  }
-  status = cutlass_status_to_cuda(gemm.initialize(arguments, workspace));
-  if (status != cudaSuccess) {
-    return status;
-  }
-  return cutlass_status_to_cuda(gemm.run(stream));
-}
-
+#if FIB_HAS_FLASHINFER_GROUP_GEMM_FP8_SM100
+using detail::launch_flashinfer_grouped_blockscaled_gemm1_sm100;
 #endif
-
-// Temporary FP8-unit emulation: quantize intermediate values to an E4M3FN-like grid.
-__device__ __forceinline__ float quantize_e4m3fn_like(float x) {
-  if (!isfinite(x) || x == 0.0f) return 0.0f;
-  float sign = x < 0.0f ? -1.0f : 1.0f;
-  float ax = fabsf(x);
-  const float kMax = 448.0f;
-  const float kMinSub = ldexpf(1.0f, -9);  // 2^-9
-  if (ax >= kMax) return sign * kMax;
-  if (ax < kMinSub) return 0.0f;
-
-  int e2;
-  float m = frexpf(ax, &e2);  // ax = m * 2^e2, m in [0.5,1)
-  int e = e2 - 1;             // normalized exponent in [-6, 8]
-
-  if (e < -6) {
-    float q = nearbyintf(ax / kMinSub);
-    q = fminf(7.0f, fmaxf(0.0f, q));
-    return sign * q * kMinSub;
-  }
-  if (e > 8) return sign * kMax;
-
-  float base = ldexpf(1.0f, e);
-  float mf = ax / base;                         // [1,2)
-  float qm = nearbyintf((mf - 1.0f) * 8.0f);   // 3-bit frac
-  qm = fminf(7.0f, fmaxf(0.0f, qm));
-  float qmf = 1.0f + qm * 0.125f;
-  return sign * qmf * base;
-}
+using detail::launch_cutlass_blockscaled_group_gemm_sm100;
+using detail::launch_cutlass_blockscaled_group_gemm_tn_sm100;
+using detail::launch_cutlass_blockscaled_grouped_ptr_gemm_sm100;
+using detail::launch_cutlass_dense_gemm_sm100;
+using detail::launch_cutlass_dense_grouped_ptr_gemm_sm100;
+#endif
+using detail::bf16_to_float_device;
+using detail::env_int_or_default;
+using detail::f16_to_float_device;
+using detail::float_to_e4m3_device;
+using detail::fp8_e4m3fn_to_float_device;
+using detail::fp8_native_to_float_device;
+using detail::quantize_e4m3fn_like;
+using detail::siluf_device;
 
 __global__ void gemm1_kernel(const float* __restrict__ a, int64_t t, int hidden, int gemm1_out,
                              int block, int hidden_blocks, int local_expert_idx,
@@ -710,6 +516,29 @@ __global__ void gather_hidden_scale_rows_mn_major_kernel(const float* __restrict
       hidden_scale[static_cast<int64_t>(hb) * t + tok];
 }
 
+__global__ void gather_hidden_fp8_and_scale_rows_mn_major_kernel(
+    const uint8_t* __restrict__ hidden_fp8, const float* __restrict__ hidden_scale,
+    const int* __restrict__ permuted_tok, int64_t t, int n_rows, int padded_rows, int hidden,
+    int hidden_blocks, uint8_t* __restrict__ a_perm, float* __restrict__ a_scale) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t a_total = static_cast<int64_t>(padded_rows) * hidden;
+  int64_t scale_total = static_cast<int64_t>(padded_rows) * hidden_blocks;
+
+  if (idx < a_total) {
+    int pr = static_cast<int>(idx / hidden);
+    int h = static_cast<int>(idx - static_cast<int64_t>(pr) * hidden);
+    a_perm[idx] = (pr < n_rows) ? hidden_fp8[static_cast<int64_t>(permuted_tok[pr]) * hidden + h]
+                                : 0;
+  }
+
+  if (idx < scale_total) {
+    int pr = static_cast<int>(idx / hidden_blocks);
+    int hb = static_cast<int>(idx - static_cast<int64_t>(pr) * hidden_blocks);
+    a_scale[static_cast<int64_t>(pr) * hidden_blocks + hb] =
+        (pr < n_rows) ? hidden_scale[static_cast<int64_t>(hb) * t + permuted_tok[pr]] : 1.0f;
+  }
+}
+
 __global__ void transpose_rowmajor_nk_to_colmajor_nk_kernel(const uint8_t* __restrict__ src,
                                                            int n, int k,
                                                            uint8_t* __restrict__ dst) {
@@ -790,6 +619,35 @@ __global__ void dequant_fp8_rows_native_to_f16_kernel(const uint8_t* __restrict_
   int row_scale_count = (rows + row_scale_granularity - 1) / row_scale_granularity;
   float scale = scale_major_k ? in_scale[static_cast<int64_t>(rb) * col_blocks + cb]
                               : in_scale[static_cast<int64_t>(cb) * row_scale_count + rb];
+  union {
+    uint16_t u;
+    __half h;
+  } v;
+  v.h = __float2half(fp8_e4m3fn_to_float_device(in_fp8[idx]) * scale);
+  out_f16[idx] = v.u;
+}
+
+__global__ void dequant_fp8_experts_native_to_f16_kernel(const uint8_t* __restrict__ in_fp8,
+                                                         const float* __restrict__ in_scale,
+                                                         int experts, int rows, int cols,
+                                                         int row_scale_granularity,
+                                                         int col_blocks,
+                                                         uint16_t* __restrict__ out_f16) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t matrix_elems = static_cast<int64_t>(rows) * cols;
+  int64_t total = static_cast<int64_t>(experts) * matrix_elems;
+  if (idx >= total) return;
+  int expert = static_cast<int>(idx / matrix_elems);
+  int64_t local = idx - static_cast<int64_t>(expert) * matrix_elems;
+  int row = static_cast<int>(local / cols);
+  int col = static_cast<int>(local - static_cast<int64_t>(row) * cols);
+  int rb = row / row_scale_granularity;
+  int cb = col / 128;
+  int64_t scale_elems = static_cast<int64_t>((rows + row_scale_granularity - 1) /
+                                             row_scale_granularity) *
+                        col_blocks;
+  float scale = in_scale[static_cast<int64_t>(expert) * scale_elems +
+                         static_cast<int64_t>(rb) * col_blocks + cb];
   union {
     uint16_t u;
     __half h;
@@ -901,6 +759,221 @@ __global__ void swiglu_quantize_f16_to_fp8_kernel(const uint16_t* __restrict__ g
   if (tid < 128 && i < intermediate) {
     c_fp8[static_cast<int64_t>(row) * intermediate + i] =
         (row < n_rows) ? float_to_e4m3_device(v / scale) : 0;
+  }
+}
+
+__global__ void swiglu_quantize_float_to_fp8_kernel(const float* __restrict__ g1_f32,
+                                                    int intermediate, int n_rows,
+                                                    int padded_rows,
+                                                    uint8_t* __restrict__ c_fp8,
+                                                    float* __restrict__ c_scale,
+                                                    bool scale_major_k) {
+  int row = blockIdx.x;
+  int ib = blockIdx.y;
+  int tid = threadIdx.x;
+  if (row >= padded_rows) return;
+
+  extern __shared__ float smem[];
+  float v = 0.0f;
+  int i = ib * 128 + tid;
+  if (tid < 128 && i < intermediate && row < n_rows) {
+    const float* g1_row = g1_f32 + static_cast<int64_t>(row) * (2 * intermediate);
+    float x1 = g1_row[i];
+    float x2 = g1_row[i + intermediate];
+    v = x1 * siluf_device(x2);
+  }
+  smem[tid] = fabsf(v);
+  __syncthreads();
+
+  for (int offset = 64; offset > 0; offset >>= 1) {
+    if (tid < offset) smem[tid] = fmaxf(smem[tid], smem[tid + offset]);
+    __syncthreads();
+  }
+
+  float scale = fmaxf(smem[0] / 448.0f, 1.0e-8f);
+  if (tid == 0) {
+    int col_blocks = intermediate / 128;
+    if (scale_major_k) {
+      c_scale[static_cast<int64_t>(row) * col_blocks + ib] = scale;
+    } else {
+      c_scale[static_cast<int64_t>(ib) * padded_rows + row] = scale;
+    }
+  }
+  if (tid < 128 && i < intermediate) {
+    c_fp8[static_cast<int64_t>(row) * intermediate + i] =
+        (row < n_rows) ? float_to_e4m3_device(v / scale) : 0;
+  }
+}
+
+template <int RowsPerCta>
+__global__ void swiglu_quantize_float_to_fp8_rows_per_cta_kernel(
+    const float* __restrict__ g1_f32, int intermediate, int n_rows, int padded_rows,
+    uint8_t* __restrict__ c_fp8, float* __restrict__ c_scale, bool scale_major_k) {
+  int row_base = blockIdx.x * RowsPerCta;
+  int ib = blockIdx.y;
+  int tid = threadIdx.x;
+  if (row_base >= padded_rows) return;
+
+  extern __shared__ float smem[];
+  float v[RowsPerCta];
+  int i = ib * 128 + tid;
+#pragma unroll
+  for (int r = 0; r < RowsPerCta; ++r) {
+    int row = row_base + r;
+    float val = 0.0f;
+    if (tid < 128 && i < intermediate && row < n_rows) {
+      const float* g1_row = g1_f32 + static_cast<int64_t>(row) * (2 * intermediate);
+      float x1 = g1_row[i];
+      float x2 = g1_row[i + intermediate];
+      val = x1 * siluf_device(x2);
+    }
+    v[r] = val;
+    smem[r * 128 + tid] = fabsf(val);
+  }
+  __syncthreads();
+
+  for (int offset = 64; offset > 0; offset >>= 1) {
+#pragma unroll
+    for (int r = 0; r < RowsPerCta; ++r) {
+      if (tid < offset) {
+        smem[r * 128 + tid] = fmaxf(smem[r * 128 + tid], smem[r * 128 + tid + offset]);
+      }
+    }
+    __syncthreads();
+  }
+
+  int col_blocks = intermediate / 128;
+#pragma unroll
+  for (int r = 0; r < RowsPerCta; ++r) {
+    int row = row_base + r;
+    if (row >= padded_rows) continue;
+    float scale = fmaxf(smem[r * 128] / 448.0f, 1.0e-8f);
+    if (tid == 0) {
+      if (scale_major_k) {
+        c_scale[static_cast<int64_t>(row) * col_blocks + ib] = scale;
+      } else {
+        c_scale[static_cast<int64_t>(ib) * padded_rows + row] = scale;
+      }
+    }
+    if (tid < 128 && i < intermediate) {
+      c_fp8[static_cast<int64_t>(row) * intermediate + i] =
+          (row < n_rows) ? float_to_e4m3_device(v[r] / scale) : 0;
+    }
+  }
+}
+
+__global__ void grouped_swiglu_quantize_float_to_fp8_kernel(
+    const float* __restrict__ g1_f32, int intermediate, int padded_total_rows,
+    const int* __restrict__ expert_offsets, const int* __restrict__ padded_offsets,
+    uint8_t* __restrict__ c_fp8, float* __restrict__ c_scale) {
+  int padded_row = blockIdx.x;
+  int ib = blockIdx.y;
+  int tid = threadIdx.x;
+  if (padded_row >= padded_total_rows) return;
+
+  int le = 0;
+#pragma unroll
+  for (int i = 0; i < 32; ++i) {
+    if (padded_row >= padded_offsets[i]) le = i;
+  }
+  int local_row = padded_row - padded_offsets[le];
+  int n_rows = expert_offsets[le + 1] - expert_offsets[le];
+  bool valid_row = local_row < n_rows;
+  int compact_row = expert_offsets[le] + local_row;
+
+  extern __shared__ float smem[];
+  float v = 0.0f;
+  int i = ib * 128 + tid;
+  if (tid < 128 && i < intermediate && valid_row) {
+    const float* g1_row = g1_f32 + static_cast<int64_t>(compact_row) * (2 * intermediate);
+    float x1 = g1_row[i];
+    float x2 = g1_row[i + intermediate];
+    v = x1 * siluf_device(x2);
+  }
+  smem[tid] = fabsf(v);
+  __syncthreads();
+
+  for (int offset = 64; offset > 0; offset >>= 1) {
+    if (tid < offset) smem[tid] = fmaxf(smem[tid], smem[tid + offset]);
+    __syncthreads();
+  }
+
+  float scale = fmaxf(smem[0] / 448.0f, 1.0e-8f);
+  int col_blocks = intermediate / 128;
+  if (tid == 0) {
+    c_scale[static_cast<int64_t>(padded_row) * col_blocks + ib] = scale;
+  }
+  if (tid < 128 && i < intermediate) {
+    c_fp8[static_cast<int64_t>(padded_row) * intermediate + i] =
+        valid_row ? float_to_e4m3_device(v / scale) : 0;
+  }
+}
+
+template <int RowsPerCta>
+__global__ void grouped_swiglu_quantize_float_to_fp8_rows_per_cta_kernel(
+    const float* __restrict__ g1_f32, int intermediate, int padded_total_rows,
+    const int* __restrict__ expert_offsets, const int* __restrict__ padded_offsets,
+    uint8_t* __restrict__ c_fp8, float* __restrict__ c_scale) {
+  int padded_row_base = blockIdx.x * RowsPerCta;
+  int ib = blockIdx.y;
+  int tid = threadIdx.x;
+  if (padded_row_base >= padded_total_rows) return;
+
+  extern __shared__ float smem[];
+  float v[RowsPerCta];
+  bool valid_row[RowsPerCta];
+  int i = ib * 128 + tid;
+#pragma unroll
+  for (int r = 0; r < RowsPerCta; ++r) {
+    int padded_row = padded_row_base + r;
+    float val = 0.0f;
+    bool valid = false;
+    if (padded_row < padded_total_rows) {
+      int le = 0;
+#pragma unroll
+      for (int j = 0; j < 32; ++j) {
+        if (padded_row >= padded_offsets[j]) le = j;
+      }
+      int local_row = padded_row - padded_offsets[le];
+      int n_rows = expert_offsets[le + 1] - expert_offsets[le];
+      valid = local_row < n_rows;
+      int compact_row = expert_offsets[le] + local_row;
+      if (tid < 128 && i < intermediate && valid) {
+        const float* g1_row = g1_f32 + static_cast<int64_t>(compact_row) * (2 * intermediate);
+        float x1 = g1_row[i];
+        float x2 = g1_row[i + intermediate];
+        val = x1 * siluf_device(x2);
+      }
+    }
+    v[r] = val;
+    valid_row[r] = valid;
+    smem[r * 128 + tid] = fabsf(val);
+  }
+  __syncthreads();
+
+  for (int offset = 64; offset > 0; offset >>= 1) {
+#pragma unroll
+    for (int r = 0; r < RowsPerCta; ++r) {
+      if (tid < offset) {
+        smem[r * 128 + tid] = fmaxf(smem[r * 128 + tid], smem[r * 128 + tid + offset]);
+      }
+    }
+    __syncthreads();
+  }
+
+  int col_blocks = intermediate / 128;
+#pragma unroll
+  for (int r = 0; r < RowsPerCta; ++r) {
+    int padded_row = padded_row_base + r;
+    if (padded_row >= padded_total_rows) continue;
+    float scale = fmaxf(smem[r * 128] / 448.0f, 1.0e-8f);
+    if (tid == 0) {
+      c_scale[static_cast<int64_t>(padded_row) * col_blocks + ib] = scale;
+    }
+    if (tid < 128 && i < intermediate) {
+      c_fp8[static_cast<int64_t>(padded_row) * intermediate + i] =
+          valid_row[r] ? float_to_e4m3_device(v[r] / scale) : 0;
+    }
   }
 }
 
@@ -1095,6 +1168,277 @@ __global__ void scatter_float_weighted_row_scaled_kernel(
   out_acc[static_cast<int64_t>(tok) * hidden + h] += w * d_f32[idx];
 }
 
+__global__ void scatter_all_float_weighted_row_scaled_kernel(
+    const float* __restrict__ d_f32, const float* __restrict__ row_scale, int hidden,
+    int total_rows, const int* __restrict__ expert_offsets, const int* __restrict__ permuted_tok,
+    const float* __restrict__ permuted_w, float* __restrict__ out_acc) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = static_cast<int64_t>(total_rows) * hidden;
+  if (idx >= total) return;
+  int pr = static_cast<int>(idx / hidden);
+  int h = static_cast<int>(idx - static_cast<int64_t>(pr) * hidden);
+  int le = 0;
+  #pragma unroll
+  for (int i = 0; i < 32; ++i) {
+    if (pr >= expert_offsets[i]) le = i;
+  }
+  int scratch_row = pr + 4 * le;
+  int tok = permuted_tok[pr];
+  float w = permuted_w[pr] * row_scale[scratch_row];
+  atomicAdd(out_acc + static_cast<int64_t>(tok) * hidden + h,
+            w * d_f32[static_cast<int64_t>(scratch_row) * hidden + h]);
+}
+
+__global__ void scatter_all_float_weighted_kernel(
+    const float* __restrict__ d_f32, int hidden, int total_rows,
+    const int* __restrict__ expert_offsets, const int* __restrict__ permuted_tok,
+    const float* __restrict__ permuted_w, float* __restrict__ out_acc) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = static_cast<int64_t>(total_rows) * hidden;
+  if (idx >= total) return;
+  int pr = static_cast<int>(idx / hidden);
+  int h = static_cast<int>(idx - static_cast<int64_t>(pr) * hidden);
+  int le = 0;
+  #pragma unroll
+  for (int i = 0; i < 32; ++i) {
+    if (pr >= expert_offsets[i]) le = i;
+  }
+  int scratch_row = pr + 4 * le;
+  int tok = permuted_tok[pr];
+  float w = permuted_w[pr];
+  atomicAdd(out_acc + static_cast<int64_t>(tok) * hidden + h,
+            w * d_f32[static_cast<int64_t>(scratch_row) * hidden + h]);
+}
+
+__global__ void scatter_all_float_weighted_by_row_kernel(
+    const float* __restrict__ d_f32, int hidden, int total_rows,
+    const int* __restrict__ expert_offsets, const int* __restrict__ permuted_tok,
+    const float* __restrict__ permuted_w, float* __restrict__ out_acc) {
+  int pr = blockIdx.x;
+  int h = blockIdx.y * blockDim.x + threadIdx.x;
+  if (pr >= total_rows || h >= hidden) return;
+
+  int le = 0;
+#pragma unroll
+  for (int i = 0; i < 32; ++i) {
+    if (pr >= expert_offsets[i]) le = i;
+  }
+  int scratch_row = pr + 4 * le;
+  int tok = permuted_tok[pr];
+  float w = permuted_w[pr];
+  atomicAdd(out_acc + static_cast<int64_t>(tok) * hidden + h,
+            w * d_f32[static_cast<int64_t>(scratch_row) * hidden + h]);
+}
+
+__global__ void scatter_all_float_weighted_by_expert_row_kernel(
+    const float* __restrict__ d_f32, int hidden, int total_rows,
+    const int* __restrict__ permuted_tok, const int* __restrict__ permuted_expert,
+    const float* __restrict__ permuted_w, float* __restrict__ out_acc) {
+  int pr = blockIdx.x;
+  int h = blockIdx.y * blockDim.x + threadIdx.x;
+  if (pr >= total_rows || h >= hidden) return;
+
+  int scratch_row = pr + 4 * permuted_expert[pr];
+  int tok = permuted_tok[pr];
+  float w = permuted_w[pr];
+  atomicAdd(out_acc + static_cast<int64_t>(tok) * hidden + h,
+            w * d_f32[static_cast<int64_t>(scratch_row) * hidden + h]);
+}
+
+__global__ void scatter_all_float_weighted_by_padded_expert_row_kernel(
+    const float* __restrict__ d_f32, int hidden, int total_rows,
+    const int* __restrict__ expert_offsets, const int* __restrict__ padded_offsets,
+    const int* __restrict__ permuted_tok, const int* __restrict__ permuted_expert,
+    const float* __restrict__ permuted_w, float* __restrict__ out_acc) {
+  int pr = blockIdx.x;
+  int h = blockIdx.y * blockDim.x + threadIdx.x;
+  if (pr >= total_rows || h >= hidden) return;
+
+  int le = permuted_expert[pr];
+  int scratch_row = padded_offsets[le] + (pr - expert_offsets[le]);
+  int tok = permuted_tok[pr];
+  float w = permuted_w[pr];
+  atomicAdd(out_acc + static_cast<int64_t>(tok) * hidden + h,
+            w * d_f32[static_cast<int64_t>(scratch_row) * hidden + h]);
+}
+
+__global__ void gather_scratch_topk_to_bf16_kernel(
+    const float* __restrict__ d_f32, int hidden, int64_t t,
+    const int* __restrict__ routed_positions, const int* __restrict__ routed_local_experts,
+    const float* __restrict__ routed_weights, uint16_t* __restrict__ out_bf16) {
+  int tok = blockIdx.x;
+  int h = blockIdx.y * blockDim.x + threadIdx.x;
+  if (tok >= t || h >= hidden) return;
+
+  __shared__ int smem_pos[8];
+  __shared__ int smem_le[8];
+  __shared__ float smem_w[8];
+  const int base = tok * 8;
+  if (threadIdx.x < 8) {
+    smem_pos[threadIdx.x] = routed_positions[base + threadIdx.x];
+    smem_le[threadIdx.x] = routed_local_experts[base + threadIdx.x];
+    smem_w[threadIdx.x] = routed_weights[base + threadIdx.x];
+  }
+  __syncthreads();
+
+  float acc = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    int pos = smem_pos[i];
+    if (pos < 0) continue;
+    int le = smem_le[i];
+    float w = smem_w[i];
+    int scratch_row = pos + 4 * le;
+    acc += w * d_f32[static_cast<int64_t>(scratch_row) * hidden + h];
+  }
+  union {
+    __nv_bfloat16 bf16;
+    uint16_t u;
+  } packed;
+  packed.bf16 = __float2bfloat16_rn(acc);
+  out_bf16[static_cast<int64_t>(tok) * hidden + h] = packed.u;
+}
+
+template <int Vec>
+__global__ void gather_scratch_topk_to_bf16_vec_kernel(
+    const float* __restrict__ d_f32, int hidden, int64_t t,
+    const int* __restrict__ routed_positions, const int* __restrict__ routed_local_experts,
+    const float* __restrict__ routed_weights, uint16_t* __restrict__ out_bf16) {
+  int tok = blockIdx.x;
+  int h0 = (blockIdx.y * blockDim.x + threadIdx.x) * Vec;
+  if (tok >= t || h0 >= hidden) return;
+
+  __shared__ int smem_pos[8];
+  __shared__ int smem_le[8];
+  __shared__ float smem_w[8];
+  const int base = tok * 8;
+  if (threadIdx.x < 8) {
+    smem_pos[threadIdx.x] = routed_positions[base + threadIdx.x];
+    smem_le[threadIdx.x] = routed_local_experts[base + threadIdx.x];
+    smem_w[threadIdx.x] = routed_weights[base + threadIdx.x];
+  }
+  __syncthreads();
+
+  float acc[Vec];
+#pragma unroll
+  for (int v = 0; v < Vec; ++v) acc[v] = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    int pos = smem_pos[i];
+    if (pos < 0) continue;
+    int le = smem_le[i];
+    float w = smem_w[i];
+    const float* src = d_f32 + static_cast<int64_t>(pos + 4 * le) * hidden + h0;
+#pragma unroll
+    for (int v = 0; v < Vec; ++v) {
+      int h = h0 + v;
+      if (h < hidden) acc[v] += w * src[v];
+    }
+  }
+  uint16_t* dst = out_bf16 + static_cast<int64_t>(tok) * hidden + h0;
+#pragma unroll
+  for (int v = 0; v < Vec; ++v) {
+    int h = h0 + v;
+    if (h < hidden) {
+      union {
+        __nv_bfloat16 bf16;
+        uint16_t u;
+      } packed;
+      packed.bf16 = __float2bfloat16_rn(acc[v]);
+      dst[v] = packed.u;
+    }
+  }
+}
+
+__global__ void gather_padded_scratch_topk_to_bf16_kernel(
+    const float* __restrict__ d_f32, int hidden, int64_t t,
+    const int* __restrict__ expert_offsets, const int* __restrict__ padded_offsets,
+    const int* __restrict__ routed_positions, const int* __restrict__ routed_local_experts,
+    const float* __restrict__ routed_weights, uint16_t* __restrict__ out_bf16) {
+  int tok = blockIdx.x;
+  int h = blockIdx.y * blockDim.x + threadIdx.x;
+  if (tok >= t || h >= hidden) return;
+
+  __shared__ int smem_pos[8];
+  __shared__ int smem_le[8];
+  __shared__ float smem_w[8];
+  const int base = tok * 8;
+  if (threadIdx.x < 8) {
+    smem_pos[threadIdx.x] = routed_positions[base + threadIdx.x];
+    smem_le[threadIdx.x] = routed_local_experts[base + threadIdx.x];
+    smem_w[threadIdx.x] = routed_weights[base + threadIdx.x];
+  }
+  __syncthreads();
+
+  float acc = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    int pos = smem_pos[i];
+    if (pos < 0) continue;
+    int le = smem_le[i];
+    int scratch_row = padded_offsets[le] + (pos - expert_offsets[le]);
+    acc += smem_w[i] * d_f32[static_cast<int64_t>(scratch_row) * hidden + h];
+  }
+  union {
+    __nv_bfloat16 bf16;
+    uint16_t u;
+  } packed;
+  packed.bf16 = __float2bfloat16_rn(acc);
+  out_bf16[static_cast<int64_t>(tok) * hidden + h] = packed.u;
+}
+
+template <int Vec>
+__global__ void gather_padded_scratch_topk_to_bf16_vec_kernel(
+    const float* __restrict__ d_f32, int hidden, int64_t t,
+    const int* __restrict__ expert_offsets, const int* __restrict__ padded_offsets,
+    const int* __restrict__ routed_positions, const int* __restrict__ routed_local_experts,
+    const float* __restrict__ routed_weights, uint16_t* __restrict__ out_bf16) {
+  int tok = blockIdx.x;
+  int h0 = (blockIdx.y * blockDim.x + threadIdx.x) * Vec;
+  if (tok >= t || h0 >= hidden) return;
+
+  __shared__ int smem_pos[8];
+  __shared__ int smem_le[8];
+  __shared__ float smem_w[8];
+  const int base = tok * 8;
+  if (threadIdx.x < 8) {
+    smem_pos[threadIdx.x] = routed_positions[base + threadIdx.x];
+    smem_le[threadIdx.x] = routed_local_experts[base + threadIdx.x];
+    smem_w[threadIdx.x] = routed_weights[base + threadIdx.x];
+  }
+  __syncthreads();
+
+  float acc[Vec];
+#pragma unroll
+  for (int v = 0; v < Vec; ++v) acc[v] = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    int pos = smem_pos[i];
+    if (pos < 0) continue;
+    int le = smem_le[i];
+    int scratch_row = padded_offsets[le] + (pos - expert_offsets[le]);
+    const float* src = d_f32 + static_cast<int64_t>(scratch_row) * hidden + h0;
+#pragma unroll
+    for (int v = 0; v < Vec; ++v) {
+      int h = h0 + v;
+      if (h < hidden) acc[v] += smem_w[i] * src[v];
+    }
+  }
+  uint16_t* dst = out_bf16 + static_cast<int64_t>(tok) * hidden + h0;
+#pragma unroll
+  for (int v = 0; v < Vec; ++v) {
+    int h = h0 + v;
+    if (h < hidden) {
+      union {
+        __nv_bfloat16 bf16;
+        uint16_t u;
+      } packed;
+      packed.bf16 = __float2bfloat16_rn(acc[v]);
+      dst[v] = packed.u;
+    }
+  }
+}
+
 __global__ void bf16_matrix_to_float_kernel(const uint16_t* __restrict__ in, int64_t n,
                                            float* __restrict__ out) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1107,6 +1451,18 @@ __global__ void f16_matrix_to_float_kernel(const uint16_t* __restrict__ in, int6
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= n) return;
   out[idx] = f16_to_float_device(in[idx]);
+}
+
+__global__ void f16_rows_scaled_to_float_kernel(const uint16_t* __restrict__ in,
+                                                const float* __restrict__ row_scale, int cols,
+                                                int n_rows, int padded_rows,
+                                                float* __restrict__ out) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = static_cast<int64_t>(padded_rows) * cols;
+  if (idx >= total) return;
+  int row = static_cast<int>(idx / cols);
+  float v = (row < n_rows) ? f16_to_float_device(in[idx]) * row_scale[row] : 0.0f;
+  out[idx] = v;
 }
 
 __global__ void float_to_f16_kernel(const float* __restrict__ in, int64_t n,
@@ -1156,6 +1512,96 @@ __global__ void float_rows_scaled_to_f16_kernel(const float* __restrict__ in, in
   }
 }
 
+__global__ void swiglu_round_g1_rows_scaled_to_f16_kernel(const float* __restrict__ g1,
+                                                          int intermediate, int n_rows,
+                                                          int padded_rows,
+                                                          uint16_t* __restrict__ out,
+                                                          float* __restrict__ row_scale) {
+  int row = blockIdx.x;
+  if (row >= padded_rows) return;
+  __shared__ float smem[256];
+  float max_abs = 0.0f;
+  if (row < n_rows) {
+    const float* g1_row = g1 + static_cast<int64_t>(row) * (2 * intermediate);
+    for (int col = threadIdx.x; col < intermediate; col += blockDim.x) {
+      float x1 = __half2float(__float2half(g1_row[col]));
+      float x2 = __half2float(__float2half(g1_row[col + intermediate]));
+      float y = x1 * siluf_device(x2);
+      max_abs = fmaxf(max_abs, fabsf(y));
+    }
+  }
+  smem[threadIdx.x] = max_abs;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  float scale = fmaxf(smem[0] / 60000.0f, 1.0f);
+  if (threadIdx.x == 0) row_scale[row] = scale;
+  for (int col = threadIdx.x; col < intermediate; col += blockDim.x) {
+    float v = 0.0f;
+    if (row < n_rows) {
+      const float* g1_row = g1 + static_cast<int64_t>(row) * (2 * intermediate);
+      float x1 = __half2float(__float2half(g1_row[col]));
+      float x2 = __half2float(__float2half(g1_row[col + intermediate]));
+      v = (x1 * siluf_device(x2)) / scale;
+    }
+    union {
+      __half h;
+      uint16_t u;
+    } packed;
+    packed.h = __float2half(v);
+    out[static_cast<int64_t>(row) * intermediate + col] = packed.u;
+  }
+}
+
+__global__ void swiglu_g1_f16_rows_scaled_to_f16_kernel(const uint16_t* __restrict__ g1,
+                                                        int intermediate, int n_rows,
+                                                        int padded_rows,
+                                                        uint16_t* __restrict__ out,
+                                                        float* __restrict__ row_scale) {
+  int row = blockIdx.x;
+  if (row >= padded_rows) return;
+  __shared__ float smem[256];
+  float max_abs = 0.0f;
+  if (row < n_rows) {
+    const uint16_t* g1_row = g1 + static_cast<int64_t>(row) * (2 * intermediate);
+    for (int col = threadIdx.x; col < intermediate; col += blockDim.x) {
+      float x1 = f16_to_float_device(g1_row[col]);
+      float x2 = f16_to_float_device(g1_row[col + intermediate]);
+      float y = x1 * siluf_device(x2);
+      max_abs = fmaxf(max_abs, fabsf(y));
+    }
+  }
+  smem[threadIdx.x] = max_abs;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  float scale = fmaxf(smem[0] / 60000.0f, 1.0f);
+  if (threadIdx.x == 0) row_scale[row] = scale;
+  for (int col = threadIdx.x; col < intermediate; col += blockDim.x) {
+    float v = 0.0f;
+    if (row < n_rows) {
+      const uint16_t* g1_row = g1 + static_cast<int64_t>(row) * (2 * intermediate);
+      float x1 = f16_to_float_device(g1_row[col]);
+      float x2 = f16_to_float_device(g1_row[col + intermediate]);
+      v = (x1 * siluf_device(x2)) / scale;
+    }
+    union {
+      __half h;
+      uint16_t u;
+    } packed;
+    packed.h = __float2half(v);
+    out[static_cast<int64_t>(row) * intermediate + col] = packed.u;
+  }
+}
+
 __global__ void float_to_bf16_kernel(const float* __restrict__ in, int64_t n,
                                      uint16_t* __restrict__ out) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1178,114 +1624,6 @@ __global__ void compare_abs_diff_kernel(const float* __restrict__ a, const float
 
 }  // namespace
 
-float fp8_e4m3fn_to_float(uint8_t x) {
-  int sign = (x & 0x80) ? -1 : 1;
-  int exp = (x >> 3) & 0x0f;
-  int mant = x & 0x07;
-
-  if (exp == 0) {
-    if (mant == 0) {
-      return sign == 1 ? 0.0f : -0.0f;
-    }
-    float frac = static_cast<float>(mant) / 8.0f;
-    return sign * std::ldexp(frac, -6);
-  }
-
-  float frac = 1.0f + static_cast<float>(mant) / 8.0f;
-  return sign * std::ldexp(frac, exp - 7);
-}
-
-HostMxfpGemmModule::HostMxfpGemmModule(int hidden, int intermediate, int block)
-    : hidden_(hidden),
-      intermediate_(intermediate),
-      block_(block),
-      gemm1_out_(2 * intermediate),
-      hidden_blocks_(hidden / block),
-      intermediate_blocks_(intermediate / block),
-      gemm1_out_blocks_(gemm1_out_ / block),
-      w13_fp8_(gemm1_weight_elems()),
-      w13_scale_(gemm1_scale_elems()),
-      w2_fp8_(gemm2_weight_elems()),
-      w2_scale_(gemm2_scale_elems()) {}
-
-size_t HostMxfpGemmModule::gemm1_weight_elems() const {
-  return static_cast<size_t>(gemm1_out_) * static_cast<size_t>(hidden_);
-}
-
-size_t HostMxfpGemmModule::gemm1_scale_elems() const {
-  return static_cast<size_t>(gemm1_out_blocks_) * static_cast<size_t>(hidden_blocks_);
-}
-
-size_t HostMxfpGemmModule::gemm2_weight_elems() const {
-  return static_cast<size_t>(hidden_) * static_cast<size_t>(intermediate_);
-}
-
-size_t HostMxfpGemmModule::gemm2_scale_elems() const {
-  return static_cast<size_t>(hidden_blocks_) * static_cast<size_t>(intermediate_blocks_);
-}
-
-void HostMxfpGemmModule::load_expert_from_device(int local_expert_idx, const uint8_t* gemm1_weights_dev,
-                                                  const float* gemm1_scales_dev,
-                                                  const uint8_t* gemm2_weights_dev,
-                                                  const float* gemm2_scales_dev,
-                                                  cudaStream_t stream) {
-  size_t w13_elems = gemm1_weight_elems();
-  size_t w13s_elems = gemm1_scale_elems();
-  size_t w2_elems = gemm2_weight_elems();
-  size_t w2s_elems = gemm2_scale_elems();
-
-  size_t w13_off = static_cast<size_t>(local_expert_idx) * w13_elems;
-  size_t w13s_off = static_cast<size_t>(local_expert_idx) * w13s_elems;
-  size_t w2_off = static_cast<size_t>(local_expert_idx) * w2_elems;
-  size_t w2s_off = static_cast<size_t>(local_expert_idx) * w2s_elems;
-
-  cudaMemcpyAsync(w13_fp8_.data(), gemm1_weights_dev + w13_off, w13_elems, cudaMemcpyDeviceToHost, stream);
-  cudaMemcpyAsync(w13_scale_.data(), gemm1_scales_dev + w13s_off, w13s_elems * sizeof(float),
-                  cudaMemcpyDeviceToHost, stream);
-  cudaMemcpyAsync(w2_fp8_.data(), gemm2_weights_dev + w2_off, w2_elems, cudaMemcpyDeviceToHost, stream);
-  cudaMemcpyAsync(w2_scale_.data(), gemm2_scales_dev + w2s_off, w2s_elems * sizeof(float),
-                  cudaMemcpyDeviceToHost, stream);
-  cudaStreamSynchronize(stream);
-}
-
-void HostMxfpGemmModule::gemm1_matvec(const float* a_row, float* g1_out) const {
-  for (int j = 0; j < gemm1_out_; ++j) {
-    int jb = j / block_;
-    float acc = 0.0f;
-    const uint8_t* w13_row = w13_fp8_.data() + static_cast<size_t>(j) * hidden_;
-    for (int h = 0; h < hidden_; ++h) {
-      int hb = h / block_;
-      float s = w13_scale_[static_cast<size_t>(jb) * hidden_blocks_ + static_cast<size_t>(hb)];
-      float wv = fp8_e4m3fn_to_float(w13_row[h]) * s;
-      acc += a_row[h] * wv;
-    }
-    g1_out[j] = acc;
-  }
-}
-
-void HostMxfpGemmModule::swiglu(const float* g1, int intermediate, float* c_out) {
-  for (int i = 0; i < intermediate; ++i) {
-    float x1 = g1[i];
-    float x2 = g1[i + intermediate];
-    c_out[i] = x1 * siluf_host(x2);
-  }
-}
-
-void HostMxfpGemmModule::gemm2_matvec_accumulate(const float* c, float weight, float* out_row) const {
-  for (int h = 0; h < hidden_; ++h) {
-    int hb = h / block_;
-    float acc = 0.0f;
-    const uint8_t* w2_row = w2_fp8_.data() + static_cast<size_t>(h) * intermediate_;
-    for (int i = 0; i < intermediate_; ++i) {
-      int ib = i / block_;
-      float s = w2_scale_[static_cast<size_t>(hb) * intermediate_blocks_ + static_cast<size_t>(ib)];
-      float wv = fp8_e4m3fn_to_float(w2_row[i]) * s;
-      acc += c[i] * wv;
-    }
-    out_row[h] += weight * acc;
-  }
-}
-
 DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int block)
     : hidden_(hidden),
       intermediate_(intermediate),
@@ -1298,6 +1636,7 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
       emulate_fp8_unit_(false),
       emulate_fp16_operands_(false),
       emulate_acc_half_(false),
+      tc_fp16_middle_(false),
       g1_dev_(nullptr),
       c_dev_(nullptr),
       tc_max_rows_(0),
@@ -1307,21 +1646,22 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
       tc_a_scale_dev_(nullptr),
       tc_b_scale_dev_(nullptr),
       tc_g1_f32_dev_(nullptr),
-      tc_g1_f16_dev_(nullptr),
       tc_c_fp8_dev_(nullptr),
       tc_c_scale_dev_(nullptr),
-      tc_c_bf16_dev_(nullptr),
-      tc_b_bf16_dev_(nullptr),
       tc_d_f32_dev_(nullptr),
       tc_m_indptr_dev_(nullptr),
       tc_int_workspace_dev_(nullptr),
-      tc_float_workspace_dev_(nullptr) {
+      tc_float_workspace_dev_(nullptr),
+      tc_group_int_workspace_dev_(nullptr),
+      tc_group_float_workspace_dev_(nullptr) {
   const char* env = std::getenv("FIB_EMULATE_FP8_UNIT");
   emulate_fp8_unit_ = (env != nullptr && env[0] == '1');
   const char* env_fp16_op = std::getenv("FIB_EMULATE_FP16_OPERANDS");
   emulate_fp16_operands_ = (env_fp16_op != nullptr && env_fp16_op[0] == '1');
   const char* env_acc = std::getenv("FIB_EMULATE_FP8_ACC_HALF");
   emulate_acc_half_ = (env_acc != nullptr && env_acc[0] == '1');
+  const char* env_fp16_middle = std::getenv("FIB_MOE_TC_FP16_MIDDLE");
+  tc_fp16_middle_ = (env_fp16_middle != nullptr && env_fp16_middle[0] == '1');
   if (emulate_fp8_unit_) {
     std::fprintf(stderr,
                  "[mxfp] FIB_EMULATE_FP8_UNIT=1 (TC-like emulation: FP8-like operands, FP32 accumulate)\n");
@@ -1331,6 +1671,10 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
   }
   if (emulate_fp16_operands_) {
     std::fprintf(stderr, "[mxfp] FIB_EMULATE_FP16_OPERANDS=1 (fp16*fp16 multiply emulation enabled)\n");
+  }
+  if (tc_fp16_middle_) {
+    std::fprintf(stderr,
+                 "[mxfp] FIB_MOE_TC_FP16_MIDDLE=1 (experimental fp16 middle path enabled)\n");
   }
   const char* env_tc = std::getenv("FIB_MOE_TC");
   if (env_tc != nullptr) {
@@ -1347,8 +1691,8 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
                  FIB_HAS_DIRECT_CUTLASS_SM100 ? "direct CUTLASS available"
                                               : "direct CUTLASS unavailable");
   }
-  if (emulate_fp8_unit_ || emulate_fp16_operands_ || emulate_acc_half_ || env_tc != nullptr ||
-      env_no_tc != nullptr || FIB_HAS_DIRECT_CUTLASS_SM100) {
+  if (emulate_fp8_unit_ || emulate_fp16_operands_ || emulate_acc_half_ || tc_fp16_middle_ ||
+      env_tc != nullptr || env_no_tc != nullptr || FIB_HAS_DIRECT_CUTLASS_SM100) {
     std::fflush(stderr);
   }
 }
@@ -1361,15 +1705,14 @@ DeviceMxfpGemmModule::~DeviceMxfpGemmModule() {
   if (tc_a_scale_dev_ != nullptr) cudaFree(tc_a_scale_dev_);
   if (tc_b_scale_dev_ != nullptr) cudaFree(tc_b_scale_dev_);
   if (tc_g1_f32_dev_ != nullptr) cudaFree(tc_g1_f32_dev_);
-  if (tc_g1_f16_dev_ != nullptr) cudaFree(tc_g1_f16_dev_);
   if (tc_c_fp8_dev_ != nullptr) cudaFree(tc_c_fp8_dev_);
   if (tc_c_scale_dev_ != nullptr) cudaFree(tc_c_scale_dev_);
-  if (tc_c_bf16_dev_ != nullptr) cudaFree(tc_c_bf16_dev_);
-  if (tc_b_bf16_dev_ != nullptr) cudaFree(tc_b_bf16_dev_);
   if (tc_d_f32_dev_ != nullptr) cudaFree(tc_d_f32_dev_);
   if (tc_m_indptr_dev_ != nullptr) cudaFree(tc_m_indptr_dev_);
   if (tc_int_workspace_dev_ != nullptr) cudaFree(tc_int_workspace_dev_);
   if (tc_float_workspace_dev_ != nullptr) cudaFree(tc_float_workspace_dev_);
+  if (tc_group_int_workspace_dev_ != nullptr) cudaFree(tc_group_int_workspace_dev_);
+  if (tc_group_float_workspace_dev_ != nullptr) cudaFree(tc_group_float_workspace_dev_);
 }
 
 void DeviceMxfpGemmModule::EnsureWorkspace(int64_t t, cudaStream_t stream) {
@@ -1406,15 +1749,14 @@ void DeviceMxfpGemmModule::EnsureTcWorkspace(int rows) {
   if (tc_a_scale_dev_ != nullptr) cudaFree(tc_a_scale_dev_);
   if (tc_b_scale_dev_ != nullptr) cudaFree(tc_b_scale_dev_);
   if (tc_g1_f32_dev_ != nullptr) cudaFree(tc_g1_f32_dev_);
-  if (tc_g1_f16_dev_ != nullptr) cudaFree(tc_g1_f16_dev_);
   if (tc_c_fp8_dev_ != nullptr) cudaFree(tc_c_fp8_dev_);
   if (tc_c_scale_dev_ != nullptr) cudaFree(tc_c_scale_dev_);
-  if (tc_c_bf16_dev_ != nullptr) cudaFree(tc_c_bf16_dev_);
-  if (tc_b_bf16_dev_ != nullptr) cudaFree(tc_b_bf16_dev_);
   if (tc_d_f32_dev_ != nullptr) cudaFree(tc_d_f32_dev_);
   if (tc_m_indptr_dev_ != nullptr) cudaFree(tc_m_indptr_dev_);
   if (tc_int_workspace_dev_ != nullptr) cudaFree(tc_int_workspace_dev_);
   if (tc_float_workspace_dev_ != nullptr) cudaFree(tc_float_workspace_dev_);
+  if (tc_group_int_workspace_dev_ != nullptr) cudaFree(tc_group_int_workspace_dev_);
+  if (tc_group_float_workspace_dev_ != nullptr) cudaFree(tc_group_float_workspace_dev_);
 
   tc_max_rows_ = padded_rows;
   constexpr size_t kCutlassWorkspaceBytes = 32ull * 1024ull * 1024ull;
@@ -1432,24 +1774,22 @@ void DeviceMxfpGemmModule::EnsureTcWorkspace(int rows) {
   if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_b_scale_dev_");
   e = cudaMalloc(&tc_g1_f32_dev_, static_cast<size_t>(padded_rows) * gemm1_out_ * sizeof(float));
   if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_g1_f32_dev_");
-  e = cudaMalloc(&tc_g1_f16_dev_, static_cast<size_t>(padded_rows) * gemm1_out_ * sizeof(uint16_t));
-  if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_g1_f16_dev_");
   e = cudaMalloc(&tc_c_fp8_dev_, static_cast<size_t>(padded_rows) * intermediate_ * sizeof(uint8_t));
   if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_c_fp8_dev_");
   e = cudaMalloc(&tc_c_scale_dev_, static_cast<size_t>(padded_rows) * intermediate_blocks_ * sizeof(float));
   if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_c_scale_dev_");
-  e = cudaMalloc(&tc_c_bf16_dev_, static_cast<size_t>(padded_rows) * intermediate_ * sizeof(uint16_t));
-  if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_c_bf16_dev_");
-  e = cudaMalloc(&tc_b_bf16_dev_, static_cast<size_t>(hidden_) * intermediate_ * sizeof(uint16_t));
-  if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_b_bf16_dev_");
   e = cudaMalloc(&tc_d_f32_dev_, static_cast<size_t>(padded_rows) * hidden_ * sizeof(float));
   if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_d_f32_dev_");
-  e = cudaMalloc(&tc_m_indptr_dev_, 2 * sizeof(int));
+  e = cudaMalloc(&tc_m_indptr_dev_, 33 * sizeof(int));
   if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_m_indptr_dev_");
   e = cudaMalloc(&tc_int_workspace_dev_, kCutlassWorkspaceBytes);
   if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_int_workspace_dev_");
   e = cudaMalloc(&tc_float_workspace_dev_, kCutlassWorkspaceBytes);
   if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_float_workspace_dev_");
+  e = cudaMalloc(&tc_group_int_workspace_dev_, kCutlassWorkspaceBytes);
+  if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_group_int_workspace_dev_");
+  e = cudaMalloc(&tc_group_float_workspace_dev_, kCutlassWorkspaceBytes);
+  if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_group_float_workspace_dev_");
 }
 
 void DeviceMxfpGemmModule::RunExpert(const float* a_dev, int64_t t, const float* local_weight_dev,
@@ -1526,6 +1866,864 @@ void DeviceMxfpGemmModule::RunExpertPermuted(const float* a_dev, int64_t /*t*/, 
       out_acc_dev);
 }
 
+void DeviceMxfpGemmModule::RunExpertGemm2TcFromG1(
+    int64_t t, int total_rows, int n_rows, int g1_row_offset, int scratch_row_offset,
+    const int* permuted_tok_e, const float* permuted_w_e, int local_expert_idx,
+    const uint8_t* gemm2_w_dev,
+    const float* gemm2_s_dev, float* out_acc_dev, cudaStream_t stream, bool scatter_to_acc) {
+  if (n_rows <= 0) return;
+#if FIB_HAS_DIRECT_CUTLASS_SM100
+  constexpr int kThreads = 256;
+  using FP8 = cutlass::float_e4m3_t;
+  int padded_rows = (n_rows + 3) & ~3;
+  const bool scale_major_k = true;
+  size_t w2_elems = static_cast<size_t>(hidden_) * static_cast<size_t>(intermediate_);
+  size_t w2s_elems = static_cast<size_t>(hidden_blocks_) * static_cast<size_t>(intermediate_blocks_);
+  const uint8_t* w2_e = gemm2_w_dev + static_cast<size_t>(local_expert_idx) * w2_elems;
+  const float* s2_e = gemm2_s_dev + static_cast<size_t>(local_expert_idx) * w2s_elems;
+
+  float* g1_ptr = tc_g1_f32_dev_ + static_cast<int64_t>(g1_row_offset) * gemm1_out_;
+  float* d_ptr = tc_d_f32_dev_ + static_cast<int64_t>(scratch_row_offset) * hidden_;
+  float* c_scale_ptr = tc_c_scale_dev_;
+  int swiglu_rows_per_cta = select_swiglu_rows_per_cta(total_rows, padded_rows);
+  dim3 qgrid((padded_rows + swiglu_rows_per_cta - 1) / swiglu_rows_per_cta,
+             intermediate_blocks_);
+  if (swiglu_rows_per_cta == 4) {
+    swiglu_quantize_float_to_fp8_rows_per_cta_kernel<4>
+        <<<qgrid, 128, 4 * 128 * sizeof(float), stream>>>(
+            g1_ptr, intermediate_, n_rows, padded_rows,
+            tc_c_fp8_dev_ + static_cast<int64_t>(scratch_row_offset) * intermediate_, c_scale_ptr,
+            scale_major_k);
+  } else if (swiglu_rows_per_cta == 2) {
+    swiglu_quantize_float_to_fp8_rows_per_cta_kernel<2>
+        <<<qgrid, 128, 2 * 128 * sizeof(float), stream>>>(
+            g1_ptr, intermediate_, n_rows, padded_rows,
+            tc_c_fp8_dev_ + static_cast<int64_t>(scratch_row_offset) * intermediate_, c_scale_ptr,
+            scale_major_k);
+  } else {
+    swiglu_quantize_float_to_fp8_kernel<<<qgrid, 128, 128 * sizeof(float), stream>>>(
+        g1_ptr, intermediate_, n_rows, padded_rows,
+        tc_c_fp8_dev_ + static_cast<int64_t>(scratch_row_offset) * intermediate_, c_scale_ptr,
+        scale_major_k);
+  }
+  float* w2_scale_tc = const_cast<float*>(s2_e);
+
+  TcGemmDispatch g2_dispatch = select_trtllm_like_gemm2_dispatch(total_rows, padded_rows);
+  int g2_tile_m = select_tile_m_from_env("FIB_MOE_G2_TILE_M", g2_dispatch.tile_m);
+  auto run_gemm2_1sm = [&]() {
+    if (g2_tile_m == 64) {
+      return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 64, 1, cutlass::float_e4m3_t,
+                                                         cutlass::float_e4m3_t, float>(
+          tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+          32ull * 1024ull * 1024ull,
+          reinterpret_cast<FP8*>(tc_c_fp8_dev_ + static_cast<int64_t>(scratch_row_offset) *
+                                                    intermediate_),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(w2_e)),
+          c_scale_ptr,
+          w2_scale_tc, d_ptr, padded_rows, hidden_, intermediate_, stream);
+    }
+    return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 128, 1, cutlass::float_e4m3_t,
+                                                       cutlass::float_e4m3_t, float>(
+        tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+        32ull * 1024ull * 1024ull,
+        reinterpret_cast<FP8*>(tc_c_fp8_dev_ + static_cast<int64_t>(scratch_row_offset) *
+                                                  intermediate_),
+        const_cast<FP8*>(reinterpret_cast<const FP8*>(w2_e)),
+        c_scale_ptr,
+        w2_scale_tc, d_ptr, padded_rows, hidden_, intermediate_, stream);
+  };
+  auto run_gemm2_2sm = [&]() {
+    return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 256, 2, cutlass::float_e4m3_t,
+                                                       cutlass::float_e4m3_t, float>(
+        tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+        32ull * 1024ull * 1024ull,
+        reinterpret_cast<FP8*>(tc_c_fp8_dev_ + static_cast<int64_t>(scratch_row_offset) *
+                                                  intermediate_),
+        const_cast<FP8*>(reinterpret_cast<const FP8*>(w2_e)),
+        c_scale_ptr,
+        w2_scale_tc, d_ptr, padded_rows, hidden_, intermediate_, stream);
+  };
+  const char* env_g2_2sm_min_rows = std::getenv("FIB_MOE_G2_2SM_MIN_ROWS");
+  int g2_mma_sm = select_mma_sm_from_env("FIB_MOE_G2_MMA_SM", g2_dispatch.mma_sms);
+  if (std::getenv("FIB_MOE_G2_MMA_SM") == nullptr && env_g2_2sm_min_rows != nullptr) {
+    g2_mma_sm = (padded_rows >= std::atoi(env_g2_2sm_min_rows)) ? 2 : 1;
+  }
+  cudaError_t st2 = (g2_mma_sm == 2) ? run_gemm2_2sm() : run_gemm2_1sm();
+  if (st2 != cudaSuccess) return;
+  if (!scatter_to_acc) return;
+
+  int64_t scatter_elems = static_cast<int64_t>(n_rows) * hidden_;
+  scatter_float_weighted_kernel<<<static_cast<int>((scatter_elems + kThreads - 1) / kThreads),
+                                  kThreads, 0, stream>>>(
+      d_ptr, hidden_, n_rows, permuted_tok_e, permuted_w_e, out_acc_dev);
+#else
+  (void)t;
+  (void)total_rows;
+  (void)n_rows;
+  (void)g1_row_offset;
+  (void)scratch_row_offset;
+  (void)permuted_tok_e;
+  (void)permuted_w_e;
+  (void)local_expert_idx;
+  (void)gemm2_w_dev;
+  (void)gemm2_s_dev;
+  (void)out_acc_dev;
+  (void)stream;
+  (void)scatter_to_acc;
+#endif
+}
+
+void DeviceMxfpGemmModule::RunExpertPermutedTcToScratch(
+    const uint8_t* hidden_fp8_dev, const float* hidden_scale_dev, int64_t t, int total_rows,
+    int row_offset, int n_rows, const int* permuted_tok_e, int local_expert_idx,
+    const uint8_t* gemm1_w_dev, const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
+    const float* gemm2_s_dev, cudaStream_t stream, bool run_gemm2) {
+  if (n_rows <= 0) return;
+#if FIB_HAS_DIRECT_CUTLASS_SM100
+  const bool nvtx = mxfp_nvtx_enabled();
+  ScopedMxfpNvtxRange nvtx_total(nvtx, "mxfp_expert_tc_to_scratch");
+  EnsureTcWorkspace(total_rows);
+  constexpr int kThreads = 256;
+  using FP8 = cutlass::float_e4m3_t;
+  int padded_rows = (n_rows + 3) & ~3;
+  const int c_row_blocks = (padded_rows + 127) / 128;
+
+  uint8_t* a_ptr = tc_a_fp8_dev_ + static_cast<int64_t>(row_offset) * hidden_;
+  float* a_scale_ptr = tc_a_scale_dev_ + static_cast<int64_t>(row_offset) * hidden_blocks_;
+  float* g1_ptr = tc_g1_f32_dev_ + static_cast<int64_t>(row_offset) * gemm1_out_;
+  float* d_ptr = tc_d_f32_dev_ + static_cast<int64_t>(row_offset) * hidden_;
+  float* c_scale_ptr =
+      tc_c_scale_dev_ + static_cast<int64_t>(run_gemm2 ? 0 : row_offset) * intermediate_blocks_;
+
+  size_t w13_elems = static_cast<size_t>(gemm1_out_) * static_cast<size_t>(hidden_);
+  size_t w13s_elems = static_cast<size_t>(gemm1_out_blocks_) * static_cast<size_t>(hidden_blocks_);
+  size_t w2_elems = static_cast<size_t>(hidden_) * static_cast<size_t>(intermediate_);
+  size_t w2s_elems = static_cast<size_t>(hidden_blocks_) * static_cast<size_t>(intermediate_blocks_);
+  const uint8_t* w13_e = gemm1_w_dev + static_cast<size_t>(local_expert_idx) * w13_elems;
+  const float* s13_e = gemm1_s_dev + static_cast<size_t>(local_expert_idx) * w13s_elems;
+  const uint8_t* w2_e = gemm2_w_dev + static_cast<size_t>(local_expert_idx) * w2_elems;
+  const float* s2_e = gemm2_s_dev + static_cast<size_t>(local_expert_idx) * w2s_elems;
+
+  int64_t a_elems = static_cast<int64_t>(padded_rows) * hidden_;
+  int64_t a_scale_elems = static_cast<int64_t>(padded_rows) * hidden_blocks_;
+  {
+    ScopedMxfpNvtxRange range(nvtx, "mxfp_gather_hidden_fp8_scale");
+    gather_hidden_fp8_and_scale_rows_mn_major_kernel<<<
+        static_cast<int>((std::max(a_elems, a_scale_elems) + kThreads - 1) / kThreads), kThreads, 0,
+        stream>>>(hidden_fp8_dev, hidden_scale_dev, permuted_tok_e, t, n_rows, padded_rows, hidden_,
+                  hidden_blocks_, a_ptr, a_scale_ptr);
+  }
+
+  float* w13_scale_tc = const_cast<float*>(s13_e);
+
+  TcGemmDispatch g1_dispatch = select_trtllm_like_gemm1_dispatch(total_rows, padded_rows);
+  int g1_tile_m = select_tile_m_from_env("FIB_MOE_G1_TILE_M", g1_dispatch.tile_m);
+  auto run_gemm1_1sm = [&]() {
+    if (g1_tile_m == 64) {
+      return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 64, 1,
+                                                         cutlass::float_e4m3_t,
+                                                         cutlass::float_e4m3_t, float>(
+          tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(a_ptr),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(w13_e)), a_scale_ptr, w13_scale_tc,
+          g1_ptr, padded_rows, gemm1_out_, hidden_, stream);
+    }
+    return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 128, 1,
+                                                       cutlass::float_e4m3_t,
+                                                       cutlass::float_e4m3_t, float>(
+        tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+        32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(a_ptr),
+        const_cast<FP8*>(reinterpret_cast<const FP8*>(w13_e)), a_scale_ptr, w13_scale_tc,
+        g1_ptr, padded_rows, gemm1_out_, hidden_, stream);
+  };
+  auto run_gemm1_2sm = [&]() {
+    return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 256, 2,
+                                                       cutlass::float_e4m3_t,
+                                                       cutlass::float_e4m3_t, float>(
+        tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+        32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(a_ptr),
+        const_cast<FP8*>(reinterpret_cast<const FP8*>(w13_e)), a_scale_ptr, w13_scale_tc,
+        g1_ptr, padded_rows, gemm1_out_, hidden_, stream);
+  };
+  int g1_mma_sm = select_mma_sm_from_env("FIB_MOE_G1_MMA_SM", g1_dispatch.mma_sms);
+  cudaError_t st1 = cudaSuccess;
+  {
+    ScopedMxfpNvtxRange range(nvtx, "mxfp_cutlass_gemm1");
+    st1 = (g1_mma_sm == 2) ? run_gemm1_2sm() : run_gemm1_1sm();
+  }
+  if (st1 != cudaSuccess) return;
+
+  {
+    ScopedMxfpNvtxRange range(nvtx, "mxfp_swiglu_quant");
+    if (tc_fp16_middle_) {
+      dim3 qgrid(padded_rows, intermediate_blocks_);
+      uint16_t* g1_f16_ptr = reinterpret_cast<uint16_t*>(tc_float_workspace_dev_);
+      float_to_f16_kernel<<<
+          static_cast<int>(((static_cast<int64_t>(padded_rows) * gemm1_out_) + kThreads - 1) /
+                           kThreads),
+          kThreads, 0, stream>>>(g1_ptr, static_cast<int64_t>(padded_rows) * gemm1_out_,
+                                 g1_f16_ptr);
+      swiglu_quantize_f16_to_fp8_kernel<<<qgrid, 128, 128 * sizeof(float), stream>>>(
+          g1_f16_ptr, intermediate_, n_rows, padded_rows,
+          tc_c_fp8_dev_ + static_cast<int64_t>(row_offset) * intermediate_, c_scale_ptr, true);
+    } else {
+      int swiglu_rows_per_cta = select_swiglu_rows_per_cta(n_rows, padded_rows);
+      dim3 qgrid((padded_rows + swiglu_rows_per_cta - 1) / swiglu_rows_per_cta,
+                 intermediate_blocks_);
+      if (swiglu_rows_per_cta == 4) {
+        swiglu_quantize_float_to_fp8_rows_per_cta_kernel<4>
+            <<<qgrid, 128, 4 * 128 * sizeof(float), stream>>>(
+                g1_ptr, intermediate_, n_rows, padded_rows,
+                tc_c_fp8_dev_ + static_cast<int64_t>(row_offset) * intermediate_, c_scale_ptr, true);
+      } else if (swiglu_rows_per_cta == 2) {
+        swiglu_quantize_float_to_fp8_rows_per_cta_kernel<2>
+            <<<qgrid, 128, 2 * 128 * sizeof(float), stream>>>(
+                g1_ptr, intermediate_, n_rows, padded_rows,
+                tc_c_fp8_dev_ + static_cast<int64_t>(row_offset) * intermediate_, c_scale_ptr, true);
+      } else {
+        swiglu_quantize_float_to_fp8_kernel<<<qgrid, 128, 128 * sizeof(float), stream>>>(
+            g1_ptr, intermediate_, n_rows, padded_rows,
+            tc_c_fp8_dev_ + static_cast<int64_t>(row_offset) * intermediate_, c_scale_ptr, true);
+      }
+    }
+  }
+  if (!run_gemm2) return;
+  float* w2_scale_tc = const_cast<float*>(s2_e);
+
+  TcGemmDispatch g2_dispatch = select_trtllm_like_gemm2_dispatch(total_rows, padded_rows);
+  int g2_tile_m = select_tile_m_from_env("FIB_MOE_G2_TILE_M", g2_dispatch.tile_m);
+  auto run_gemm2_1sm = [&]() {
+    if (g2_tile_m == 64) {
+      return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 64, 1,
+                                                         cutlass::float_e4m3_t,
+                                                         cutlass::float_e4m3_t, float>(
+          tc_int_workspace_dev_, 32ull * 1024ull * 1024ull,
+          tc_float_workspace_dev_, 32ull * 1024ull * 1024ull,
+          reinterpret_cast<FP8*>(tc_c_fp8_dev_ + static_cast<int64_t>(row_offset) * intermediate_),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(w2_e)),
+          c_scale_ptr,
+          w2_scale_tc,
+          d_ptr, padded_rows, hidden_, intermediate_, stream);
+    }
+    return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 128, 1,
+                                                       cutlass::float_e4m3_t,
+                                                       cutlass::float_e4m3_t, float>(
+        tc_int_workspace_dev_, 32ull * 1024ull * 1024ull,
+        tc_float_workspace_dev_, 32ull * 1024ull * 1024ull,
+        reinterpret_cast<FP8*>(tc_c_fp8_dev_ + static_cast<int64_t>(row_offset) * intermediate_),
+        const_cast<FP8*>(reinterpret_cast<const FP8*>(w2_e)),
+        c_scale_ptr,
+        w2_scale_tc,
+        d_ptr, padded_rows, hidden_, intermediate_, stream);
+  };
+  auto run_gemm2_2sm = [&]() {
+    return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 256, 2,
+                                                       cutlass::float_e4m3_t,
+                                                       cutlass::float_e4m3_t, float>(
+        tc_int_workspace_dev_, 32ull * 1024ull * 1024ull,
+        tc_float_workspace_dev_, 32ull * 1024ull * 1024ull,
+        reinterpret_cast<FP8*>(tc_c_fp8_dev_ + static_cast<int64_t>(row_offset) * intermediate_),
+        const_cast<FP8*>(reinterpret_cast<const FP8*>(w2_e)),
+        c_scale_ptr,
+        w2_scale_tc,
+        d_ptr, padded_rows, hidden_, intermediate_, stream);
+  };
+  const char* env_g2_2sm_min_rows = std::getenv("FIB_MOE_G2_2SM_MIN_ROWS");
+  int g2_mma_sm = select_mma_sm_from_env("FIB_MOE_G2_MMA_SM", g2_dispatch.mma_sms);
+  if (std::getenv("FIB_MOE_G2_MMA_SM") == nullptr && env_g2_2sm_min_rows != nullptr) {
+    g2_mma_sm = (padded_rows >= std::atoi(env_g2_2sm_min_rows)) ? 2 : 1;
+  }
+  {
+    ScopedMxfpNvtxRange range(nvtx, "mxfp_cutlass_gemm2");
+    (void)((g2_mma_sm == 2) ? run_gemm2_2sm() : run_gemm2_1sm());
+  }
+#else
+  (void)hidden_fp8_dev;
+  (void)hidden_scale_dev;
+  (void)t;
+  (void)total_rows;
+  (void)row_offset;
+  (void)n_rows;
+  (void)permuted_tok_e;
+  (void)local_expert_idx;
+  (void)gemm1_w_dev;
+  (void)gemm1_s_dev;
+  (void)gemm2_w_dev;
+  (void)gemm2_s_dev;
+  (void)stream;
+  (void)run_gemm2;
+#endif
+}
+
+void DeviceMxfpGemmModule::ScatterTcScratch(int total_rows, const int* expert_offsets_dev,
+                                            const int* permuted_tok_dev,
+                                            const int* permuted_expert_dev,
+                                            const float* permuted_w_dev, float* out_acc_dev,
+                                            cudaStream_t stream) {
+  if (total_rows <= 0) return;
+  (void)expert_offsets_dev;
+  constexpr int kThreads = 256;
+  dim3 grid(total_rows, (hidden_ + kThreads - 1) / kThreads);
+  scatter_all_float_weighted_by_expert_row_kernel<<<grid, kThreads, 0, stream>>>(
+      tc_d_f32_dev_, hidden_, total_rows, permuted_tok_dev, permuted_expert_dev,
+      permuted_w_dev, out_acc_dev);
+}
+
+void DeviceMxfpGemmModule::WriteTcScratchToBf16Output(
+    int64_t t, const int* routed_positions_dev, const int* routed_local_experts_dev,
+    const float* routed_weights_dev, uint16_t* output_dev, cudaStream_t stream) {
+  if (t <= 0) return;
+  const bool nvtx = mxfp_nvtx_enabled();
+  ScopedMxfpNvtxRange range(nvtx, "mxfp_direct_output_gather");
+  int kThreads = env_int_or_default("FIB_MOE_DIRECT_OUTPUT_THREADS", 128);
+  if (kThreads != 128 && kThreads != 256 && kThreads != 512) kThreads = 128;
+  int vec = select_direct_output_vec(t);
+  dim3 grid(static_cast<unsigned int>(t), (hidden_ + kThreads * vec - 1) / (kThreads * vec));
+  if (vec == 8) {
+    gather_scratch_topk_to_bf16_vec_kernel<8><<<grid, kThreads, 0, stream>>>(
+        tc_d_f32_dev_, hidden_, t, routed_positions_dev, routed_local_experts_dev,
+        routed_weights_dev, output_dev);
+  } else if (vec == 4) {
+    gather_scratch_topk_to_bf16_vec_kernel<4><<<grid, kThreads, 0, stream>>>(
+        tc_d_f32_dev_, hidden_, t, routed_positions_dev, routed_local_experts_dev,
+        routed_weights_dev, output_dev);
+  } else if (vec == 2) {
+    gather_scratch_topk_to_bf16_vec_kernel<2><<<grid, kThreads, 0, stream>>>(
+        tc_d_f32_dev_, hidden_, t, routed_positions_dev, routed_local_experts_dev,
+        routed_weights_dev, output_dev);
+  } else {
+    dim3 scalar_grid(static_cast<unsigned int>(t), (hidden_ + kThreads - 1) / kThreads);
+    gather_scratch_topk_to_bf16_kernel<<<scalar_grid, kThreads, 0, stream>>>(
+        tc_d_f32_dev_, hidden_, t, routed_positions_dev, routed_local_experts_dev,
+        routed_weights_dev, output_dev);
+  }
+}
+
+void DeviceMxfpGemmModule::WriteTcPaddedScratchToBf16Output(
+    int64_t t, const int* expert_offsets_dev, const int* padded_offsets_dev,
+    const int* routed_positions_dev, const int* routed_local_experts_dev,
+    const float* routed_weights_dev, uint16_t* output_dev, cudaStream_t stream) {
+  if (t <= 0) return;
+  const bool nvtx = mxfp_nvtx_enabled();
+  ScopedMxfpNvtxRange range(nvtx, "mxfp_padded_direct_output_gather");
+  int kThreads = env_int_or_default("FIB_MOE_DIRECT_OUTPUT_THREADS", 128);
+  if (kThreads != 128 && kThreads != 256 && kThreads != 512) kThreads = 128;
+  int vec = select_direct_output_vec(t);
+  dim3 grid(static_cast<unsigned int>(t), (hidden_ + kThreads * vec - 1) / (kThreads * vec));
+  if (vec == 8) {
+    gather_padded_scratch_topk_to_bf16_vec_kernel<8><<<grid, kThreads, 0, stream>>>(
+        tc_d_f32_dev_, hidden_, t, expert_offsets_dev, padded_offsets_dev, routed_positions_dev,
+        routed_local_experts_dev, routed_weights_dev, output_dev);
+  } else if (vec == 4) {
+    gather_padded_scratch_topk_to_bf16_vec_kernel<4><<<grid, kThreads, 0, stream>>>(
+        tc_d_f32_dev_, hidden_, t, expert_offsets_dev, padded_offsets_dev, routed_positions_dev,
+        routed_local_experts_dev, routed_weights_dev, output_dev);
+  } else if (vec == 2) {
+    gather_padded_scratch_topk_to_bf16_vec_kernel<2><<<grid, kThreads, 0, stream>>>(
+        tc_d_f32_dev_, hidden_, t, expert_offsets_dev, padded_offsets_dev, routed_positions_dev,
+        routed_local_experts_dev, routed_weights_dev, output_dev);
+  } else {
+    dim3 scalar_grid(static_cast<unsigned int>(t), (hidden_ + kThreads - 1) / kThreads);
+    gather_padded_scratch_topk_to_bf16_kernel<<<scalar_grid, kThreads, 0, stream>>>(
+        tc_d_f32_dev_, hidden_, t, expert_offsets_dev, padded_offsets_dev, routed_positions_dev,
+        routed_local_experts_dev, routed_weights_dev, output_dev);
+  }
+}
+
+bool DeviceMxfpGemmModule::RunGroupedGemm1ThenExpertGemm2Tc(
+    const uint8_t* hidden_fp8_dev, const float* hidden_scale_dev, int64_t t, int total_rows,
+    const int* expert_offsets_dev, const int* expert_counts_host,
+    const int* expert_offsets_host, const int* permuted_tok_dev,
+    const float* permuted_w_dev, const uint8_t* gemm1_w_dev,
+    const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
+    const float* gemm2_s_dev, float* out_acc_dev, cudaStream_t stream, bool direct_output,
+    const int* routed_positions_dev, const int* routed_local_experts_dev,
+    const float* routed_weights_dev, uint16_t* output_dev) {
+  if (total_rows <= 0) return true;
+  const char* env_enable = std::getenv("FIB_MOE_TC_ENABLE_GROUPED_G1");
+  const char* env_disable = std::getenv("FIB_MOE_TC_DISABLE_GROUPED_G1");
+  if (env_disable != nullptr && env_disable[0] == '1') return false;
+  if (env_enable != nullptr && env_enable[0] != '1') return false;
+  if (!SupportsTcPath()) return false;
+  if (env_enable == nullptr) {
+    int auto_max_rows = std::max(
+        0, env_int_or_default("FIB_MOE_TC_GROUPED_G1_AUTO_MAX_ROWS", 32768));
+    if (auto_max_rows == 0 || total_rows > auto_max_rows) return false;
+  }
+  int grouped_g1_min_rows = std::max(0, env_int_or_default("FIB_MOE_TC_GROUPED_G1_MIN_ROWS", 0));
+  std::array<int, 32> active_expert_ids{};
+  std::array<int, 33> compact_offsets{};
+  int active_groups = 0;
+  for (int le = 0; le < 32; ++le) {
+    if (expert_counts_host[le] <= 0) continue;
+    if (expert_counts_host[le] < grouped_g1_min_rows) return false;
+    active_expert_ids[active_groups] = le;
+    compact_offsets[active_groups] = expert_offsets_host[le];
+    ++active_groups;
+  }
+  if (active_groups == 0) return true;
+  compact_offsets[active_groups] = total_rows;
+#if FIB_HAS_DIRECT_CUTLASS_SM100
+  EnsureTcWorkspace(total_rows + 4 * 32);
+  void* grouped_arg_workspace = tc_group_int_workspace_dev_;
+  void* grouped_gemm_workspace = tc_group_float_workspace_dev_;
+  constexpr int kThreads = 256;
+  int64_t a_elems = static_cast<int64_t>(total_rows) * hidden_;
+  int64_t a_scale_elems = static_cast<int64_t>(total_rows) * hidden_blocks_;
+  gather_hidden_fp8_and_scale_rows_mn_major_kernel<<<
+      static_cast<int>((std::max(a_elems, a_scale_elems) + kThreads - 1) / kThreads), kThreads, 0,
+      stream>>>(hidden_fp8_dev, hidden_scale_dev, permuted_tok_dev, t, total_rows, total_rows,
+                hidden_, hidden_blocks_, tc_a_fp8_dev_, tc_a_scale_dev_);
+
+  using FP8 = cutlass::float_e4m3_t;
+  int g1_mma_sm = 1;
+  int grouped_g1_mma_sm_override = env_int_or_default("FIB_MOE_TC_GROUPED_G1_MMA_SM", 0);
+  if (grouped_g1_mma_sm_override == 1 || grouped_g1_mma_sm_override == 2) {
+    g1_mma_sm = grouped_g1_mma_sm_override;
+  }
+  int grouped_g1_tile_m = select_tile_m_from_env(
+      "FIB_MOE_GROUPED_G1_TILE_M", g1_mma_sm == 2 ? 256 : 64);
+  const char* env_group_flashinfer = std::getenv("FIB_MOE_TC_GROUPED_G1_FLASHINFER");
+  const bool group_flashinfer =
+      (env_group_flashinfer != nullptr && env_group_flashinfer[0] == '1' && active_groups == 32);
+  const char* env_group_scale_mn = std::getenv("FIB_MOE_TC_GROUPED_G1_SCALE_MN");
+  const bool group_scale_mn = (env_group_scale_mn != nullptr && env_group_scale_mn[0] == '1');
+  cudaError_t st1 = cudaSuccess;
+#if FIB_HAS_FLASHINFER_GROUP_GEMM_FP8_SM100
+  if (group_flashinfer) {
+    if (group_scale_mn) {
+      st1 = (g1_mma_sm == 2)
+                ? launch_flashinfer_grouped_blockscaled_gemm1_sm100<false, 2, float>(
+                      grouped_arg_workspace, 32ull * 1024ull * 1024ull, grouped_gemm_workspace,
+                      32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
+                      const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm1_w_dev)), tc_a_scale_dev_,
+                      const_cast<float*>(gemm1_s_dev), tc_g1_f32_dev_,
+                      const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_, 32,
+                      stream)
+                : launch_flashinfer_grouped_blockscaled_gemm1_sm100<false, 1, float>(
+                      grouped_arg_workspace, 32ull * 1024ull * 1024ull, grouped_gemm_workspace,
+                      32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
+                      const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm1_w_dev)), tc_a_scale_dev_,
+                      const_cast<float*>(gemm1_s_dev), tc_g1_f32_dev_,
+                      const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_, 32,
+                      stream);
+    } else {
+      st1 = (g1_mma_sm == 2)
+                ? launch_flashinfer_grouped_blockscaled_gemm1_sm100<true, 2, float>(
+                      grouped_arg_workspace, 32ull * 1024ull * 1024ull, grouped_gemm_workspace,
+                      32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
+                      const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm1_w_dev)), tc_a_scale_dev_,
+                      const_cast<float*>(gemm1_s_dev), tc_g1_f32_dev_,
+                      const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_, 32,
+                      stream)
+                : launch_flashinfer_grouped_blockscaled_gemm1_sm100<true, 1, float>(
+                      grouped_arg_workspace, 32ull * 1024ull * 1024ull, grouped_gemm_workspace,
+                      32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
+                      const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm1_w_dev)), tc_a_scale_dev_,
+                      const_cast<float*>(gemm1_s_dev), tc_g1_f32_dev_,
+                      const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_, 32,
+                      stream);
+    }
+  } else
+#endif
+  if (group_scale_mn) {
+    if (g1_mma_sm == 2) {
+      st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<1, false, 256, 2,
+                                                              cutlass::float_e4m3_t,
+                                                              cutlass::float_e4m3_t, float>(
+          grouped_arg_workspace, 32ull * 1024ull * 1024ull, grouped_gemm_workspace,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm1_w_dev)), tc_a_scale_dev_,
+          const_cast<float*>(gemm1_s_dev), tc_g1_f32_dev_,
+          const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
+          active_groups, stream, compact_offsets.data(), active_expert_ids.data());
+    } else if (grouped_g1_tile_m == 64) {
+      st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<1, false, 64, 1,
+                                                              cutlass::float_e4m3_t,
+                                                              cutlass::float_e4m3_t, float>(
+          grouped_arg_workspace, 32ull * 1024ull * 1024ull, grouped_gemm_workspace,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm1_w_dev)), tc_a_scale_dev_,
+          const_cast<float*>(gemm1_s_dev), tc_g1_f32_dev_,
+          const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
+          active_groups, stream, compact_offsets.data(), active_expert_ids.data());
+    } else {
+      st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<1, false, 128, 1,
+                                                              cutlass::float_e4m3_t,
+                                                              cutlass::float_e4m3_t, float>(
+          grouped_arg_workspace, 32ull * 1024ull * 1024ull, grouped_gemm_workspace,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm1_w_dev)), tc_a_scale_dev_,
+          const_cast<float*>(gemm1_s_dev), tc_g1_f32_dev_,
+          const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
+          active_groups, stream, compact_offsets.data(), active_expert_ids.data());
+    }
+  } else {
+    if (g1_mma_sm == 2) {
+      st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<1, true, 256, 2,
+                                                              cutlass::float_e4m3_t,
+                                                              cutlass::float_e4m3_t, float>(
+          grouped_arg_workspace, 32ull * 1024ull * 1024ull, grouped_gemm_workspace,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm1_w_dev)), tc_a_scale_dev_,
+          const_cast<float*>(gemm1_s_dev), tc_g1_f32_dev_,
+          const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
+          active_groups, stream, compact_offsets.data(), active_expert_ids.data());
+    } else if (grouped_g1_tile_m == 64) {
+      st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<1, true, 64, 1,
+                                                              cutlass::float_e4m3_t,
+                                                              cutlass::float_e4m3_t, float>(
+          grouped_arg_workspace, 32ull * 1024ull * 1024ull, grouped_gemm_workspace,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm1_w_dev)), tc_a_scale_dev_,
+          const_cast<float*>(gemm1_s_dev), tc_g1_f32_dev_,
+          const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
+          active_groups, stream, compact_offsets.data(), active_expert_ids.data());
+    } else {
+      st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<1, true, 128, 1,
+                                                              cutlass::float_e4m3_t,
+                                                              cutlass::float_e4m3_t, float>(
+          grouped_arg_workspace, 32ull * 1024ull * 1024ull, grouped_gemm_workspace,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm1_w_dev)), tc_a_scale_dev_,
+          const_cast<float*>(gemm1_s_dev), tc_g1_f32_dev_,
+          const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
+          active_groups, stream, compact_offsets.data(), active_expert_ids.data());
+    }
+  }
+  if (st1 != cudaSuccess) return false;
+
+  const char* env_compare_grouped_g1 = std::getenv("FIB_MOE_TC_COMPARE_GROUPED_G1");
+  if (env_compare_grouped_g1 != nullptr && env_compare_grouped_g1[0] == '1') {
+    EnsureWorkspace(total_rows, stream);
+    for (int le = 0; le < 32; ++le) {
+      int n_rows = expert_counts_host[le];
+      if (n_rows <= 0) continue;
+      int start = expert_offsets_host[le];
+      size_t w13_elems = static_cast<size_t>(gemm1_out_) * static_cast<size_t>(hidden_);
+      size_t w13s_elems = static_cast<size_t>(gemm1_out_blocks_) * static_cast<size_t>(hidden_blocks_);
+      const FP8* w13_e = reinterpret_cast<const FP8*>(gemm1_w_dev + static_cast<size_t>(le) * w13_elems);
+      const float* s13_e = gemm1_s_dev + static_cast<size_t>(le) * w13s_elems;
+      int w13_scale_elems = gemm1_out_blocks_ * hidden_blocks_;
+      copy_scale_nblock_kblock_kernel<<<(w13_scale_elems + kThreads - 1) / kThreads, kThreads,
+                                        0, stream>>>(s13_e, w13_scale_elems, tc_b_scale_dev_);
+      cudaError_t st_ref = (n_rows >= 256)
+          ? launch_cutlass_blockscaled_group_gemm_sm100<1, true, 256, 2,
+                                                        cutlass::float_e4m3_t,
+                                                        cutlass::float_e4m3_t, float>(
+                tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+                32ull * 1024ull * 1024ull,
+                reinterpret_cast<FP8*>(tc_a_fp8_dev_ + static_cast<int64_t>(start) * hidden_),
+                const_cast<FP8*>(w13_e),
+                tc_a_scale_dev_ + static_cast<int64_t>(start) * hidden_blocks_,
+                tc_b_scale_dev_, g1_dev_, n_rows, gemm1_out_, hidden_, stream)
+          : launch_cutlass_blockscaled_group_gemm_sm100<1, true, 128, 1,
+                                                        cutlass::float_e4m3_t,
+                                                        cutlass::float_e4m3_t, float>(
+                tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+                32ull * 1024ull * 1024ull,
+                reinterpret_cast<FP8*>(tc_a_fp8_dev_ + static_cast<int64_t>(start) * hidden_),
+                const_cast<FP8*>(w13_e),
+                tc_a_scale_dev_ + static_cast<int64_t>(start) * hidden_blocks_,
+                tc_b_scale_dev_, g1_dev_, n_rows, gemm1_out_, hidden_, stream);
+      if (st_ref != cudaSuccess) continue;
+      float* max_diff_dev = nullptr;
+      cudaMalloc(&max_diff_dev, sizeof(float));
+      cudaMemsetAsync(max_diff_dev, 0, sizeof(float), stream);
+      int64_t g1_elems = static_cast<int64_t>(n_rows) * gemm1_out_;
+      float* grouped_g1_cur_dev = reinterpret_cast<float*>(tc_float_workspace_dev_);
+      cudaMemcpyAsync(grouped_g1_cur_dev,
+                      tc_g1_f32_dev_ + static_cast<int64_t>(start) * gemm1_out_,
+                      g1_elems * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+      compare_abs_diff_kernel<<<static_cast<int>((g1_elems + kThreads - 1) / kThreads),
+                                kThreads, 0, stream>>>(
+          grouped_g1_cur_dev, g1_dev_, g1_elems, max_diff_dev);
+      float max_diff = 0.0f;
+      cudaMemcpyAsync(&max_diff, max_diff_dev, sizeof(float), cudaMemcpyDeviceToHost, stream);
+      cudaStreamSynchronize(stream);
+      cudaFree(max_diff_dev);
+      std::fprintf(stderr, "[mxfp] grouped_g1_compare le=%d n_rows=%d max_abs_diff=%g\n",
+                   le, n_rows, max_diff);
+      const char* env_single_group_debug = std::getenv("FIB_MOE_TC_GROUPED_G1_SINGLE_DEBUG");
+      if (le == 0 && start == 0 && env_single_group_debug != nullptr &&
+          env_single_group_debug[0] == '1') {
+        cudaError_t st_group1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
+            1, true, 128, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>(
+            grouped_arg_workspace, 32ull * 1024ull * 1024ull, grouped_gemm_workspace,
+            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
+            const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm1_w_dev)), tc_a_scale_dev_,
+            const_cast<float*>(gemm1_s_dev), tc_g1_f32_dev_, const_cast<int*>(expert_offsets_dev),
+            n_rows, gemm1_out_, hidden_, 1, stream, expert_offsets_host);
+        if (st_group1 == cudaSuccess) {
+          cudaMalloc(&max_diff_dev, sizeof(float));
+          cudaMemsetAsync(max_diff_dev, 0, sizeof(float), stream);
+          compare_abs_diff_kernel<<<static_cast<int>((g1_elems + kThreads - 1) / kThreads),
+                                    kThreads, 0, stream>>>(
+              tc_g1_f32_dev_, g1_dev_, g1_elems, max_diff_dev);
+          max_diff = 0.0f;
+          cudaMemcpyAsync(&max_diff, max_diff_dev, sizeof(float), cudaMemcpyDeviceToHost, stream);
+          cudaStreamSynchronize(stream);
+          cudaFree(max_diff_dev);
+          std::fprintf(stderr,
+                       "[mxfp] grouped_g1_single_group_compare le=%d n_rows=%d max_abs_diff=%g\n",
+                       le, n_rows, max_diff);
+        } else {
+          std::fprintf(stderr, "[mxfp] grouped_g1_single_group launch failed: %s\n",
+                       cudaGetErrorString(st_group1));
+        }
+      }
+      break;
+    }
+  }
+
+  std::array<int, 33> padded_offsets{};
+  for (int le = 0; le < 32; ++le) {
+    padded_offsets[le + 1] = padded_offsets[le] + ((expert_counts_host[le] + 3) & ~3);
+  }
+  int padded_total_rows = padded_offsets[32];
+
+  const char* env_grouped_g2_after_g1 = std::getenv("FIB_MOE_TC_GROUPED_G1_GROUPED_G2");
+  int grouped_g2_after_g1_max_rows =
+      std::max(0, env_int_or_default("FIB_MOE_TC_GROUPED_G1_GROUPED_G2_MAX_ROWS", 32768));
+  const bool grouped_g2_after_g1 =
+      direct_output && grouped_g2_after_g1_max_rows > 0 && total_rows <= grouped_g2_after_g1_max_rows &&
+      (env_grouped_g2_after_g1 == nullptr || env_grouped_g2_after_g1[0] != '0');
+  if (grouped_g2_after_g1 && padded_total_rows > 0) {
+    cudaMemcpyAsync(tc_m_indptr_dev_, padded_offsets.data(), padded_offsets.size() * sizeof(int),
+                    cudaMemcpyHostToDevice, stream);
+
+    const char* env_grouped_swiglu = std::getenv("FIB_MOE_TC_GROUPED_SWIGLU");
+    const bool grouped_swiglu =
+        env_grouped_swiglu == nullptr || env_grouped_swiglu[0] != '0';
+    if (grouped_swiglu) {
+      int rows_per_cta = select_grouped_swiglu_rows_per_cta(total_rows, padded_total_rows);
+      dim3 qgrid((padded_total_rows + rows_per_cta - 1) / rows_per_cta, intermediate_blocks_);
+      if (rows_per_cta == 4) {
+        grouped_swiglu_quantize_float_to_fp8_rows_per_cta_kernel<4>
+            <<<qgrid, 128, 4 * 128 * sizeof(float), stream>>>(
+                tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
+                tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
+      } else if (rows_per_cta == 2) {
+        grouped_swiglu_quantize_float_to_fp8_rows_per_cta_kernel<2>
+            <<<qgrid, 128, 2 * 128 * sizeof(float), stream>>>(
+                tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
+                tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
+      } else {
+        grouped_swiglu_quantize_float_to_fp8_kernel<<<qgrid, 128, 128 * sizeof(float), stream>>>(
+            tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
+            tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
+      }
+    } else {
+      for (int le = 0; le < 32; ++le) {
+        int n_rows = expert_counts_host[le];
+        if (n_rows == 0) continue;
+        int start = expert_offsets_host[le];
+        int padded_start = padded_offsets[le];
+        int padded_rows = (n_rows + 3) & ~3;
+        int swiglu_rows_per_cta = select_swiglu_rows_per_cta(total_rows, padded_rows);
+        dim3 qgrid((padded_rows + swiglu_rows_per_cta - 1) / swiglu_rows_per_cta,
+                   intermediate_blocks_);
+        float* g1_ptr = tc_g1_f32_dev_ + static_cast<int64_t>(start) * gemm1_out_;
+        uint8_t* c_ptr = tc_c_fp8_dev_ + static_cast<int64_t>(padded_start) * intermediate_;
+        float* c_scale_ptr =
+            tc_c_scale_dev_ + static_cast<int64_t>(padded_start) * intermediate_blocks_;
+        if (swiglu_rows_per_cta == 4) {
+          swiglu_quantize_float_to_fp8_rows_per_cta_kernel<4>
+              <<<qgrid, 128, 4 * 128 * sizeof(float), stream>>>(
+                  g1_ptr, intermediate_, n_rows, padded_rows, c_ptr, c_scale_ptr, true);
+        } else if (swiglu_rows_per_cta == 2) {
+          swiglu_quantize_float_to_fp8_rows_per_cta_kernel<2>
+              <<<qgrid, 128, 2 * 128 * sizeof(float), stream>>>(
+                  g1_ptr, intermediate_, n_rows, padded_rows, c_ptr, c_scale_ptr, true);
+        } else {
+          swiglu_quantize_float_to_fp8_kernel<<<qgrid, 128, 128 * sizeof(float), stream>>>(
+              g1_ptr, intermediate_, n_rows, padded_rows, c_ptr, c_scale_ptr, true);
+        }
+      }
+    }
+
+    TcGemmDispatch g2_dispatch = select_trtllm_like_gemm2_dispatch(total_rows, 64);
+    int g2_tile_m = select_tile_m_from_env("FIB_MOE_GROUPED_G2_TILE_M", g2_dispatch.tile_m);
+    int g2_mma_sm = select_mma_sm_from_env("FIB_MOE_GROUPED_G2_MMA_SM", g2_dispatch.mma_sms);
+    cudaError_t st_g2 = cudaSuccess;
+    if (g2_mma_sm == 2) {
+      st_g2 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
+          1, true, 256, 2, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>(
+          tc_group_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_group_float_workspace_dev_,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
+          const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
+          hidden_, intermediate_, 32, stream, padded_offsets.data());
+    } else if (g2_tile_m == 128) {
+      st_g2 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
+          1, true, 128, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>(
+          tc_group_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_group_float_workspace_dev_,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
+          const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
+          hidden_, intermediate_, 32, stream, padded_offsets.data());
+    } else {
+      st_g2 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
+          1, true, 64, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>(
+          tc_group_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_group_float_workspace_dev_,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
+          const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
+          hidden_, intermediate_, 32, stream, padded_offsets.data());
+    }
+    if (st_g2 == cudaSuccess) {
+      if (routed_positions_dev == nullptr || routed_local_experts_dev == nullptr ||
+          routed_weights_dev == nullptr || output_dev == nullptr) {
+        return false;
+      }
+      WriteTcPaddedScratchToBf16Output(t, expert_offsets_dev, tc_m_indptr_dev_,
+                                       routed_positions_dev, routed_local_experts_dev,
+                                       routed_weights_dev, output_dev, stream);
+      return true;
+    }
+  }
+
+  for (int le = 0; le < 32; ++le) {
+    int n_rows = expert_counts_host[le];
+    if (n_rows == 0) continue;
+    int start = expert_offsets_host[le];
+    // Match the direct-output gather scratch convention: compact row position
+    // plus four padding rows per expert. This keeps grouped G1 compatible with
+    // the existing top-k gather and avoids an out_acc/final-convert pass.
+    int scratch_start = direct_output ? (start + 4 * le) : padded_offsets[le];
+    const float* permuted_w_e = direct_output ? nullptr : (permuted_w_dev + start);
+    RunExpertGemm2TcFromG1(t, total_rows, n_rows, start, scratch_start, permuted_tok_dev + start,
+                           permuted_w_e, le, gemm2_w_dev, gemm2_s_dev, out_acc_dev,
+                           stream, !direct_output);
+  }
+  if (direct_output) {
+    if (routed_positions_dev == nullptr || routed_local_experts_dev == nullptr ||
+        routed_weights_dev == nullptr || output_dev == nullptr) {
+      return false;
+    }
+    WriteTcScratchToBf16Output(t, routed_positions_dev, routed_local_experts_dev,
+                               routed_weights_dev, output_dev, stream);
+  }
+  return true;
+#else
+  (void)hidden_fp8_dev;
+  (void)hidden_scale_dev;
+  (void)t;
+  (void)total_rows;
+  (void)expert_offsets_dev;
+  (void)expert_counts_host;
+  (void)expert_offsets_host;
+  (void)permuted_tok_dev;
+  (void)permuted_w_dev;
+  (void)gemm1_w_dev;
+  (void)gemm1_s_dev;
+  (void)gemm2_w_dev;
+  (void)gemm2_s_dev;
+  (void)out_acc_dev;
+  (void)stream;
+  (void)direct_output;
+  (void)routed_positions_dev;
+  (void)routed_local_experts_dev;
+  (void)routed_weights_dev;
+  (void)output_dev;
+  return false;
+#endif
+}
+
+bool DeviceMxfpGemmModule::RunExpertGemm1ThenGroupedGemm2Tc(
+    const uint8_t* hidden_fp8_dev, const float* hidden_scale_dev, int64_t t, int total_rows,
+    const int* expert_offsets_dev, const int* expert_counts_host,
+    const int* expert_offsets_host, const int* permuted_tok_dev,
+    const int* permuted_expert_dev, const float* permuted_w_dev, const uint8_t* gemm1_w_dev,
+    const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
+    const float* gemm2_s_dev, float* out_acc_dev, cudaStream_t stream) {
+#if FIB_HAS_DIRECT_CUTLASS_SM100
+  const char* env_enable = std::getenv("FIB_MOE_TC_ENABLE_GROUPED_G2");
+  if (env_enable == nullptr || env_enable[0] != '1') return false;
+  if (total_rows <= 0) return true;
+  if (!SupportsTcPath()) return false;
+
+  std::array<int, 33> padded_offsets{};
+  for (int le = 0; le < 32; ++le) {
+    padded_offsets[le + 1] = padded_offsets[le] + ((expert_counts_host[le] + 3) & ~3);
+  }
+  int padded_total_rows = padded_offsets[32];
+  if (padded_total_rows <= 0) return true;
+
+  EnsureTcWorkspace(padded_total_rows);
+  for (int le = 0; le < 32; ++le) {
+    int n_rows = expert_counts_host[le];
+    if (n_rows == 0) continue;
+    int start = expert_offsets_host[le];
+    int padded_start = padded_offsets[le];
+    RunExpertPermutedTcToScratch(hidden_fp8_dev, hidden_scale_dev, t, padded_total_rows,
+                                 padded_start, n_rows, permuted_tok_dev + start, le,
+                                 gemm1_w_dev, gemm1_s_dev, gemm2_w_dev, gemm2_s_dev, stream,
+                                 false);
+  }
+
+  cudaMemcpyAsync(tc_m_indptr_dev_, padded_offsets.data(), padded_offsets.size() * sizeof(int),
+                  cudaMemcpyHostToDevice, stream);
+
+  using FP8 = cutlass::float_e4m3_t;
+  TcGemmDispatch g2_dispatch = select_trtllm_like_gemm2_dispatch(total_rows, 64);
+  int g2_tile_m = select_tile_m_from_env("FIB_MOE_GROUPED_G2_TILE_M", g2_dispatch.tile_m);
+  int g2_mma_sm = select_mma_sm_from_env("FIB_MOE_GROUPED_G2_MMA_SM", g2_dispatch.mma_sms);
+  cudaError_t st = cudaSuccess;
+  if (g2_mma_sm == 2) {
+    st = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
+        1, true, 256, 2, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>(
+        tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+        32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
+        const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
+        const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
+        hidden_, intermediate_, 32, stream, padded_offsets.data());
+  } else if (g2_tile_m == 128) {
+    st = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
+        1, true, 128, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>(
+        tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+        32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
+        const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
+        const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
+        hidden_, intermediate_, 32, stream, padded_offsets.data());
+  } else {
+    st = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
+        1, true, 64, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>(
+        tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+        32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
+        const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
+        const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
+        hidden_, intermediate_, 32, stream, padded_offsets.data());
+  }
+  if (st != cudaSuccess) return false;
+
+  constexpr int kThreads = 256;
+  dim3 grid(total_rows, (hidden_ + kThreads - 1) / kThreads);
+  scatter_all_float_weighted_by_padded_expert_row_kernel<<<grid, kThreads, 0, stream>>>(
+      tc_d_f32_dev_, hidden_, total_rows, expert_offsets_dev, tc_m_indptr_dev_, permuted_tok_dev,
+      permuted_expert_dev, permuted_w_dev, out_acc_dev);
+  return true;
+#else
+  (void)hidden_fp8_dev;
+  (void)hidden_scale_dev;
+  (void)t;
+  (void)total_rows;
+  (void)expert_offsets_dev;
+  (void)expert_counts_host;
+  (void)expert_offsets_host;
+  (void)permuted_tok_dev;
+  (void)permuted_expert_dev;
+  (void)permuted_w_dev;
+  (void)gemm1_w_dev;
+  (void)gemm1_s_dev;
+  (void)gemm2_w_dev;
+  (void)gemm2_s_dev;
+  (void)out_acc_dev;
+  (void)stream;
+  return false;
+#endif
+}
+
 void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
                                                const float* hidden_scale_dev, int64_t t,
                                                int n_rows, const int* permuted_tok_e,
@@ -1563,30 +2761,55 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
       (env_force_transpose_b != nullptr && env_force_transpose_b[0] == '1');
   const char* env_scale_major_k = std::getenv("FIB_MOE_TC_SCALE_MAJOR_K");
   const bool scale_major_k = (env_scale_major_k == nullptr || env_scale_major_k[0] == '1');
-  const char* env_c_scale_gran_m = std::getenv("FIB_MOE_TC_C_SCALE_GRAN_M");
-  const int c_scale_gran_m =
-      (env_c_scale_gran_m != nullptr && std::atoi(env_c_scale_gran_m) == 128) ? 128 : 1;
+  constexpr int c_scale_gran_m = 1;
 
   using FP8 = cutlass::float_e4m3_t;
 
   constexpr int kThreads = 256;
   int64_t a_elems = static_cast<int64_t>(padded_rows) * hidden_;
   int64_t a_scale_elems = static_cast<int64_t>(padded_rows) * hidden_blocks_;
-  gather_hidden_fp8_rows_kernel<<<static_cast<int>((a_elems + kThreads - 1) / kThreads),
-                                  kThreads, 0, stream>>>(
-      hidden_fp8_dev, permuted_tok_e, n_rows, padded_rows, hidden_, tc_a_fp8_dev_);
   if (scale_major_k) {
-    gather_hidden_scale_rows_mn_major_kernel<<<
-        static_cast<int>((a_scale_elems + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
-        hidden_scale_dev, permuted_tok_e, t, n_rows, padded_rows, hidden_blocks_,
-        tc_a_scale_dev_);
+    gather_hidden_fp8_and_scale_rows_mn_major_kernel<<<
+        static_cast<int>((std::max(a_elems, a_scale_elems) + kThreads - 1) / kThreads), kThreads,
+        0, stream>>>(hidden_fp8_dev, hidden_scale_dev, permuted_tok_e, t, n_rows, padded_rows,
+                     hidden_, hidden_blocks_, tc_a_fp8_dev_, tc_a_scale_dev_);
   } else {
+    gather_hidden_fp8_rows_kernel<<<static_cast<int>((a_elems + kThreads - 1) / kThreads),
+                                    kThreads, 0, stream>>>(
+        hidden_fp8_dev, permuted_tok_e, n_rows, padded_rows, hidden_, tc_a_fp8_dev_);
     gather_hidden_scale_rows_kernel<<<static_cast<int>((a_scale_elems + kThreads - 1) / kThreads),
                                       kThreads, 0, stream>>>(
         hidden_scale_dev, permuted_tok_e, t, n_rows, padded_rows, hidden_blocks_,
         tc_a_scale_dev_);
   }
-  write_single_group_indptr_kernel<<<1, 1, 0, stream>>>(padded_rows, tc_m_indptr_dev_);
+
+  const int small_rows_threshold =
+      std::max(0, env_int_or_default("FIB_MOE_TC_SMALL_ROWS", 0));
+  if (n_rows <= small_rows_threshold) {
+    EnsureWorkspace(n_rows, stream);
+    float* a_compact_dev = reinterpret_cast<float*>(tc_int_workspace_dev_);
+    int64_t a_f32_elems = static_cast<int64_t>(n_rows) * hidden_;
+    int64_t g1_elems = static_cast<int64_t>(n_rows) * gemm1_out_;
+    int64_t c_elems = static_cast<int64_t>(n_rows) * intermediate_;
+    int64_t out_elems = static_cast<int64_t>(n_rows) * hidden_;
+    dequant_fp8_rows_kernel<<<static_cast<int>((a_f32_elems + kThreads - 1) / kThreads),
+                              kThreads, 0, stream>>>(
+        tc_a_fp8_dev_, tc_a_scale_dev_, n_rows, hidden_, 1, hidden_blocks_, scale_major_k,
+        a_compact_dev);
+    gemm1_compact_kernel<<<static_cast<int>((g1_elems + kThreads - 1) / kThreads), kThreads, 0,
+                           stream>>>(
+        a_compact_dev, hidden_, gemm1_out_, block_, hidden_blocks_, n_rows, w13_e, s13_e,
+        emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_, g1_dev_);
+    swiglu_permuted_kernel<<<static_cast<int>((c_elems + kThreads - 1) / kThreads), kThreads, 0,
+                             stream>>>(g1_dev_, intermediate_, n_rows, false, c_dev_);
+    gemm2_scatter_accumulate_kernel<<<static_cast<int>((out_elems + kThreads - 1) / kThreads),
+                                      kThreads, 0, stream>>>(
+        c_dev_, hidden_, intermediate_, block_, intermediate_blocks_, n_rows, permuted_tok_e,
+        permuted_w_e, w2_e, s2_e, emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_,
+        out_acc_dev);
+    return;
+  }
+
   int64_t w13_transpose_elems = static_cast<int64_t>(gemm1_out_) * hidden_;
   if (transpose_b) {
     transpose_rowmajor_nk_to_colmajor_nk_kernel<<<
@@ -1596,48 +2819,95 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
   FP8* w13_tc = transpose_b ? reinterpret_cast<FP8*>(tc_b_col_dev_)
                             : const_cast<FP8*>(reinterpret_cast<const FP8*>(w13_e));
   int w13_scale_elems = gemm1_out_blocks_ * hidden_blocks_;
+  float* w13_scale_tc = const_cast<float*>(s13_e);
   if (scale_major_k) {
-    copy_scale_nblock_kblock_kernel<<<(w13_scale_elems + kThreads - 1) / kThreads, kThreads, 0,
-                                      stream>>>(s13_e, w13_scale_elems, tc_b_scale_dev_);
+    (void)w13_scale_elems;
   } else {
     transpose_scale_nblock_kblock_to_kblock_nblock_kernel<<<
         (w13_scale_elems + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
         s13_e, gemm1_out_blocks_, hidden_blocks_, tc_b_scale_dev_);
+    w13_scale_tc = tc_b_scale_dev_;
   }
 
   auto run_gemm1_1sm = [&]() {
+    TcGemmDispatch g1_dispatch = select_trtllm_like_gemm1_dispatch(n_rows, padded_rows);
+    int g1_tile_m = select_tile_m_from_env("FIB_MOE_G1_TILE_M", g1_dispatch.tile_m);
+    const char* env_g1_tn = std::getenv("FIB_MOE_G1_TRANSPOSED");
+    if (env_g1_tn != nullptr && env_g1_tn[0] == '1' && scale_major_k && !transpose_b) {
+      int g1_tile_n = select_tile_m_from_env("FIB_MOE_G1_TN_TILE_N", 64);
+      if (g1_tile_n == 128) {
+        return launch_cutlass_blockscaled_group_gemm_tn_sm100<128, 1, true, 128,
+                                                              cutlass::float_e4m3_t,
+                                                              cutlass::float_e4m3_t, float>(
+            tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+            32ull * 1024ull * 1024ull, const_cast<FP8*>(reinterpret_cast<const FP8*>(w13_e)),
+            reinterpret_cast<FP8*>(tc_a_fp8_dev_), w13_scale_tc, tc_a_scale_dev_,
+            tc_g1_f32_dev_, gemm1_out_, padded_rows, hidden_, stream);
+      }
+      return launch_cutlass_blockscaled_group_gemm_tn_sm100<128, 1, true, 64,
+                                                            cutlass::float_e4m3_t,
+                                                            cutlass::float_e4m3_t, float>(
+          tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+          32ull * 1024ull * 1024ull, const_cast<FP8*>(reinterpret_cast<const FP8*>(w13_e)),
+          reinterpret_cast<FP8*>(tc_a_fp8_dev_), w13_scale_tc, tc_a_scale_dev_,
+          tc_g1_f32_dev_, gemm1_out_, padded_rows, hidden_, stream);
+    }
     if (scale_major_k) {
-      return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 1, cutlass::float_e4m3_t,
+      if (g1_tile_m == 64) {
+        return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 64, 1,
+                                                           cutlass::float_e4m3_t,
+                                                           cutlass::float_e4m3_t, float>(
+            tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_), w13_tc,
+            tc_a_scale_dev_, w13_scale_tc, tc_g1_f32_dev_,
+            padded_rows, gemm1_out_, hidden_, stream);
+      }
+      return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 128, 1,
+                                                         cutlass::float_e4m3_t,
                                                          cutlass::float_e4m3_t, float>(
           tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
           32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_), w13_tc,
-          tc_a_scale_dev_, tc_b_scale_dev_, tc_g1_f32_dev_,
+          tc_a_scale_dev_, w13_scale_tc, tc_g1_f32_dev_,
           padded_rows, gemm1_out_, hidden_, stream);
     }
-    return launch_cutlass_blockscaled_group_gemm_sm100<1, false, 1, cutlass::float_e4m3_t,
+    if (g1_tile_m == 64) {
+      return launch_cutlass_blockscaled_group_gemm_sm100<1, false, 64, 1,
+                                                         cutlass::float_e4m3_t,
+                                                         cutlass::float_e4m3_t, float>(
+          tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_), w13_tc,
+          tc_a_scale_dev_, w13_scale_tc, tc_g1_f32_dev_,
+          padded_rows, gemm1_out_, hidden_, stream);
+    }
+    return launch_cutlass_blockscaled_group_gemm_sm100<1, false, 128, 1,
+                                                       cutlass::float_e4m3_t,
                                                        cutlass::float_e4m3_t, float>(
         tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
         32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_), w13_tc,
-        tc_a_scale_dev_, tc_b_scale_dev_, tc_g1_f32_dev_,
+        tc_a_scale_dev_, w13_scale_tc, tc_g1_f32_dev_,
         padded_rows, gemm1_out_, hidden_, stream);
   };
   auto run_gemm1_2sm = [&]() {
     if (scale_major_k) {
-      return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 2, cutlass::float_e4m3_t,
+      return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 256, 2,
+                                                         cutlass::float_e4m3_t,
                                                          cutlass::float_e4m3_t, float>(
           tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
           32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_), w13_tc,
-          tc_a_scale_dev_, tc_b_scale_dev_, tc_g1_f32_dev_,
+          tc_a_scale_dev_, w13_scale_tc, tc_g1_f32_dev_,
           padded_rows, gemm1_out_, hidden_, stream);
     }
-    return launch_cutlass_blockscaled_group_gemm_sm100<1, false, 2, cutlass::float_e4m3_t,
+    return launch_cutlass_blockscaled_group_gemm_sm100<1, false, 256, 2,
+                                                       cutlass::float_e4m3_t,
                                                        cutlass::float_e4m3_t, float>(
         tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
         32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_), w13_tc,
-        tc_a_scale_dev_, tc_b_scale_dev_, tc_g1_f32_dev_,
+        tc_a_scale_dev_, w13_scale_tc, tc_g1_f32_dev_,
         padded_rows, gemm1_out_, hidden_, stream);
   };
-  cudaError_t st1 = (padded_rows >= 256) ? run_gemm1_2sm() : run_gemm1_1sm();
+  TcGemmDispatch g1_dispatch = select_trtllm_like_gemm1_dispatch(n_rows, padded_rows);
+  int g1_mma_sm = select_mma_sm_from_env("FIB_MOE_G1_MMA_SM", g1_dispatch.mma_sms);
+  cudaError_t st1 = (g1_mma_sm == 2) ? run_gemm1_2sm() : run_gemm1_1sm();
   if (st1 != cudaSuccess) return;
 
   const char* env_compare_g1 = std::getenv("FIB_MOE_TC_COMPARE_G1");
@@ -1677,16 +2947,11 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
 
   if (std::getenv("FIB_MOE_TC_GEMM1_ONLY") != nullptr) {
     EnsureWorkspace(n_rows, stream);
-    int64_t g1_elems = static_cast<int64_t>(n_rows) * gemm1_out_;
-    float_to_f16_kernel<<<static_cast<int>((g1_elems + kThreads - 1) / kThreads), kThreads, 0,
-                          stream>>>(tc_g1_f32_dev_, g1_elems, tc_g1_f16_dev_);
-    f16_matrix_to_float_kernel<<<static_cast<int>((g1_elems + kThreads - 1) / kThreads), kThreads,
-                                 0, stream>>>(tc_g1_f16_dev_, g1_elems, g1_dev_);
     int64_t c_elems = static_cast<int64_t>(n_rows) * intermediate_;
     int64_t out_elems = static_cast<int64_t>(n_rows) * hidden_;
     swiglu_permuted_kernel<<<static_cast<int>((c_elems + kThreads - 1) / kThreads),
                               kThreads, 0, stream>>>(
-        g1_dev_, intermediate_, n_rows, false, c_dev_);
+        tc_g1_f32_dev_, intermediate_, n_rows, false, c_dev_);
     gemm2_scatter_accumulate_kernel<<<static_cast<int>((out_elems + kThreads - 1) / kThreads),
                                       kThreads, 0, stream>>>(
         c_dev_, hidden_, intermediate_, block_, intermediate_blocks_, n_rows, permuted_tok_e,
@@ -1695,47 +2960,43 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
     return;
   }
 
-  EnsureWorkspace(n_rows, stream);
-  int64_t g1_elems = static_cast<int64_t>(n_rows) * gemm1_out_;
-  float_to_f16_kernel<<<static_cast<int>((g1_elems + kThreads - 1) / kThreads), kThreads, 0,
-                        stream>>>(tc_g1_f32_dev_, g1_elems, tc_g1_f16_dev_);
-  f16_matrix_to_float_kernel<<<static_cast<int>((g1_elems + kThreads - 1) / kThreads), kThreads, 0,
-                               stream>>>(tc_g1_f16_dev_, g1_elems, g1_dev_);
-  int64_t c_elems = static_cast<int64_t>(n_rows) * intermediate_;
-  swiglu_permuted_kernel<<<static_cast<int>((c_elems + kThreads - 1) / kThreads), kThreads, 0,
-                           stream>>>(g1_dev_, intermediate_, n_rows, false, c_dev_);
-  const char* env_gemm2_f16 = std::getenv("FIB_MOE_TC_GEMM2_F16");
-  const char* env_gemm2_bf16 = std::getenv("FIB_MOE_TC_GEMM2_BF16");
-  const bool gemm2_f16 = (env_gemm2_f16 != nullptr && env_gemm2_f16[0] == '1');
-  const bool gemm2_bf16 =
-      !gemm2_f16 && (env_gemm2_bf16 == nullptr || env_gemm2_bf16[0] != '0');
-  if (gemm2_bf16) {
-    float_to_bf16_kernel<<<static_cast<int>((c_elems + kThreads - 1) / kThreads), kThreads, 0,
-                           stream>>>(c_dev_, c_elems, tc_c_bf16_dev_);
-  } else if (gemm2_f16) {
-    float_rows_scaled_to_f16_kernel<<<padded_rows, 256, 0, stream>>>(
-        c_dev_, intermediate_, n_rows, padded_rows, tc_c_bf16_dev_, tc_c_scale_dev_);
+  if (tc_fp16_middle_) {
+    dim3 qgrid(padded_rows, intermediate_blocks_);
+    uint16_t* g1_f16_ptr = reinterpret_cast<uint16_t*>(tc_float_workspace_dev_);
+    float_to_f16_kernel<<<
+        static_cast<int>(((static_cast<int64_t>(padded_rows) * gemm1_out_) + kThreads - 1) /
+                         kThreads),
+        kThreads, 0, stream>>>(tc_g1_f32_dev_,
+                               static_cast<int64_t>(padded_rows) * gemm1_out_, g1_f16_ptr);
+    swiglu_quantize_f16_to_fp8_kernel<<<qgrid, 128, 128 * sizeof(float), stream>>>(
+        g1_f16_ptr, intermediate_, n_rows, padded_rows, tc_c_fp8_dev_, tc_c_scale_dev_,
+        scale_major_k);
   } else {
-    if (c_scale_gran_m == 128) {
-      int c_row_blocks = (padded_rows + 127) / 128;
-      dim3 qgrid(c_row_blocks, intermediate_blocks_);
-      compute_block_scale_128x128_kernel<<<qgrid, 256, 256 * sizeof(float), stream>>>(
-          c_dev_, intermediate_, n_rows, padded_rows, c_row_blocks, intermediate_blocks_,
-          tc_c_scale_dev_, scale_major_k);
-      quantize_float_blocks_128x128_to_fp8_kernel<<<
-          static_cast<int>(((static_cast<int64_t>(padded_rows) * intermediate_) + kThreads - 1) /
-                           kThreads),
-          kThreads, 0, stream>>>(c_dev_, tc_c_scale_dev_, intermediate_, n_rows, padded_rows,
-                                 c_row_blocks, intermediate_blocks_, tc_c_fp8_dev_, scale_major_k);
+    int swiglu_rows_per_cta = select_swiglu_rows_per_cta(n_rows, padded_rows);
+    dim3 qgrid((padded_rows + swiglu_rows_per_cta - 1) / swiglu_rows_per_cta,
+               intermediate_blocks_);
+    if (swiglu_rows_per_cta == 4) {
+      swiglu_quantize_float_to_fp8_rows_per_cta_kernel<4>
+          <<<qgrid, 128, 4 * 128 * sizeof(float), stream>>>(
+              tc_g1_f32_dev_, intermediate_, n_rows, padded_rows, tc_c_fp8_dev_, tc_c_scale_dev_,
+              scale_major_k);
+    } else if (swiglu_rows_per_cta == 2) {
+      swiglu_quantize_float_to_fp8_rows_per_cta_kernel<2>
+          <<<qgrid, 128, 2 * 128 * sizeof(float), stream>>>(
+              tc_g1_f32_dev_, intermediate_, n_rows, padded_rows, tc_c_fp8_dev_, tc_c_scale_dev_,
+              scale_major_k);
     } else {
-      dim3 qgrid(padded_rows, intermediate_blocks_);
-      quantize_float_rows_to_fp8_mse_kernel<<<qgrid, 128, 0, stream>>>(
-          c_dev_, intermediate_, n_rows, padded_rows, tc_c_fp8_dev_, tc_c_scale_dev_,
+      swiglu_quantize_float_to_fp8_kernel<<<qgrid, 128, 128 * sizeof(float), stream>>>(
+          tc_g1_f32_dev_, intermediate_, n_rows, padded_rows, tc_c_fp8_dev_, tc_c_scale_dev_,
           scale_major_k);
     }
   }
   const char* env_compare_c = std::getenv("FIB_MOE_TC_COMPARE_C");
-  if (!gemm2_bf16 && !gemm2_f16 && env_compare_c != nullptr && env_compare_c[0] == '1') {
+  if (env_compare_c != nullptr && env_compare_c[0] == '1') {
+    EnsureWorkspace(n_rows, stream);
+    int64_t c_elems = static_cast<int64_t>(n_rows) * intermediate_;
+    swiglu_permuted_kernel<<<static_cast<int>((c_elems + kThreads - 1) / kThreads), kThreads, 0,
+                             stream>>>(tc_g1_f32_dev_, intermediate_, n_rows, false, c_dev_);
     int64_t c_all_elems = static_cast<int64_t>(n_rows) * intermediate_;
     int64_t c_all_bytes = c_all_elems * static_cast<int64_t>(sizeof(float));
     int64_t g1_ref_elems = static_cast<int64_t>(n_rows) * gemm1_out_;
@@ -1909,21 +3170,6 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
       std::fflush(stderr);
     }
   }
-  if (std::getenv("FIB_MOE_TC_GEMM2_REF") != nullptr) {
-    if (!gemm2_bf16 && !gemm2_f16) {
-      dequant_fp8_rows_native_kernel<<<
-          static_cast<int>((c_elems + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
-          tc_c_fp8_dev_, tc_c_scale_dev_, n_rows, intermediate_, c_scale_gran_m,
-          intermediate_blocks_, scale_major_k, c_dev_);
-    }
-    int64_t out_elems = static_cast<int64_t>(n_rows) * hidden_;
-    gemm2_scatter_accumulate_kernel<<<static_cast<int>((out_elems + kThreads - 1) / kThreads),
-                                      kThreads, 0, stream>>>(
-        c_dev_, hidden_, intermediate_, block_, intermediate_blocks_, n_rows, permuted_tok_e,
-        permuted_w_e, w2_e, s2_e, emulate_fp8_unit_, emulate_fp16_operands_, emulate_acc_half_,
-        out_acc_dev);
-    return;
-  }
   int64_t w2_transpose_elems = static_cast<int64_t>(hidden_) * intermediate_;
   if (transpose_b) {
     transpose_rowmajor_nk_to_colmajor_nk_kernel<<<
@@ -1933,133 +3179,116 @@ void DeviceMxfpGemmModule::RunExpertPermutedTc(const uint8_t* hidden_fp8_dev,
   FP8* w2_tc = transpose_b ? reinterpret_cast<FP8*>(tc_b_col_dev_)
                            : const_cast<FP8*>(reinterpret_cast<const FP8*>(w2_e));
   int w2_scale_elems = hidden_blocks_ * intermediate_blocks_;
-  if (gemm2_bf16) {
-    dequant_fp8_rows_native_to_bf16_kernel<<<
-        static_cast<int>((w2_transpose_elems + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
-        w2_e, s2_e, hidden_, intermediate_, 128, intermediate_blocks_, true, tc_b_bf16_dev_);
-  } else if (gemm2_f16) {
-    dequant_fp8_rows_native_to_f16_kernel<<<
-        static_cast<int>((w2_transpose_elems + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
-        w2_e, s2_e, hidden_, intermediate_, 128, intermediate_blocks_, true, tc_b_bf16_dev_);
-  } else if (scale_major_k) {
-    copy_scale_nblock_kblock_kernel<<<(w2_scale_elems + kThreads - 1) / kThreads, kThreads, 0,
-                                      stream>>>(s2_e, w2_scale_elems, tc_b_scale_dev_);
+  float* w2_scale_tc = const_cast<float*>(s2_e);
+  if (scale_major_k) {
+    (void)w2_scale_elems;
   } else {
     transpose_scale_nblock_kblock_to_kblock_nblock_kernel<<<
         (w2_scale_elems + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
         s2_e, hidden_blocks_, intermediate_blocks_, tc_b_scale_dev_);
+    w2_scale_tc = tc_b_scale_dev_;
   }
 
   auto run_gemm2_1sm = [&]() {
-    if (gemm2_bf16) {
-      return launch_cutlass_dense_gemm_sm100<1, cutlass::bfloat16_t, cutlass::bfloat16_t>(
-          tc_float_workspace_dev_, 32ull * 1024ull * 1024ull,
-          reinterpret_cast<cutlass::bfloat16_t*>(tc_c_bf16_dev_),
-          reinterpret_cast<cutlass::bfloat16_t*>(tc_b_bf16_dev_), tc_d_f32_dev_, padded_rows, hidden_,
-          intermediate_, stream);
-    }
-    if (gemm2_f16) {
-      return launch_cutlass_dense_gemm_sm100<1, cutlass::half_t, cutlass::half_t>(
-          tc_float_workspace_dev_, 32ull * 1024ull * 1024ull,
-          reinterpret_cast<cutlass::half_t*>(tc_c_bf16_dev_),
-          reinterpret_cast<cutlass::half_t*>(tc_b_bf16_dev_), tc_d_f32_dev_, padded_rows, hidden_,
-          intermediate_, stream);
-    }
+    TcGemmDispatch g2_dispatch = select_trtllm_like_gemm2_dispatch(n_rows, padded_rows);
+    int g2_tile_m = select_tile_m_from_env("FIB_MOE_G2_TILE_M", g2_dispatch.tile_m);
     if (scale_major_k) {
       if (c_scale_gran_m == 128) {
-        return launch_cutlass_blockscaled_group_gemm_sm100<128, true, 1,
+        return launch_cutlass_blockscaled_group_gemm_sm100<128, true, 128, 1,
                                                            cutlass::float_e4m3_t,
                                                            cutlass::float_e4m3_t, float>(
             tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
             32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_), w2_tc,
-            tc_c_scale_dev_, tc_b_scale_dev_, tc_d_f32_dev_, padded_rows, hidden_,
+            tc_c_scale_dev_, w2_scale_tc, tc_d_f32_dev_, padded_rows, hidden_,
             intermediate_, stream);
       }
-      return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 1, cutlass::float_e4m3_t,
+      if (g2_tile_m == 64) {
+        return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 64, 1,
+                                                           cutlass::float_e4m3_t,
+                                                           cutlass::float_e4m3_t, float>(
+            tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_), w2_tc,
+            tc_c_scale_dev_, w2_scale_tc, tc_d_f32_dev_,
+            padded_rows, hidden_, intermediate_, stream);
+      }
+      return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 128, 1, cutlass::float_e4m3_t,
                                                          cutlass::float_e4m3_t, float>(
           tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
           32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_), w2_tc,
-          tc_c_scale_dev_, tc_b_scale_dev_, tc_d_f32_dev_,
+          tc_c_scale_dev_, w2_scale_tc, tc_d_f32_dev_,
           padded_rows, hidden_, intermediate_, stream);
     }
     if (c_scale_gran_m == 128) {
-      return launch_cutlass_blockscaled_group_gemm_sm100<128, false, 1,
+      return launch_cutlass_blockscaled_group_gemm_sm100<128, false, 128, 1,
                                                          cutlass::float_e4m3_t,
                                                          cutlass::float_e4m3_t, float>(
           tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
           32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_), w2_tc,
-          tc_c_scale_dev_, tc_b_scale_dev_, tc_d_f32_dev_,
+          tc_c_scale_dev_, w2_scale_tc, tc_d_f32_dev_,
           padded_rows, hidden_, intermediate_, stream);
     }
-    return launch_cutlass_blockscaled_group_gemm_sm100<1, false, 1, cutlass::float_e4m3_t,
+    if (g2_tile_m == 64) {
+      return launch_cutlass_blockscaled_group_gemm_sm100<1, false, 64, 1, cutlass::float_e4m3_t,
+                                                         cutlass::float_e4m3_t, float>(
+          tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_), w2_tc,
+          tc_c_scale_dev_, w2_scale_tc, tc_d_f32_dev_,
+          padded_rows, hidden_, intermediate_, stream);
+    }
+    return launch_cutlass_blockscaled_group_gemm_sm100<1, false, 128, 1, cutlass::float_e4m3_t,
                                                        cutlass::float_e4m3_t, float>(
         tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
         32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_), w2_tc,
-        tc_c_scale_dev_, tc_b_scale_dev_, tc_d_f32_dev_,
+        tc_c_scale_dev_, w2_scale_tc, tc_d_f32_dev_,
         padded_rows, hidden_, intermediate_, stream);
   };
   auto run_gemm2_2sm = [&]() {
-    if (gemm2_bf16) {
-      return launch_cutlass_dense_gemm_sm100<2, cutlass::bfloat16_t, cutlass::bfloat16_t>(
-          tc_float_workspace_dev_, 32ull * 1024ull * 1024ull,
-          reinterpret_cast<cutlass::bfloat16_t*>(tc_c_bf16_dev_),
-          reinterpret_cast<cutlass::bfloat16_t*>(tc_b_bf16_dev_), tc_d_f32_dev_, padded_rows, hidden_,
-          intermediate_, stream);
-    }
-    if (gemm2_f16) {
-      return launch_cutlass_dense_gemm_sm100<2, cutlass::half_t, cutlass::half_t>(
-          tc_float_workspace_dev_, 32ull * 1024ull * 1024ull,
-          reinterpret_cast<cutlass::half_t*>(tc_c_bf16_dev_),
-          reinterpret_cast<cutlass::half_t*>(tc_b_bf16_dev_), tc_d_f32_dev_, padded_rows, hidden_,
-          intermediate_, stream);
-    }
     if (scale_major_k) {
       if (c_scale_gran_m == 128) {
-        return launch_cutlass_blockscaled_group_gemm_sm100<128, true, 2,
+        return launch_cutlass_blockscaled_group_gemm_sm100<128, true, 256, 2,
                                                            cutlass::float_e4m3_t,
                                                            cutlass::float_e4m3_t, float>(
             tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
             32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_), w2_tc,
-            tc_c_scale_dev_, tc_b_scale_dev_, tc_d_f32_dev_, padded_rows, hidden_,
+            tc_c_scale_dev_, w2_scale_tc, tc_d_f32_dev_, padded_rows, hidden_,
             intermediate_, stream);
       }
-      return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 2, cutlass::float_e4m3_t,
+      return launch_cutlass_blockscaled_group_gemm_sm100<1, true, 256, 2, cutlass::float_e4m3_t,
                                                          cutlass::float_e4m3_t, float>(
           tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
           32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_), w2_tc,
-          tc_c_scale_dev_, tc_b_scale_dev_, tc_d_f32_dev_,
+          tc_c_scale_dev_, w2_scale_tc, tc_d_f32_dev_,
           padded_rows, hidden_, intermediate_, stream);
     }
     if (c_scale_gran_m == 128) {
-      return launch_cutlass_blockscaled_group_gemm_sm100<128, false, 2,
+      return launch_cutlass_blockscaled_group_gemm_sm100<128, false, 256, 2,
                                                          cutlass::float_e4m3_t,
                                                          cutlass::float_e4m3_t, float>(
           tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
           32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_), w2_tc,
-          tc_c_scale_dev_, tc_b_scale_dev_, tc_d_f32_dev_,
+          tc_c_scale_dev_, w2_scale_tc, tc_d_f32_dev_,
           padded_rows, hidden_, intermediate_, stream);
     }
-    return launch_cutlass_blockscaled_group_gemm_sm100<1, false, 2, cutlass::float_e4m3_t,
+    return launch_cutlass_blockscaled_group_gemm_sm100<1, false, 256, 2, cutlass::float_e4m3_t,
                                                        cutlass::float_e4m3_t, float>(
         tc_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_float_workspace_dev_,
         32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_), w2_tc,
-        tc_c_scale_dev_, tc_b_scale_dev_, tc_d_f32_dev_,
+        tc_c_scale_dev_, w2_scale_tc, tc_d_f32_dev_,
         padded_rows, hidden_, intermediate_, stream);
   };
-  cudaError_t st2 = (padded_rows >= 256) ? run_gemm2_2sm() : run_gemm2_1sm();
+  TcGemmDispatch g2_dispatch = select_trtllm_like_gemm2_dispatch(n_rows, padded_rows);
+  const char* env_g2_2sm_min_rows = std::getenv("FIB_MOE_G2_2SM_MIN_ROWS");
+  int g2_mma_sm = select_mma_sm_from_env("FIB_MOE_G2_MMA_SM", g2_dispatch.mma_sms);
+  if (std::getenv("FIB_MOE_G2_MMA_SM") == nullptr && env_g2_2sm_min_rows != nullptr) {
+    g2_mma_sm = (padded_rows >= std::atoi(env_g2_2sm_min_rows)) ? 2 : 1;
+  }
+  cudaError_t st2 = (g2_mma_sm == 2) ? run_gemm2_2sm() : run_gemm2_1sm();
   if (st2 != cudaSuccess) return;
 
   int64_t scatter_elems = static_cast<int64_t>(n_rows) * hidden_;
-  if (gemm2_f16) {
-    scatter_float_weighted_row_scaled_kernel<<<
-        static_cast<int>((scatter_elems + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
-        tc_d_f32_dev_, tc_c_scale_dev_, hidden_, n_rows, permuted_tok_e, permuted_w_e,
-        out_acc_dev);
-  } else {
-    scatter_float_weighted_kernel<<<static_cast<int>((scatter_elems + kThreads - 1) / kThreads),
-                                    kThreads, 0, stream>>>(
-        tc_d_f32_dev_, hidden_, n_rows, permuted_tok_e, permuted_w_e, out_acc_dev);
-  }
+  scatter_float_weighted_kernel<<<static_cast<int>((scatter_elems + kThreads - 1) / kThreads),
+                                  kThreads, 0, stream>>>(
+      tc_d_f32_dev_, hidden_, n_rows, permuted_tok_e, permuted_w_e, out_acc_dev);
 #else
   return RunExpertPermuted(nullptr, t, n_rows, permuted_tok_e, permuted_w_e, local_expert_idx,
                            gemm1_w_dev, gemm1_s_dev, gemm2_w_dev, gemm2_s_dev, out_acc_dev,

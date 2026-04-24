@@ -4,56 +4,8 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <vector>
 
 namespace mxfp {
-
-// Host-side FP8 e4m3fn decoder used by the current reference path.
-float fp8_e4m3fn_to_float(uint8_t x);
-
-// Host MXFP block-scale GEMM module.
-// This isolates weight loading and GEMM math so we can later swap
-// internals with B200 TC kernels while preserving call sites.
-class HostMxfpGemmModule {
- public:
-  HostMxfpGemmModule(int hidden, int intermediate, int block);
-
-  size_t gemm1_weight_elems() const;
-  size_t gemm1_scale_elems() const;
-  size_t gemm2_weight_elems() const;
-  size_t gemm2_scale_elems() const;
-
-  void load_expert_from_device(int local_expert_idx, const uint8_t* gemm1_weights_dev,
-                               const float* gemm1_scales_dev, const uint8_t* gemm2_weights_dev,
-                               const float* gemm2_scales_dev, cudaStream_t stream);
-
-  // GEMM1: [1, hidden] x [hidden, 2*intermediate] -> [2*intermediate]
-  void gemm1_matvec(const float* a_row, float* g1_out) const;
-
-  // SwiGLU: split g1 into [x1, x2], c = x1 * silu(x2)
-  static void swiglu(const float* g1, int intermediate, float* c_out);
-
-  // GEMM2 + accumulation: out_row += weight * ([1, intermediate] x [intermediate, hidden])
-  void gemm2_matvec_accumulate(const float* c, float weight, float* out_row) const;
-
- private:
-  int hidden_;
-  int intermediate_;
-  int block_;
-  int gemm1_out_;
-  int hidden_blocks_;
-  int intermediate_blocks_;
-  int gemm1_out_blocks_;
-
-  // Host weights for current reference backend.
-  // Layouts:
-  // - w13_fp8_: [2I, H], w13_scale_: [2I/128, H/128]
-  // - w2_fp8_:  [H, I],  w2_scale_:  [H/128, I/128]
-  std::vector<uint8_t> w13_fp8_;
-  std::vector<float> w13_scale_;
-  std::vector<uint8_t> w2_fp8_;
-  std::vector<float> w2_scale_;
-};
 
 // Device implementation for end-to-end GPU execution.
 class DeviceMxfpGemmModule {
@@ -85,18 +37,61 @@ class DeviceMxfpGemmModule {
   bool SupportsTcPath() const;
 
   // Blackwell/CUTLASS path: keep the current routing/per-expert loop, run
-  // GEMM1 as direct FP8 block-scaled GEMM on compact routed rows, round the
-  // GEMM1 output to fp16 before the fp32 middle ops, then run GEMM2 from
-  // bf16 activations / bf16-dequantized weights.
+  // GEMM1 as direct FP8 block-scaled GEMM on compact routed rows, keep the
+  // middle ops in FP32, quantize SwiGLU output back to block-scaled FP8, then
+  // run GEMM2 as FP8 block-scaled CUTLASS.
   void RunExpertPermutedTc(const uint8_t* hidden_fp8_dev, const float* hidden_scale_dev,
                            int64_t t, int n_rows, const int* permuted_tok_e,
                            const float* permuted_w_e, int local_expert_idx,
                            const uint8_t* gemm1_w_dev, const float* gemm1_s_dev,
                            const uint8_t* gemm2_w_dev, const float* gemm2_s_dev,
                            float* out_acc_dev, cudaStream_t stream);
+  void RunExpertPermutedTcToScratch(const uint8_t* hidden_fp8_dev,
+                                    const float* hidden_scale_dev, int64_t t,
+                                    int total_rows, int row_offset, int n_rows,
+                                    const int* permuted_tok_e, int local_expert_idx,
+                                    const uint8_t* gemm1_w_dev, const float* gemm1_s_dev,
+                                    const uint8_t* gemm2_w_dev, const float* gemm2_s_dev,
+                                    cudaStream_t stream, bool run_gemm2 = true);
+  void ScatterTcScratch(int total_rows, const int* expert_offsets_dev,
+                        const int* permuted_tok_dev, const int* permuted_expert_dev,
+                        const float* permuted_w_dev, float* out_acc_dev, cudaStream_t stream);
+  void WriteTcScratchToBf16Output(int64_t t, const int* routed_positions_dev,
+                                  const int* routed_local_experts_dev,
+                                  const float* routed_weights_dev, uint16_t* output_dev,
+                                  cudaStream_t stream);
+  bool RunGroupedGemm1ThenExpertGemm2Tc(
+      const uint8_t* hidden_fp8_dev, const float* hidden_scale_dev, int64_t t, int total_rows,
+      const int* expert_offsets_dev, const int* expert_counts_host,
+      const int* expert_offsets_host, const int* permuted_tok_dev,
+      const float* permuted_w_dev, const uint8_t* gemm1_w_dev,
+      const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
+      const float* gemm2_s_dev, float* out_acc_dev, cudaStream_t stream,
+      bool direct_output = false, const int* routed_positions_dev = nullptr,
+      const int* routed_local_experts_dev = nullptr, const float* routed_weights_dev = nullptr,
+      uint16_t* output_dev = nullptr);
+  bool RunExpertGemm1ThenGroupedGemm2Tc(
+      const uint8_t* hidden_fp8_dev, const float* hidden_scale_dev, int64_t t, int total_rows,
+      const int* expert_offsets_dev, const int* expert_counts_host,
+      const int* expert_offsets_host, const int* permuted_tok_dev,
+      const int* permuted_expert_dev, const float* permuted_w_dev, const uint8_t* gemm1_w_dev,
+      const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
+      const float* gemm2_s_dev, float* out_acc_dev, cudaStream_t stream);
 
  private:
   void EnsureTcWorkspace(int rows);
+  void RunExpertGemm2TcFromG1(int64_t t, int total_rows, int n_rows, int g1_row_offset,
+                              int scratch_row_offset, const int* permuted_tok_e,
+                              const float* permuted_w_e,
+                              int local_expert_idx, const uint8_t* gemm2_w_dev,
+                              const float* gemm2_s_dev, float* out_acc_dev,
+                              cudaStream_t stream, bool scatter_to_acc = true);
+  void WriteTcPaddedScratchToBf16Output(int64_t t, const int* expert_offsets_dev,
+                                        const int* padded_offsets_dev,
+                                        const int* routed_positions_dev,
+                                        const int* routed_local_experts_dev,
+                                        const float* routed_weights_dev, uint16_t* output_dev,
+                                        cudaStream_t stream);
 
   int hidden_;
   int intermediate_;
@@ -109,6 +104,7 @@ class DeviceMxfpGemmModule {
   bool emulate_fp8_unit_;
   bool emulate_fp16_operands_;
   bool emulate_acc_half_;
+  bool tc_fp16_middle_;
   float* g1_dev_;
   float* c_dev_;
   int tc_max_rows_;
@@ -118,15 +114,14 @@ class DeviceMxfpGemmModule {
   float* tc_a_scale_dev_;
   float* tc_b_scale_dev_;
   float* tc_g1_f32_dev_;
-  uint16_t* tc_g1_f16_dev_;
   uint8_t* tc_c_fp8_dev_;
   float* tc_c_scale_dev_;
-  uint16_t* tc_c_bf16_dev_;
-  uint16_t* tc_b_bf16_dev_;
   float* tc_d_f32_dev_;
   int* tc_m_indptr_dev_;
   void* tc_int_workspace_dev_;
   void* tc_float_workspace_dev_;
+  void* tc_group_int_workspace_dev_;
+  void* tc_group_float_workspace_dev_;
 };
 
 }  // namespace mxfp

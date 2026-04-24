@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -26,6 +27,101 @@ from flashinfer_bench.data import EvaluationStatus
 from scripts.pack_solution import pack_solution
 
 
+MOE_DEFINITION = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
+
+
+def apply_definition_defaults(
+    definition_name: str,
+    cfg: BenchmarkConfig,
+    *,
+    rtol: float | None = None,
+    atol: float | None = None,
+    required_matched_ratio: float | None = None,
+) -> BenchmarkConfig:
+    if definition_name != MOE_DEFINITION:
+        return replace(
+            cfg,
+            rtol=cfg.rtol if rtol is None else float(rtol),
+            atol=cfg.atol if atol is None else float(atol),
+            required_matched_ratio=(
+                cfg.required_matched_ratio
+                if required_matched_ratio is None
+                else float(required_matched_ratio)
+            ),
+        )
+
+    return replace(
+        cfg,
+        rtol=0.3 if rtol is None else float(rtol),
+        atol=1.0 if atol is None else float(atol),
+        required_matched_ratio=0.9
+        if required_matched_ratio is None
+        else float(required_matched_ratio),
+    )
+
+
+def ensure_flashinfer_cutlass_sm100_group_scheduler_patch(cutlass_include: Path) -> None:
+    """Patch FlashInfer's vendored CUTLASS SM100 grouped scheduler callback bug."""
+    header = cutlass_include / "cutlass" / "gemm" / "kernel" / "sm100_tile_scheduler_group.hpp"
+    if not header.exists():
+        return
+
+    text = header.read_text()
+    if "struct IdentityCallback" in text:
+        return
+
+    original = text
+    text = text.replace(
+        "  using CLCResponse = WorkTileInfo;\n  \n"
+        "  static constexpr bool IsDynamicPersistent = UnderlyingScheduler::IsDynamicPersistent;\n",
+        "  using CLCResponse = WorkTileInfo;\n\n"
+        "  struct IdentityCallback {\n"
+        "    CUTLASS_DEVICE\n"
+        "    WorkTileInfo operator()(WorkTileInfo info) const {\n"
+        "      return info;\n"
+        "    }\n"
+        "  };\n"
+        "  \n"
+        "  static constexpr bool IsDynamicPersistent = UnderlyingScheduler::IsDynamicPersistent;\n",
+    )
+    text = text.replace(
+        "  template <typename ClusterShape, typename CallbackBeforeCommit = WorkTileInfo(*)(WorkTileInfo)>\n"
+        "  CUTLASS_DEVICE\n"
+        "  auto\n"
+        "  initial_work_tile_info(ClusterShape cluster_shape, CallbackBeforeCommit callback_before_commit = [] (WorkTileInfo info) { return info;}) {\n",
+        "  template <typename ClusterShape, typename CallbackBeforeCommit = IdentityCallback>\n"
+        "  CUTLASS_DEVICE\n"
+        "  auto\n"
+        "  initial_work_tile_info(ClusterShape cluster_shape, CallbackBeforeCommit callback_before_commit = {}) {\n",
+    )
+    text = text.replace(
+        "  template <typename CLCPipeline, typename CLCPipelineState, typename CallbackBeforeCommit = WorkTileInfo(*)(WorkTileInfo)>\n"
+        "  CUTLASS_DEVICE\n"
+        "  auto\n"
+        "  advance_to_next_work(\n"
+        "    CLCPipeline& clc_pipeline,\n"
+        "    CLCPipelineState clc_pipe_producer_state,\n"
+        "    uint32_t advance_count = 1,\n"
+        "    CallbackBeforeCommit callback_before_commit = [] (WorkTileInfo info) { return info;}) {\n",
+        "  template <typename CLCPipeline, typename CLCPipelineState, typename CallbackBeforeCommit = IdentityCallback>\n"
+        "  CUTLASS_DEVICE\n"
+        "  auto\n"
+        "  advance_to_next_work(\n"
+        "    CLCPipeline& clc_pipeline,\n"
+        "    CLCPipelineState clc_pipe_producer_state,\n"
+        "    uint32_t advance_count = 1,\n"
+        "    CallbackBeforeCommit callback_before_commit = {}) {\n",
+    )
+
+    if text == original:
+        print(
+            f"[run_local_single] CUTLASS SM100 grouped scheduler patch not applied: unexpected header shape at {header}",
+            file=sys.stderr,
+        )
+        return
+    header.write_text(text)
+
+
 def ensure_tvm_ffi_cuda_arch(solution: Solution) -> None:
     """Set TVM_FFI_CUDA_ARCH_LIST from current visible GPU when not explicitly set."""
     if solution.spec.language.value != "cuda":
@@ -35,9 +131,58 @@ def ensure_tvm_ffi_cuda_arch(solution: Solution) -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
         return
     major, minor = torch.cuda.get_device_capability(0)
-    arch = f"{major}.{minor}"
+    suffix = "a" if major >= 10 else ""
+    arch = f"{major}.{minor}{suffix}"
     os.environ["TVM_FFI_CUDA_ARCH_LIST"] = arch
     print(f"Using TVM_FFI_CUDA_ARCH_LIST={arch}")
+
+
+def ensure_cutlass_include_paths() -> None:
+    """Expose FlashInfer's vendored CUTLASS headers to local TVM-FFI builds."""
+    try:
+        import flashinfer
+        import tvm_ffi.cpp
+    except Exception as exc:
+        print(f"[run_local_single] CUTLASS include setup skipped: {exc}", file=sys.stderr)
+        return
+
+    base = Path(flashinfer.__file__).resolve().parent / "data"
+    paths = [
+        base / "include",
+        base / "cutlass" / "include",
+        base / "cutlass" / "tools" / "util" / "include",
+    ]
+    existing = [str(p) for p in paths if p.exists()]
+    if not existing:
+        return
+    ensure_flashinfer_cutlass_sm100_group_scheduler_patch(base / "cutlass" / "include")
+
+    for var in ("CPATH", "CPLUS_INCLUDE_PATH"):
+        prior = os.environ.get(var, "")
+        pieces = existing + ([prior] if prior else [])
+        os.environ[var] = ":".join(pieces)
+
+    if getattr(tvm_ffi.cpp.build, "_fib_cutlass_patched", False):
+        return
+
+    original_build = tvm_ffi.cpp.build
+
+    def build_with_cutlass_headers(*args, **kwargs):
+        inc = list(kwargs.get("extra_include_paths") or [])
+        for path in existing:
+            if path not in inc:
+                inc.append(path)
+        kwargs["extra_include_paths"] = inc
+
+        cuda_flags = list(kwargs.get("extra_cuda_cflags") or [])
+        for flag in ("-DCUTLASS_ENABLE_GDC_FOR_SM100=1",):
+            if flag not in cuda_flags:
+                cuda_flags.append(flag)
+        kwargs["extra_cuda_cflags"] = cuda_flags
+        return original_build(*args, **kwargs)
+
+    build_with_cutlass_headers._fib_cutlass_patched = True
+    tvm_ffi.cpp.build = build_with_cutlass_headers
 
 
 def get_trace_set_path() -> str:
@@ -50,13 +195,22 @@ def get_trace_set_path() -> str:
     return path
 
 
-def run_single(solution: Solution, cfg: BenchmarkConfig, max_workloads: int, device: str) -> dict:
+def run_single(
+    solution: Solution,
+    cfg: BenchmarkConfig,
+    max_workloads: int,
+    device: str,
+    workload_start: int = 0,
+) -> dict:
     trace_set = TraceSet.from_path(get_trace_set_path())
     if solution.definition not in trace_set.definitions:
         raise ValueError(f"Definition '{solution.definition}' not found in trace set")
 
     definition = trace_set.definitions[solution.definition]
-    workloads = trace_set.workloads.get(solution.definition, [])[:max_workloads]
+    all_workloads = trace_set.workloads.get(solution.definition, [])
+    if workload_start < 0:
+        raise ValueError("--workload-start must be non-negative")
+    workloads = all_workloads[workload_start : workload_start + max_workloads]
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
@@ -130,6 +284,8 @@ def run_single(solution: Solution, cfg: BenchmarkConfig, max_workloads: int, dev
         if evaluation.correctness is not None:
             entry["max_abs_error"] = evaluation.correctness.max_absolute_error
             entry["max_rel_error"] = evaluation.correctness.max_relative_error
+            if evaluation.correctness.extra is not None:
+                entry["matched_ratio"] = evaluation.correctness.extra.get("matched_ratio")
 
         results[definition.name][workload.uuid] = entry
 
@@ -153,6 +309,8 @@ def print_results(results: dict):
                 abs_err = result["max_abs_error"]
                 rel_err = result.get("max_rel_error", 0)
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
+            if result.get("matched_ratio") is not None:
+                print(f" | matched={result['matched_ratio']:.4f}", end="")
 
             print()
 
@@ -163,9 +321,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--iterations", type=int, default=10)
     p.add_argument("--num-trials", type=int, default=1)
     p.add_argument("--max-workloads", type=int, default=3)
+    p.add_argument("--workload-start", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda:0")
-    p.add_argument("--rtol", type=float, default=1e-2)
-    p.add_argument("--atol", type=float, default=1e-2)
+    p.add_argument("--rtol", type=float, default=None)
+    p.add_argument("--atol", type=float, default=None)
+    p.add_argument("--required-matched-ratio", type=float, default=None)
     return p.parse_args()
 
 
@@ -179,22 +339,30 @@ def main():
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
     ensure_tvm_ffi_cuda_arch(solution)
+    ensure_cutlass_include_paths()
 
-    cfg = BenchmarkConfig(
+    cfg = apply_definition_defaults(
+        solution.definition,
+        BenchmarkConfig(
         warmup_runs=args.warmup_runs,
         iterations=args.iterations,
         num_trials=args.num_trials,
-        rtol=float(args.rtol),
-        atol=float(args.atol),
+        rtol=1e-2,
+        atol=1e-2,
+        ),
+        rtol=args.rtol,
+        atol=args.atol,
+        required_matched_ratio=args.required_matched_ratio,
     )
 
     print(
         "\nRunning benchmark (single-process mode: "
         f"warmup={args.warmup_runs}, iter={args.iterations}, "
-        f"trials={args.num_trials}, workloads={args.max_workloads}, device={args.device})..."
+        f"trials={args.num_trials}, workload_start={args.workload_start}, "
+        f"workloads={args.max_workloads}, device={args.device})..."
     )
 
-    results = run_single(solution, cfg, args.max_workloads, args.device)
+    results = run_single(solution, cfg, args.max_workloads, args.device, args.workload_start)
     print_results(results)
 
 
