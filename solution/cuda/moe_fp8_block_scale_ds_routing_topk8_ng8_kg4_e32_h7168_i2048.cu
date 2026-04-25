@@ -400,6 +400,110 @@ __global__ void routing_recompute_kernel(
   }
 }
 
+__global__ void routing_parallel_grouped_kernel(
+    const float* __restrict__ logits, const uint16_t* __restrict__ bias_bf16, int64_t t,
+    int local_expert_offset, float routed_scaling_factor, int* __restrict__ expert_counts,
+    int* __restrict__ routed_local_experts, float* __restrict__ routed_weights,
+    int* __restrict__ routed_positions) {
+  int tok = blockIdx.x;
+  int tid = threadIdx.x;
+  if (tok >= t || tid >= kNumExperts) return;
+
+  __shared__ float sigmoid_sh[kNumExperts];
+  __shared__ float score_sh[kNumExperts];
+  __shared__ float group_scores[kNumGroups];
+
+  const float* lrow = logits + static_cast<int64_t>(tok) * kNumExperts;
+  float sig = sigmoidf_device(lrow[tid]);
+  float score = sig + bf16_to_float_device(bias_bf16[tid]);
+  sigmoid_sh[tid] = sig;
+  score_sh[tid] = score;
+
+  int lane = tid & 31;
+  int group = tid >> 5;
+  float top1 = score;
+  float top2 = -INFINITY;
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    float o1 = __shfl_down_sync(0xffffffffu, top1, offset);
+    float o2 = __shfl_down_sync(0xffffffffu, top2, offset);
+    if (lane + offset < 32) {
+      if (o1 > top1) {
+        top2 = fmaxf(top1, top2);
+        top1 = o1;
+      } else {
+        top2 = fmaxf(top2, o1);
+      }
+      if (o2 > top1) {
+        top2 = top1;
+        top1 = o2;
+      } else {
+        top2 = fmaxf(top2, o2);
+      }
+    }
+  }
+  if (lane == 0) group_scores[group] = top1 + top2;
+  __syncthreads();
+
+  if (tid != 0) return;
+
+  TopKEntry grp[kTopKGroups] = {{-INFINITY, -1}, {-INFINITY, -1}, {-INFINITY, -1}, {-INFINITY, -1}};
+  for (int g = 0; g < kNumGroups; ++g) {
+    if (group_scores[g] > grp[3].val) {
+      grp[3] = {group_scores[g], g};
+      for (int i = 3; i > 0 && grp[i].val > grp[i - 1].val; --i) {
+        TopKEntry tmp = grp[i];
+        grp[i] = grp[i - 1];
+        grp[i - 1] = tmp;
+      }
+    }
+  }
+
+  bool keep[kNumGroups] = {false, false, false, false, false, false, false, false};
+  for (int i = 0; i < kTopKGroups; ++i) {
+    if (grp[i].idx >= 0) keep[grp[i].idx] = true;
+  }
+
+  TopKEntry topk[kTopK] = {
+      {-INFINITY, -1}, {-INFINITY, -1}, {-INFINITY, -1}, {-INFINITY, -1},
+      {-INFINITY, -1}, {-INFINITY, -1}, {-INFINITY, -1}, {-INFINITY, -1},
+  };
+  for (int e = 0; e < kNumExperts; ++e) {
+    if (!keep[e / kGroupSize]) continue;
+    insert_topk8_device(topk, score_sh[e], e);
+  }
+
+  float wsum = 1e-20f;
+  for (int i = 0; i < kTopK; ++i) {
+    if (topk[i].idx >= 0) wsum += sigmoid_sh[topk[i].idx];
+  }
+
+  int* routed_le_row = routed_local_experts + static_cast<int64_t>(tok) * kTopK;
+  float* routed_w_row = routed_weights + static_cast<int64_t>(tok) * kTopK;
+  int* routed_pos_row = routed_positions + static_cast<int64_t>(tok) * kTopK;
+#pragma unroll
+  for (int i = 0; i < kTopK; ++i) {
+    routed_le_row[i] = -1;
+    routed_w_row[i] = 0.0f;
+    routed_pos_row[i] = -1;
+  }
+
+  int local_slot = 0;
+  for (int i = 0; i < kTopK; ++i) {
+    int ge = topk[i].idx;
+    if (ge < 0) continue;
+    int le = ge - local_expert_offset;
+    if (0 <= le && le < kNumLocalExperts) {
+      float w = (sigmoid_sh[ge] / wsum) * routed_scaling_factor;
+      routed_le_row[local_slot] = le;
+      routed_w_row[local_slot] = w;
+      atomicAdd(&expert_counts[le], 1);
+      ++local_slot;
+      if (local_slot == kTopK) break;
+    }
+  }
+}
+
 __global__ void dequant_hidden_kernel(const uint8_t* __restrict__ hidden_fp8,
                                       const float* __restrict__ hidden_scale, int64_t t,
                                       float* __restrict__ a_out) {
@@ -474,12 +578,28 @@ __global__ void scatter_topk_placements_kernel(const int* __restrict__ routed_lo
   if (tok >= t) return;
   const int* le_row = routed_local_experts + static_cast<int64_t>(tok) * kTopK;
   const float* w_row = routed_weights + static_cast<int64_t>(tok) * kTopK;
+  const int lane = threadIdx.x & 31;
+  bool done = false;
   #pragma unroll
   for (int i = 0; i < kTopK; ++i) {
-    int le = le_row[i];
-    if (le < 0) break;
+    int le = done ? -1 : le_row[i];
+    if (le < 0) done = true;
+    const unsigned active_mask = __activemask();
+    const unsigned valid_mask = __ballot_sync(active_mask, !done);
+    if (valid_mask == 0) break;
+    unsigned same_expert = __match_any_sync(active_mask, le) & valid_mask;
+    int slot = 0;
+    if (!done) {
+      const int leader = __ffs(same_expert) - 1;
+      const int rank = __popc(same_expert & ((1u << lane) - 1u));
+      const int count = __popc(same_expert);
+      int slot_base = 0;
+      if (lane == leader) slot_base = atomicAdd(&running_counter[le], count);
+      slot_base = __shfl_sync(same_expert, slot_base, leader);
+      slot = slot_base + rank;
+    }
+    if (done) continue;
     float w = w_row[i];
-    int slot = atomicAdd(&running_counter[le], 1);
     int pos = expert_offsets[le] + slot;
     permuted_token_ids[pos] = tok;
     if (permuted_expert_ids != nullptr) permuted_expert_ids[pos] = le;
@@ -726,7 +846,19 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
         !routing_recompute_disabled &&
         ((env_routing_recompute != nullptr && env_routing_recompute[0] == '1') ||
          (routing_recompute_min_t > 0 && t >= routing_recompute_min_t));
-    if (routing_recompute_enabled) {
+    const int parallel_routing_max_t =
+        std::max(0, env_int("FIB_MOE_PARALLEL_ROUTING_MAX_T", 128));
+    const bool parallel_routing_enabled =
+        kGrouped && !routing_recompute_enabled && parallel_routing_max_t > 0 &&
+        t <= parallel_routing_max_t;
+    if (parallel_routing_enabled) {
+      routing_parallel_grouped_kernel<<<static_cast<int>(t), kNumExperts, 0, stream>>>(
+          static_cast<const float*>(routing_logits.data_ptr()),
+          static_cast<const uint16_t*>(routing_bias.data_ptr()), t,
+          static_cast<int>(local_expert_offset), static_cast<float>(routed_scaling_factor),
+          expert_counts_dev, routed_local_experts_dev, routed_weights_topk_dev,
+          routed_positions_dev);
+    } else if (routing_recompute_enabled) {
       if (kGrouped) {
         routing_recompute_kernel<true><<<routing_blocks, kRoutingThreads, 0, stream>>>(
             static_cast<const float*>(routing_logits.data_ptr()),

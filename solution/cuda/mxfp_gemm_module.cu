@@ -142,7 +142,7 @@ int select_direct_output_threads(int64_t t) {
 
 bool use_vec16_hidden_gather(int rows) {
   const char* env_min_rows = std::getenv("FIB_MOE_HIDDEN_GATHER_VEC16_MIN_ROWS");
-  int min_rows = env_min_rows == nullptr ? 1024 : std::max(0, std::atoi(env_min_rows));
+  int min_rows = env_min_rows == nullptr ? 0 : std::max(0, std::atoi(env_min_rows));
   return rows >= min_rows;
 }
 

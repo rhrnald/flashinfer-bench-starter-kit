@@ -6,6 +6,7 @@ reference/solution directly in the current process.
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -28,6 +29,7 @@ from scripts.pack_solution import pack_solution
 
 
 MOE_DEFINITION = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
+DEFAULT_FIXED_BASELINE_CACHE = PROJECT_ROOT / "experiments" / "moe_flashinfer_baseline_fixed.json"
 
 
 def apply_definition_defaults(
@@ -292,7 +294,16 @@ def run_single(
     return results
 
 
-def print_results(results: dict):
+def load_fixed_baseline_cache(path: Path) -> dict[str, float]:
+    data = json.loads(path.read_text())
+    rows = data.get("rows")
+    if not isinstance(rows, list):
+        raise ValueError(f"Invalid fixed baseline cache: {path}")
+    return {row["workload_uuid"]: float(row["baseline_ms"]) for row in rows}
+
+
+def print_results(results: dict, fixed_baseline_ms: dict[str, float] | None = None):
+    fixed_speedups = []
     for def_name, traces in results.items():
         print(f"\n{def_name}:")
         for workload_uuid, result in traces.items():
@@ -305,6 +316,17 @@ def print_results(results: dict):
             if result.get("speedup_factor") is not None:
                 print(f" | {result['speedup_factor']:.2f}x speedup", end="")
 
+            if fixed_baseline_ms is not None and result.get("latency_ms") is not None:
+                base_ms = fixed_baseline_ms.get(workload_uuid)
+                if base_ms is not None:
+                    fixed_speedup = base_ms / result["latency_ms"]
+                    fixed_speedups.append(fixed_speedup)
+                    print(
+                        f" | fixed_base={base_ms:.3f} ms"
+                        f" | fixed_speedup={fixed_speedup:.3f}x",
+                        end="",
+                    )
+
             if result.get("max_abs_error") is not None:
                 abs_err = result["max_abs_error"]
                 rel_err = result.get("max_rel_error", 0)
@@ -313,6 +335,12 @@ def print_results(results: dict):
                 print(f" | matched={result['matched_ratio']:.4f}", end="")
 
             print()
+
+    if fixed_speedups:
+        print(
+            f"\nFixed-baseline mean speedup over selected workloads: "
+            f"{sum(fixed_speedups) / len(fixed_speedups):.4f}x"
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -326,6 +354,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rtol", type=float, default=None)
     p.add_argument("--atol", type=float, default=None)
     p.add_argument("--required-matched-ratio", type=float, default=None)
+    p.add_argument(
+        "--compare-fixed-baseline",
+        action="store_true",
+        help="Print speedup against a fixed FlashInfer baseline cache.",
+    )
+    p.add_argument(
+        "--fixed-baseline-cache",
+        type=Path,
+        default=DEFAULT_FIXED_BASELINE_CACHE,
+        help="Path to fixed baseline JSON used by --compare-fixed-baseline.",
+    )
     return p.parse_args()
 
 
@@ -362,8 +401,19 @@ def main():
         f"workloads={args.max_workloads}, device={args.device})..."
     )
 
+    fixed_baseline_ms = None
+    if args.compare_fixed_baseline:
+        if not args.fixed_baseline_cache.exists():
+            raise FileNotFoundError(
+                f"Fixed baseline cache not found: {args.fixed_baseline_cache}. "
+                "Create it with scripts/sweep_moe_baseline_variants.py "
+                "--refresh-baseline-cache first."
+            )
+        fixed_baseline_ms = load_fixed_baseline_cache(args.fixed_baseline_cache)
+        print(f"Using fixed baseline cache: {args.fixed_baseline_cache}")
+
     results = run_single(solution, cfg, args.max_workloads, args.device, args.workload_start)
-    print_results(results)
+    print_results(results, fixed_baseline_ms)
 
 
 if __name__ == "__main__":
