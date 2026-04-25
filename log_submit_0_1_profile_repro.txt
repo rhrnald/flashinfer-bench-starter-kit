@@ -1,0 +1,69 @@
+Selected implementation: direct
+Using random seed=1234
+Packing solution from source files...
+Solution packed: /home/snu_avq1/workspace/chaewon/flashinfer-bench-starter-kit/solution.json
+  Name: moe_fp8_cpu_ref_cuda
+  Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
+  Author: kplc
+  Language: cuda
+
+Loading solution...
+Loaded: moe_fp8_cpu_ref_cuda (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+Using TVM_FFI_CUDA_ARCH_LIST=10.0a
+
+Loading comparison solution...
+Loaded comparison: flashinfer_wrapper_9sdjf3 (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+
+Running benchmark (single-process mode: warmup=1, iter=5, trials=1, workloads=3, device=cuda:0, compare=flashinfer_wrapper_9sdjf3, correctness_only=False)...
+[1/2] Starting workload b8f4f012... 
+2026-04-25 11:42:02,986 - WARNING - core.py:2740 - flashinfer.jit: the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0.
+[mxfp] using direct B200 step kernels
+[moe_step1_timing] impl=direct seq_len=7 step1=0.187ms
+[moe_step2_timing] impl=direct seq_len=7 step2=0.141ms
+[moe_step_timing] seq_len=7 routing=1.015ms dequant=0.000ms expert=0.495ms out=0.017ms total=1.566ms
+[moe_step1_timing] impl=direct seq_len=7 step1=0.111ms
+[moe_step2_timing] impl=direct seq_len=7 step2=0.115ms
+[moe_step_timing] seq_len=7 routing=0.488ms dequant=0.000ms expert=0.342ms out=0.012ms total=0.855ms
+[moe_step1_timing] impl=direct seq_len=7 step1=0.102ms
+[moe_step2_timing] impl=direct seq_len=7 step2=0.115ms
+[moe_step_timing] seq_len=7 routing=0.089ms dequant=0.000ms expert=0.294ms out=0.011ms total=0.401ms
+[moe_step1_timing] impl=direct seq_len=7 step1=0.101ms
+[moe_step2_timing] impl=direct seq_len=7 step2=0.112ms
+[moe_step_timing] seq_len=7 routing=0.091ms dequant=0.000ms expert=0.299ms out=0.011ms total=0.408ms
+[moe_step1_timing] impl=direct seq_len=7 step1=0.100ms
+[moe_step2_timing] impl=direct seq_len=7 step2=0.116ms
+[moe_step_timing] seq_len=7 routing=0.088ms dequant=0.000ms expert=0.290ms out=0.011ms total=0.394ms
+[moe_step1_timing] impl=direct seq_len=7 step1=0.104ms
+[moe_step2_timing] impl=direct seq_len=7 step2=0.113ms
+[moe_step_timing] seq_len=7 routing=0.090ms dequant=0.000ms expert=0.293ms out=0.011ms total=0.401ms
+[moe_step1_timing] impl=direct seq_len=7 step1=0.102ms
+[moe_step2_timing] impl=direct seq_len=7 step2=0.114ms
+[moe_step_timing] seq_len=7 routing=0.087ms dequant=0.000ms expert=0.294ms out=0.011ms total=0.398ms
+[1/2] Finished workload b8f4f012... status=PASSED elapsed=0.54s
+[2/2] Starting workload e05c6c03... 
+[moe_step1_timing] impl=direct seq_len=1 step1=0.057ms
+[moe_step2_timing] impl=direct seq_len=1 step2=0.061ms
+[moe_step_timing] seq_len=1 routing=0.065ms dequant=0.000ms expert=0.215ms out=0.010ms total=0.300ms
+[moe_step1_timing] impl=direct seq_len=1 step1=0.058ms
+[moe_step2_timing] impl=direct seq_len=1 step2=0.062ms
+[moe_step_timing] seq_len=1 routing=0.518ms dequant=0.000ms expert=0.196ms out=0.010ms total=0.732ms
+[moe_step1_timing] impl=direct seq_len=1 step1=0.057ms
+[moe_step2_timing] impl=direct seq_len=1 step2=0.060ms
+[moe_step_timing] seq_len=1 routing=0.065ms dequant=0.000ms expert=0.188ms out=0.009ms total=0.269ms
+[moe_step1_timing] impl=direct seq_len=1 step1=0.057ms
+[moe_step2_timing] impl=direct seq_len=1 step2=0.062ms
+[moe_step_timing] seq_len=1 routing=0.066ms dequant=0.000ms expert=0.188ms out=0.009ms total=0.269ms
+[moe_step1_timing] impl=direct seq_len=1 step1=0.057ms
+[moe_step2_timing] impl=direct seq_len=1 step2=0.061ms
+[moe_step_timing] seq_len=1 routing=0.064ms dequant=0.000ms expert=0.192ms out=0.010ms total=0.271ms
+[moe_step1_timing] impl=direct seq_len=1 step1=0.059ms
+[moe_step2_timing] impl=direct seq_len=1 step2=0.062ms
+[moe_step_timing] seq_len=1 routing=0.067ms dequant=0.000ms expert=0.193ms out=0.010ms total=0.276ms
+[moe_step1_timing] impl=direct seq_len=1 step1=0.057ms
+[moe_step2_timing] impl=direct seq_len=1 step2=0.061ms
+[moe_step_timing] seq_len=1 routing=0.064ms dequant=0.000ms expert=0.191ms out=0.009ms total=0.270ms
+[2/2] Finished workload e05c6c03... status=PASSED elapsed=0.09s
+
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
+  Workload b8f4f012...: PASSED | 0.409 ms | 0.57x speedup | abs_err=3.73e+05, rel_err=8.77e+02
+  Workload e05c6c03...: PASSED | 0.279 ms | 0.67x speedup | abs_err=2.76e+05, rel_err=5.02e+03

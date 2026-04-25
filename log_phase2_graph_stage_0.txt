@@ -1,0 +1,36 @@
+Selected implementation: direct
+Using random seed=1234
+Packing solution from source files...
+Solution packed: /home/snu_avq1/workspace/chaewon/flashinfer-bench-starter-kit/solution.json
+  Name: moe_fp8_cpu_ref_cuda
+  Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
+  Author: kplc
+  Language: cuda
+
+Loading solution...
+Loaded: moe_fp8_cpu_ref_cuda (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+Using TVM_FFI_CUDA_ARCH_LIST=10.0a
+
+Loading comparison solution...
+Loaded comparison: flashinfer_wrapper_9sdjf3 (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+
+Running benchmark (single-process mode: warmup=0, iter=1, trials=1, workloads=3, device=cuda:0, compare=flashinfer_wrapper_9sdjf3, correctness_only=False)...
+[1/1] Starting workload e05c6c03... 
+2026-04-25 14:50:19,114 - WARNING - core.py:2740 - flashinfer.jit: the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0.
+[mxfp] using direct B200 step kernels
+Traceback (most recent call last):
+  File "/home/snu_avq1/miniconda3/envs/fi-bench/lib/python3.12/site-packages/flashinfer_bench/bench/evaluators/lowbit.py", line 53, in check_correctness
+    sol_runnable(*inp, *out)
+  File "/home/snu_avq1/miniconda3/envs/fi-bench/lib/python3.12/site-packages/flashinfer_bench/compile/runnable.py", line 95, in __call__
+    ret = self._callable(*args)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "python/tvm_ffi/cython/function.pxi", line 929, in tvm_ffi.core.Function.__call__
+  File "<unknown>", line 0, in __tvm_ffi_moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
+  File "/home/snu_avq1/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_moe_fp8_cpu_ref_cuda_f3b384/moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.cu", line 1051, in void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, int64_t, double, tvm::ffi::TensorView)
+    TVM_FFI_ICHECK_EQ(graph_status, cudaSuccess)
+    
+RuntimeError: Check failed: graph_status == cudaSuccess (900 vs. 0) : small direct CUDA graph launch failed: operation not permitted when stream is capturing
+[1/1] Finished workload e05c6c03... status=RUNTIME_ERROR elapsed=1.32s
+
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
+  Workload e05c6c03...: RUNTIME_ERROR

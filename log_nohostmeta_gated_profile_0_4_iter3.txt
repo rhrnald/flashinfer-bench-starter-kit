@@ -1,0 +1,111 @@
+Selected implementation: direct
+Using random seed=1234
+Packing solution from source files...
+Solution packed: /home/snu_avq1/workspace/chaewon/flashinfer-bench-starter-kit/solution.json
+  Name: moe_fp8_cpu_ref_cuda
+  Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
+  Author: kplc
+  Language: cuda
+
+Loading solution...
+Loaded: moe_fp8_cpu_ref_cuda (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+Using TVM_FFI_CUDA_ARCH_LIST=10.0a
+
+Loading comparison solution...
+Loaded comparison: flashinfer_wrapper_9sdjf3 (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+
+Running benchmark (single-process mode: warmup=1, iter=3, trials=1, workloads=3, device=cuda:0, compare=flashinfer_wrapper_9sdjf3, correctness_only=False)...
+[1/5] Starting workload b8f4f012... 
+2026-04-25 14:01:43,226 - WARNING - core.py:2740 - flashinfer.jit: the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0.
+[mxfp] using direct B200 step kernels
+[moe_step1_timing] impl=direct seq_len=7 step1=0.182ms
+[moe_step2_timing] impl=direct seq_len=7 step2=0.128ms
+[moe_step_timing] seq_len=7 routing=1.145ms dequant=0.000ms expert=0.427ms out=0.017ms total=1.636ms
+[moe_step1_timing] impl=direct seq_len=7 step1=0.109ms
+[moe_step2_timing] impl=direct seq_len=7 step2=0.098ms
+[moe_step_timing] seq_len=7 routing=0.483ms dequant=0.000ms expert=0.287ms out=0.011ms total=0.793ms
+[moe_step1_timing] impl=direct seq_len=7 step1=0.101ms
+[moe_step2_timing] impl=direct seq_len=7 step2=0.096ms
+[moe_step_timing] seq_len=7 routing=0.089ms dequant=0.000ms expert=0.236ms out=0.010ms total=0.342ms
+[moe_step1_timing] impl=direct seq_len=7 step1=0.102ms
+[moe_step2_timing] impl=direct seq_len=7 step2=0.099ms
+[moe_step_timing] seq_len=7 routing=0.090ms dequant=0.000ms expert=0.256ms out=0.010ms total=0.361ms
+[moe_step1_timing] impl=direct seq_len=7 step1=0.102ms
+[moe_step2_timing] impl=direct seq_len=7 step2=0.098ms
+[moe_step_timing] seq_len=7 routing=0.087ms dequant=0.000ms expert=0.256ms out=0.010ms total=0.358ms
+[1/5] Finished workload b8f4f012... status=PASSED elapsed=0.52s
+[2/5] Starting workload e05c6c03... 
+[moe_step1_timing] impl=direct seq_len=1 step1=0.061ms
+[moe_step2_timing] impl=direct seq_len=1 step2=0.060ms
+[moe_step_timing] seq_len=1 routing=0.066ms dequant=0.000ms expert=0.186ms out=0.010ms total=0.272ms
+[moe_step1_timing] impl=direct seq_len=1 step1=0.061ms
+[moe_step2_timing] impl=direct seq_len=1 step2=0.060ms
+[moe_step_timing] seq_len=1 routing=0.514ms dequant=0.000ms expert=0.179ms out=0.009ms total=0.710ms
+[moe_step1_timing] impl=direct seq_len=1 step1=0.057ms
+[moe_step2_timing] impl=direct seq_len=1 step2=0.061ms
+[moe_step_timing] seq_len=1 routing=0.066ms dequant=0.000ms expert=0.153ms out=0.009ms total=0.234ms
+[moe_step1_timing] impl=direct seq_len=1 step1=0.060ms
+[moe_step2_timing] impl=direct seq_len=1 step2=0.061ms
+[moe_step_timing] seq_len=1 routing=0.066ms dequant=0.000ms expert=0.174ms out=0.010ms total=0.256ms
+[moe_step1_timing] impl=direct seq_len=1 step1=0.058ms
+[moe_step2_timing] impl=direct seq_len=1 step2=0.061ms
+[moe_step_timing] seq_len=1 routing=0.065ms dequant=0.000ms expert=0.173ms out=0.009ms total=0.252ms
+[2/5] Finished workload e05c6c03... status=PASSED elapsed=0.07s
+[3/5] Starting workload 6230e838... 
+[moe_step1_timing] impl=direct seq_len=32 step1=0.440ms
+[moe_step2_timing] impl=direct seq_len=32 step2=0.287ms
+[moe_step_timing] seq_len=32 routing=0.110ms dequant=0.000ms expert=0.777ms out=0.011ms total=0.981ms
+[moe_step1_timing] impl=direct seq_len=32 step1=0.263ms
+[moe_step2_timing] impl=direct seq_len=32 step2=0.274ms
+[moe_step_timing] seq_len=32 routing=0.563ms dequant=0.000ms expert=0.601ms out=0.011ms total=1.180ms
+[moe_step1_timing] impl=direct seq_len=32 step1=0.262ms
+[moe_step2_timing] impl=direct seq_len=32 step2=0.280ms
+[moe_step_timing] seq_len=32 routing=0.109ms dequant=0.000ms expert=0.581ms out=0.010ms total=0.706ms
+[moe_step1_timing] impl=direct seq_len=32 step1=0.261ms
+[moe_step2_timing] impl=direct seq_len=32 step2=0.284ms
+[moe_step_timing] seq_len=32 routing=0.108ms dequant=0.000ms expert=0.604ms out=0.010ms total=0.727ms
+[moe_step1_timing] impl=direct seq_len=32 step1=0.259ms
+[moe_step2_timing] impl=direct seq_len=32 step2=0.274ms
+[moe_step_timing] seq_len=32 routing=0.108ms dequant=0.000ms expert=0.592ms out=0.010ms total=0.715ms
+[3/5] Finished workload 6230e838... status=PASSED elapsed=0.09s
+[4/5] Starting workload 8f1ff9f1... 
+[moe_step1_timing] impl=direct seq_len=80 step1=0.582ms
+[moe_step2_timing] impl=direct seq_len=80 step2=0.421ms
+[moe_step_timing] seq_len=80 routing=0.140ms dequant=0.000ms expert=1.079ms out=0.012ms total=1.491ms
+[moe_step1_timing] impl=direct seq_len=80 step1=0.343ms
+[moe_step2_timing] impl=direct seq_len=80 step2=0.426ms
+[moe_step_timing] seq_len=80 routing=0.594ms dequant=0.000ms expert=0.839ms out=0.011ms total=1.452ms
+[moe_step1_timing] impl=direct seq_len=80 step1=0.340ms
+[moe_step2_timing] impl=direct seq_len=80 step2=0.422ms
+[moe_step_timing] seq_len=80 routing=0.137ms dequant=0.000ms expert=0.809ms out=0.010ms total=0.963ms
+[moe_step1_timing] impl=direct seq_len=80 step1=0.346ms
+[moe_step2_timing] impl=direct seq_len=80 step2=0.417ms
+[moe_step_timing] seq_len=80 routing=0.136ms dequant=0.000ms expert=0.827ms out=0.010ms total=0.980ms
+[moe_step1_timing] impl=direct seq_len=80 step1=0.344ms
+[moe_step2_timing] impl=direct seq_len=80 step2=0.421ms
+[moe_step_timing] seq_len=80 routing=0.144ms dequant=0.000ms expert=0.830ms out=0.011ms total=0.990ms
+[4/5] Finished workload 8f1ff9f1... status=PASSED elapsed=0.10s
+[5/5] Starting workload 1a4c6ba1... 
+[moe_step1_timing] impl=direct seq_len=901 step1=2.395ms
+[moe_step2_timing] impl=direct seq_len=901 step2=2.605ms
+[moe_step_timing] seq_len=901 routing=0.155ms dequant=0.000ms expert=5.114ms out=0.025ms total=5.630ms
+[moe_step1_timing] impl=direct seq_len=901 step1=2.108ms
+[moe_step2_timing] impl=direct seq_len=901 step2=2.535ms
+[moe_step_timing] seq_len=901 routing=0.623ms dequant=0.000ms expert=4.749ms out=0.029ms total=5.409ms
+[moe_step1_timing] impl=direct seq_len=901 step1=2.103ms
+[moe_step2_timing] impl=direct seq_len=901 step2=2.590ms
+[moe_step_timing] seq_len=901 routing=0.158ms dequant=0.000ms expert=4.772ms out=0.025ms total=4.961ms
+[moe_step1_timing] impl=direct seq_len=901 step1=2.122ms
+[moe_step2_timing] impl=direct seq_len=901 step2=2.522ms
+[moe_step_timing] seq_len=901 routing=0.158ms dequant=0.000ms expert=4.743ms out=0.028ms total=4.935ms
+[moe_step1_timing] impl=direct seq_len=901 step1=2.109ms
+[moe_step2_timing] impl=direct seq_len=901 step2=2.542ms
+[moe_step_timing] seq_len=901 routing=0.158ms dequant=0.000ms expert=4.749ms out=0.025ms total=4.938ms
+[5/5] Finished workload 1a4c6ba1... status=PASSED elapsed=0.19s
+
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
+  Workload b8f4f012...: PASSED | 0.363 ms | 0.80x speedup | abs_err=3.12e+04, rel_err=8.77e+02
+  Workload e05c6c03...: PASSED | 0.255 ms | 0.78x speedup | abs_err=1.64e+04, rel_err=5.02e+03
+  Workload 6230e838...: PASSED | 0.724 ms | 0.43x speedup | abs_err=3.07e+04, rel_err=1.59e+11
+  Workload 8f1ff9f1...: PASSED | 0.986 ms | 0.41x speedup | abs_err=2.97e+04, rel_err=7.71e+03
+  Workload 1a4c6ba1...: PASSED | 4.953 ms | 0.09x speedup | abs_err=4.71e+04, rel_err=1.20e+12

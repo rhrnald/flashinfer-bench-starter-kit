@@ -1,0 +1,11 @@
+usage: run_local_single.py [-h] [--impl {reference,direct}]
+                           [--warmup-runs WARMUP_RUNS]
+                           [--iterations ITERATIONS] [--num-trials NUM_TRIALS]
+                           [--max-workloads MAX_WORKLOADS] [--device DEVICE]
+                           [--workload-indexes WORKLOAD_INDEXES]
+                           [--correctness-only]
+                           [--compare-target {baseline,reference}]
+                           [--compare-solution COMPARE_SOLUTION] [--seed SEED]
+                           [--rtol RTOL] [--atol ATOL]
+                           [--required-matched-ratio REQUIRED_MATCHED_RATIO]
+run_local_single.py: error: unrecognized arguments: --solution solution.json --workloads data/workloads --workload-id e05c6c03 --trials 1

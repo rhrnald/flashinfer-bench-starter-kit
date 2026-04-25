@@ -1,0 +1,36 @@
+Selected implementation: direct
+Using random seed=1234
+Packing solution from source files...
+Solution packed: /home/snu_avq1/workspace/chaewon/flashinfer-bench-starter-kit/solution.json
+  Name: moe_fp8_cpu_ref_cuda
+  Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
+  Author: kplc
+  Language: cuda
+
+Loading solution...
+Loaded: moe_fp8_cpu_ref_cuda (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+Using TVM_FFI_CUDA_ARCH_LIST=10.0a
+
+Loading comparison solution...
+Loaded comparison: flashinfer_wrapper_9sdjf3 (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+
+Running benchmark (single-process mode: warmup=1, iter=10, trials=1, workloads=3, device=cuda:0, compare=flashinfer_wrapper_9sdjf3, correctness_only=False)...
+[1/5] Starting workload b8f4f012... 
+2026-04-25 12:56:37,602 - WARNING - core.py:2740 - flashinfer.jit: the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0.
+[mxfp] using direct B200 step kernels
+[1/5] Finished workload b8f4f012... status=PASSED elapsed=0.62s
+[2/5] Starting workload e05c6c03... 
+[2/5] Finished workload e05c6c03... status=PASSED elapsed=0.16s
+[3/5] Starting workload 6230e838... 
+[3/5] Finished workload 6230e838... status=PASSED elapsed=0.20s
+[4/5] Starting workload 8f1ff9f1... 
+[4/5] Finished workload 8f1ff9f1... status=PASSED elapsed=0.23s
+[5/5] Starting workload 1a4c6ba1... 
+[5/5] Finished workload 1a4c6ba1... status=PASSED elapsed=0.38s
+
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
+  Workload b8f4f012...: PASSED | 0.373 ms | 0.62x speedup | abs_err=5.28e+05, rel_err=8.77e+02
+  Workload e05c6c03...: PASSED | 0.253 ms | 0.77x speedup | abs_err=3.22e+05, rel_err=5.02e+03
+  Workload 6230e838...: PASSED | 0.774 ms | 0.39x speedup | abs_err=6.14e+05, rel_err=1.59e+11
+  Workload 8f1ff9f1...: PASSED | 1.061 ms | 0.47x speedup | abs_err=5.65e+05, rel_err=7.71e+03
+  Workload 1a4c6ba1...: PASSED | 5.446 ms | 0.09x speedup | abs_err=4.71e+04, rel_err=1.20e+12

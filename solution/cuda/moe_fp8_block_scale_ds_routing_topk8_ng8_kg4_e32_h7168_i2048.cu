@@ -59,9 +59,10 @@ int ParseStep2PipelineVariant() {
   if (std::strcmp(env, "m64n8_k4_db_batch2") == 0) {
     return direct_backend::kStep2PipeM64N8K4DbBatch2;
   }
+  if (std::strcmp(env, "m64n16_k8_batch1") == 0) {
+    return direct_backend::kStep2PipeM64N16K8Batch1;
+  }
   if (std::strcmp(env, "m64n16_k8_db_batch2") == 0) {
-    // N16 is kept as a selector alias for sweep bookkeeping. A real N16 path
-    // needs wider partial/scaled TMEM than the current safe Step2 allocation.
     return direct_backend::kStep2PipeM64N16K8DbBatch2;
   }
   if (std::strcmp(env, "m64n16_k4_db_batch2") == 0) {
@@ -74,6 +75,31 @@ int ParseStep2PipelineVariant() {
     return direct_backend::kStep2PipeM128N8K8DbBatch2;
   }
   return direct_backend::kStep2PipeM64N8K8DbBatch2;
+}
+
+struct DirectSubmitConfig {
+  bool use_direct_impl;
+  bool use_direct_tma;
+  bool use_direct_tma_sw128;
+  bool use_direct_b_sw128;
+  bool measure_step1_comm_only;
+  int step2_pipeline_variant;
+};
+
+DirectSubmitConfig ParseDirectSubmitConfig() {
+  return {
+      UseDirectImplementation(),
+      std::getenv("FIB_MOE_COMM_USE_TMA") != nullptr,
+      std::getenv("FIB_MOE_DIRECT_TMA_SW128") != nullptr,
+      std::getenv("FIB_MOE_DIRECT_B_SW128") != nullptr,
+      std::getenv("FIB_MEASURE_STEP1_COMM_ONLY") != nullptr,
+      ParseStep2PipelineVariant(),
+  };
+}
+
+const DirectSubmitConfig& GetDirectSubmitConfig() {
+  static const DirectSubmitConfig cfg = ParseDirectSubmitConfig();
+  return cfg;
 }
 
 inline void CheckCuLocal(CUresult status, const char* where) {
@@ -411,9 +437,16 @@ __device__ __forceinline__ void insert_topk8_device(TopKEntry* topk, float v, in
 
 __global__ void routing_kernel(const float* __restrict__ logits, const uint16_t* __restrict__ bias_bf16,
                                int64_t t, int local_expert_offset, float routed_scaling_factor,
-                               float* __restrict__ local_weight) {
+                               float* __restrict__ local_weight,
+                               int* __restrict__ expert_counts) {
   int tok = blockIdx.x * blockDim.x + threadIdx.x;
   if (tok >= t) return;
+
+  float* lw_row = local_weight + static_cast<int64_t>(tok) * kNumLocalExperts;
+#pragma unroll
+  for (int le = 0; le < kNumLocalExperts; ++le) {
+    lw_row[le] = 0.0f;
+  }
 
   const float* lrow = logits + static_cast<int64_t>(tok) * kNumExperts;
   float s[kNumExperts];
@@ -474,7 +507,6 @@ __global__ void routing_kernel(const float* __restrict__ logits, const uint16_t*
     if (topk[i].idx >= 0) wsum += s[topk[i].idx];
   }
 
-  float* lw_row = local_weight + static_cast<int64_t>(tok) * kNumLocalExperts;
   for (int i = 0; i < kTopK; ++i) {
     int ge = topk[i].idx;
     if (ge < 0) continue;
@@ -482,6 +514,7 @@ __global__ void routing_kernel(const float* __restrict__ logits, const uint16_t*
     if (0 <= le && le < kNumLocalExperts) {
       float w = (s[ge] / wsum) * routed_scaling_factor;
       lw_row[le] = w;
+      atomicAdd(&expert_counts[le], 1);
     }
   }
 }
@@ -490,6 +523,21 @@ __global__ void f32_to_bf16_kernel(const float* __restrict__ in, int64_t n, uint
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= n) return;
   out[idx] = float_to_bf16_rne_device(in[idx]);
+}
+
+template <typename T>
+__global__ void fill_zero_kernel(T* __restrict__ data, int64_t n) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < n) data[idx] = T{0};
+}
+
+__global__ void clear_expert_metadata_kernel(int* __restrict__ expert_counts,
+                                             int* __restrict__ running_counter) {
+  int idx = threadIdx.x;
+  if (idx < kNumLocalExperts) {
+    expert_counts[idx] = 0;
+    running_counter[idx] = 0;
+  }
 }
 
 // Routing-metadata builder kernels. Input is the existing dense
@@ -685,6 +733,229 @@ struct MoeWorkspace {
   }
 };
 
+struct SmallDirectGraphKey {
+  int64_t t = 0;
+  int64_t local_expert_offset = 0;
+  float routed_scaling_factor = 0.0f;
+  int step2_pipeline_variant = 0;
+  bool use_direct_tma = false;
+  bool use_direct_tma_sw128 = false;
+  bool use_direct_b_sw128 = false;
+  const void* routing_logits = nullptr;
+  const void* routing_bias = nullptr;
+  const void* hidden_states = nullptr;
+  const void* hidden_states_scale = nullptr;
+  const void* gemm1_weights = nullptr;
+  const void* gemm1_weights_scale = nullptr;
+  const void* gemm2_weights = nullptr;
+  const void* gemm2_weights_scale = nullptr;
+  void* output = nullptr;
+  float* local_weight = nullptr;
+  float* out_acc = nullptr;
+  int* expert_counts = nullptr;
+  int* expert_offsets = nullptr;
+  int* running_counter = nullptr;
+  int* permuted_token_ids = nullptr;
+  float* permuted_weights = nullptr;
+  float* c_perm_all = nullptr;
+  uint8_t* c_perm_q = nullptr;
+  float* c_perm_scale = nullptr;
+  const void* step1_tma_desc = nullptr;
+  const void* step2_tma_desc = nullptr;
+};
+
+inline bool SameSmallDirectGraphKey(const SmallDirectGraphKey& a,
+                                    const SmallDirectGraphKey& b) {
+  return std::memcmp(&a, &b, sizeof(SmallDirectGraphKey)) == 0;
+}
+
+struct SmallDirectGraphCache {
+  bool valid = false;
+  SmallDirectGraphKey key{};
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t exec = nullptr;
+  cudaStream_t graph_stream = nullptr;
+  cudaEvent_t input_ready = nullptr;
+  cudaEvent_t graph_done = nullptr;
+
+  void Reset() {
+    if (exec != nullptr) {
+      cudaGraphExecDestroy(exec);
+      exec = nullptr;
+    }
+    if (graph != nullptr) {
+      cudaGraphDestroy(graph);
+      graph = nullptr;
+    }
+    valid = false;
+    key = SmallDirectGraphKey{};
+  }
+
+  cudaError_t EnsureRuntimeObjects() {
+    cudaError_t st = cudaSuccess;
+    if (graph_stream == nullptr) {
+      st = cudaStreamCreateWithFlags(&graph_stream, cudaStreamNonBlocking);
+      if (st != cudaSuccess) return st;
+    }
+    if (input_ready == nullptr) {
+      st = cudaEventCreateWithFlags(&input_ready, cudaEventDisableTiming);
+      if (st != cudaSuccess) return st;
+    }
+    if (graph_done == nullptr) {
+      st = cudaEventCreateWithFlags(&graph_done, cudaEventDisableTiming);
+      if (st != cudaSuccess) return st;
+    }
+    return cudaSuccess;
+  }
+};
+
+SmallDirectGraphCache g_small_direct_graph_cache;
+
+inline cudaError_t LaunchSmallDirectPipeline(
+    const SmallDirectGraphKey& key,
+    cudaStream_t stream) {
+  constexpr int kFillThreads = 256;
+  const int out_acc_elems = static_cast<int>(key.t * kHidden);
+  fill_zero_kernel<<<(out_acc_elems + kFillThreads - 1) / kFillThreads,
+                     kFillThreads, 0, stream>>>(key.out_acc, out_acc_elems);
+  clear_expert_metadata_kernel<<<1, kNumLocalExperts, 0, stream>>>(
+      key.expert_counts, key.running_counter);
+
+  constexpr int kRoutingThreads = 128;
+  const int routing_blocks = static_cast<int>((key.t + kRoutingThreads - 1) / kRoutingThreads);
+  routing_kernel<<<routing_blocks, kRoutingThreads, 0, stream>>>(
+      static_cast<const float*>(key.routing_logits),
+      static_cast<const uint16_t*>(key.routing_bias), key.t,
+      static_cast<int>(key.local_expert_offset), key.routed_scaling_factor,
+      key.local_weight, key.expert_counts);
+
+  constexpr int kMetaThreads = 128;
+  const int meta_blocks = static_cast<int>((key.t + kMetaThreads - 1) / kMetaThreads);
+  scan_offsets_kernel<<<1, 32, 0, stream>>>(key.expert_counts, key.expert_offsets);
+  scatter_placements_kernel<<<meta_blocks, kMetaThreads, 0, stream>>>(
+      key.local_weight, key.t, key.expert_offsets, key.running_counter,
+      key.permuted_token_ids, key.permuted_weights);
+
+  cudaError_t st = direct_backend::RunStep1AllExpertsDirect(
+      static_cast<const uint8_t*>(key.hidden_states),
+      static_cast<const float*>(key.hidden_states_scale),
+      key.t,
+      key.expert_counts,
+      key.expert_offsets,
+      key.permuted_token_ids,
+      nullptr,
+      0,
+      static_cast<const uint8_t*>(key.gemm1_weights),
+      static_cast<const float*>(key.gemm1_weights_scale),
+      key.step1_tma_desc,
+      0,
+      key.c_perm_all,
+      stream,
+      key.use_direct_tma && key.use_direct_tma_sw128,
+      key.use_direct_b_sw128,
+      2,
+      false);
+  if (st != cudaSuccess) {
+    return st;
+  }
+
+  const int total_routed = static_cast<int>(key.t * kTopK);
+  st = direct_backend::LaunchStep2PrequantCperm(
+      key.c_perm_all, total_routed, key.c_perm_q, key.c_perm_scale, stream, false);
+  if (st != cudaSuccess) {
+    return st;
+  }
+
+  st = direct_backend::LaunchStep2DirectAllExperts(
+      key.expert_counts,
+      key.expert_offsets,
+      key.permuted_token_ids,
+      key.permuted_weights,
+      nullptr,
+      0,
+      key.c_perm_q,
+      key.c_perm_scale,
+      static_cast<const uint8_t*>(key.gemm2_weights),
+      static_cast<const float*>(key.gemm2_weights_scale),
+      key.step2_tma_desc,
+      key.out_acc,
+      stream,
+      key.step2_pipeline_variant,
+      false);
+  if (st != cudaSuccess) {
+    return st;
+  }
+
+  constexpr int kOutThreads = 256;
+  const int64_t n_hidden = key.t * kHidden;
+  const int out_blocks = static_cast<int>((n_hidden + kOutThreads - 1) / kOutThreads);
+  f32_to_bf16_kernel<<<out_blocks, kOutThreads, 0, stream>>>(
+      key.out_acc, n_hidden, static_cast<uint16_t*>(key.output));
+  return cudaSuccess;
+}
+
+inline cudaError_t LaunchSmallDirectGraph(
+    const SmallDirectGraphKey& key,
+    cudaStream_t stream) {
+  cudaError_t st = g_small_direct_graph_cache.EnsureRuntimeObjects();
+  if (st != cudaSuccess) return st;
+  st = cudaEventRecord(g_small_direct_graph_cache.input_ready, stream);
+  if (st != cudaSuccess) return st;
+  st = cudaStreamWaitEvent(
+      g_small_direct_graph_cache.graph_stream,
+      g_small_direct_graph_cache.input_ready,
+      0);
+  if (st != cudaSuccess) return st;
+
+  if (g_small_direct_graph_cache.valid &&
+      SameSmallDirectGraphKey(g_small_direct_graph_cache.key, key)) {
+    st = cudaGraphLaunch(
+        g_small_direct_graph_cache.exec,
+        g_small_direct_graph_cache.graph_stream);
+    if (st != cudaSuccess) return st;
+    st = cudaEventRecord(
+        g_small_direct_graph_cache.graph_done,
+        g_small_direct_graph_cache.graph_stream);
+    if (st != cudaSuccess) return st;
+    return cudaStreamWaitEvent(stream, g_small_direct_graph_cache.graph_done, 0);
+  }
+
+  g_small_direct_graph_cache.Reset();
+  st = g_small_direct_graph_cache.EnsureRuntimeObjects();
+  if (st != cudaSuccess) return st;
+  st = cudaStreamBeginCapture(
+      g_small_direct_graph_cache.graph_stream,
+      cudaStreamCaptureModeGlobal);
+  if (st != cudaSuccess) return st;
+  st = LaunchSmallDirectPipeline(key, g_small_direct_graph_cache.graph_stream);
+  if (st != cudaSuccess) {
+    cudaGraph_t abandoned = nullptr;
+    cudaStreamEndCapture(g_small_direct_graph_cache.graph_stream, &abandoned);
+    if (abandoned != nullptr) cudaGraphDestroy(abandoned);
+    return st;
+  }
+  cudaGraph_t graph = nullptr;
+  st = cudaStreamEndCapture(g_small_direct_graph_cache.graph_stream, &graph);
+  if (st != cudaSuccess) return st;
+  cudaGraphExec_t exec = nullptr;
+  st = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+  if (st != cudaSuccess) {
+    cudaGraphDestroy(graph);
+    return st;
+  }
+  g_small_direct_graph_cache.graph = graph;
+  g_small_direct_graph_cache.exec = exec;
+  g_small_direct_graph_cache.key = key;
+  g_small_direct_graph_cache.valid = true;
+  st = cudaGraphLaunch(exec, g_small_direct_graph_cache.graph_stream);
+  if (st != cudaSuccess) return st;
+  st = cudaEventRecord(
+      g_small_direct_graph_cache.graph_done,
+      g_small_direct_graph_cache.graph_stream);
+  if (st != cudaSuccess) return st;
+  return cudaStreamWaitEvent(stream, g_small_direct_graph_cache.graph_done, 0);
+}
+
 }  // namespace
 
 void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
@@ -742,10 +1013,6 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   ws.ensure_core(t);
   float* local_weight_dev = ws.local_weight_dev;
   float* out_acc_dev = ws.out_acc_dev;
-
-  cudaMemsetAsync(local_weight_dev, 0, static_cast<size_t>(t) * kNumLocalExperts * sizeof(float), stream);
-  cudaMemsetAsync(out_acc_dev, 0, static_cast<size_t>(t) * kHidden * sizeof(float), stream);
-
   ws.ensure_grouped(t);
   int* expert_counts_dev = ws.expert_counts_dev;
   int* expert_offsets_dev = ws.expert_offsets_dev;
@@ -753,10 +1020,84 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   int* permuted_token_ids_dev = ws.permuted_token_ids_dev;
   int* active_experts_dev = ws.active_experts_dev;
   float* permuted_weights_dev = ws.permuted_weights_dev;
-  cudaMemsetAsync(expert_counts_dev, 0, kNumLocalExperts * sizeof(int), stream);
-  cudaMemsetAsync(running_counter_dev, 0, kNumLocalExperts * sizeof(int), stream);
-  const bool use_direct_impl = UseDirectImplementation();
+  const DirectSubmitConfig& direct_cfg = GetDirectSubmitConfig();
+  const bool use_direct_impl = direct_cfg.use_direct_impl;
   const bool need_step1_debug_dump = std::getenv("FIB_DEBUG_DUMP_STEP1_DIR") != nullptr;
+  const bool use_device_metadata_direct =
+      use_direct_impl && !need_step1_debug_dump && t <= 128;
+  const char* tcgen_accum_env = std::getenv("FIB_TCGEN_ACCUM");
+  const bool graph_step1_accum_ok =
+      tcgen_accum_env == nullptr ||
+      std::strcmp(tcgen_accum_env, "tf32_scale") == 0 ||
+      std::strcmp(tcgen_accum_env, "tmem_scale") == 0;
+  const bool can_use_small_direct_graph =
+      use_device_metadata_direct &&
+      !kProfile &&
+      !direct_cfg.measure_step1_comm_only &&
+      graph_step1_accum_ok &&
+      std::getenv("FIB_ENABLE_DIRECT_GRAPH") != nullptr &&
+      std::getenv("FIB_DEBUG_STEP1_OUTPUT") == nullptr &&
+      std::getenv("FIB_STEP1_ABLATE_ACCUM56") == nullptr &&
+      std::getenv("FIB_STEP1_ABLATE_ACCUM56_RAW_GATE") == nullptr;
+
+  if (can_use_small_direct_graph) {
+    const int total_routed = static_cast<int>(t * kTopK);
+    ws.ensure_routed_step1(total_routed);
+    UploadDirectTmaDescriptors(
+        gemm1_weights, gemm2_weights, direct_cfg.use_direct_tma,
+        direct_cfg.use_direct_tma_sw128);
+    cudaError_t attr_status = direct_backend::EnsureStep1AllExpertsDirectAttributes();
+    TVM_FFI_ICHECK_EQ(attr_status, cudaSuccess)
+        << "direct Step1 attribute setup failed before graph capture: "
+        << cudaGetErrorString(attr_status);
+    const bool step2_k4_variant =
+        direct_cfg.step2_pipeline_variant == direct_backend::kStep2PipeM64N8K4DbBatch2 ||
+        direct_cfg.step2_pipeline_variant == direct_backend::kStep2PipeM64N16K4DbBatch2;
+    SmallDirectGraphKey graph_key{};
+    graph_key.t = t;
+    graph_key.local_expert_offset = local_expert_offset;
+    graph_key.routed_scaling_factor = static_cast<float>(routed_scaling_factor);
+    graph_key.step2_pipeline_variant = direct_cfg.step2_pipeline_variant;
+    graph_key.use_direct_tma = direct_cfg.use_direct_tma;
+    graph_key.use_direct_tma_sw128 = direct_cfg.use_direct_tma_sw128;
+    graph_key.use_direct_b_sw128 = direct_cfg.use_direct_b_sw128;
+    graph_key.routing_logits = routing_logits.data_ptr();
+    graph_key.routing_bias = routing_bias.data_ptr();
+    graph_key.hidden_states = hidden_states.data_ptr();
+    graph_key.hidden_states_scale = hidden_states_scale.data_ptr();
+    graph_key.gemm1_weights = gemm1_weights.data_ptr();
+    graph_key.gemm1_weights_scale = gemm1_weights_scale.data_ptr();
+    graph_key.gemm2_weights = gemm2_weights.data_ptr();
+    graph_key.gemm2_weights_scale = gemm2_weights_scale.data_ptr();
+    graph_key.output = output.data_ptr();
+    graph_key.local_weight = local_weight_dev;
+    graph_key.out_acc = out_acc_dev;
+    graph_key.expert_counts = expert_counts_dev;
+    graph_key.expert_offsets = expert_offsets_dev;
+    graph_key.running_counter = running_counter_dev;
+    graph_key.permuted_token_ids = permuted_token_ids_dev;
+    graph_key.permuted_weights = permuted_weights_dev;
+    graph_key.c_perm_all = ws.c_perm_all_dev;
+    graph_key.c_perm_q = ws.c_perm_q_dev;
+    graph_key.c_perm_scale = ws.c_perm_scale_dev;
+    graph_key.step1_tma_desc = direct_cfg.use_direct_tma ? g_step1_direct_w13_tma_desc_dev : nullptr;
+    graph_key.step2_tma_desc =
+        direct_cfg.use_direct_tma
+            ? (step2_k4_variant ? g_step2_w2_tma_desc_k4_dev : g_step2_w2_tma_desc_dev)
+            : nullptr;
+    cudaError_t graph_status = LaunchSmallDirectGraph(graph_key, stream);
+    TVM_FFI_ICHECK_EQ(graph_status, cudaSuccess)
+        << "small direct CUDA graph launch failed: " << cudaGetErrorString(graph_status);
+    cudaError_t final_sync = cudaStreamSynchronize(stream);
+    TVM_FFI_ICHECK_EQ(final_sync, cudaSuccess)
+        << "direct MoE graph final stream sync failed: " << cudaGetErrorString(final_sync);
+    return;
+  }
+
+  cudaMemsetAsync(out_acc_dev, 0,
+                  static_cast<size_t>(t) * kHidden * sizeof(float), stream);
+  clear_expert_metadata_kernel<<<1, kNumLocalExperts, 0, stream>>>(
+      expert_counts_dev, running_counter_dev);
 
   std::chrono::high_resolution_clock::time_point t0_routing, t1_routing;
   std::chrono::high_resolution_clock::time_point t0_dequant, t1_dequant;
@@ -769,7 +1110,7 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   routing_kernel<<<routing_blocks, kRoutingThreads, 0, stream>>>(
       static_cast<const float*>(routing_logits.data_ptr()),
       static_cast<const uint16_t*>(routing_bias.data_ptr()), t, static_cast<int>(local_expert_offset),
-      static_cast<float>(routed_scaling_factor), local_weight_dev);
+      static_cast<float>(routed_scaling_factor), local_weight_dev, expert_counts_dev);
   if (kProfile) {
     cudaStreamSynchronize(stream);
     t1_routing = std::chrono::high_resolution_clock::now();
@@ -790,15 +1131,11 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   // Build grouped-GEMM metadata.
   constexpr int kMetaThreads = 128;
   int meta_blocks = static_cast<int>((t + kMetaThreads - 1) / kMetaThreads);
-  build_counts_kernel<<<meta_blocks, kMetaThreads, 0, stream>>>(local_weight_dev, t,
-                                                                expert_counts_dev);
   scan_offsets_kernel<<<1, 32, 0, stream>>>(expert_counts_dev, expert_offsets_dev);
   scatter_placements_kernel<<<meta_blocks, kMetaThreads, 0, stream>>>(
       local_weight_dev, t, expert_offsets_dev, running_counter_dev, permuted_token_ids_dev,
       permuted_weights_dev);
 
-  const bool use_device_metadata_direct =
-      use_direct_impl && !need_step1_debug_dump && t <= 128;
   const bool need_metadata_host = !use_device_metadata_direct;
   if (need_metadata_host) {
     cudaMemcpyAsync(expert_counts_host.data(), expert_counts_dev,
@@ -817,15 +1154,15 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   const int active_expert_count =
       need_metadata_host ? BuildActiveExpertList(expert_counts_host, active_experts_dev, stream) : 0;
   if (use_direct_impl && total_routed > 0) {
-    const bool kUseDirectTma = std::getenv("FIB_MOE_COMM_USE_TMA") != nullptr;
-    const bool kUseDirectTmaSw128 = std::getenv("FIB_MOE_DIRECT_TMA_SW128") != nullptr;
-    const bool kUseDirectBSw128 = std::getenv("FIB_MOE_DIRECT_B_SW128") != nullptr;
-    const int step2_pipeline_variant = ParseStep2PipelineVariant();
+    const bool kUseDirectTma = direct_cfg.use_direct_tma;
+    const bool kUseDirectTmaSw128 = direct_cfg.use_direct_tma_sw128;
+    const bool kUseDirectBSw128 = direct_cfg.use_direct_b_sw128;
+    const int step2_pipeline_variant = direct_cfg.step2_pipeline_variant;
     UploadDirectTmaDescriptors(gemm1_weights, gemm2_weights, kUseDirectTma, kUseDirectTmaSw128);
 
-    const bool kMeasureStep1CommOnly = std::getenv("FIB_MEASURE_STEP1_COMM_ONLY") != nullptr;
+    const bool kMeasureStep1CommOnly = direct_cfg.measure_step1_comm_only;
     if (kMeasureStep1CommOnly) {
-      const bool kUseCommTma = std::getenv("FIB_MOE_COMM_USE_TMA") != nullptr;
+      const bool kUseCommTma = direct_cfg.use_direct_tma;
       int comm_tma_mode = 0;
       int comm_out_rows = kBlock;
       int comm_h_tiles = kBlock / 32;

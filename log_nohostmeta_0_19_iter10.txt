@@ -1,0 +1,102 @@
+Selected implementation: direct
+Using random seed=1234
+Packing solution from source files...
+Solution packed: /home/snu_avq1/workspace/chaewon/flashinfer-bench-starter-kit/solution.json
+  Name: moe_fp8_cpu_ref_cuda
+  Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
+  Author: kplc
+  Language: cuda
+
+Loading solution...
+Loaded: moe_fp8_cpu_ref_cuda (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+Using TVM_FFI_CUDA_ARCH_LIST=10.0a
+
+Loading comparison solution...
+Loaded comparison: flashinfer_wrapper_9sdjf3 (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+
+Running benchmark (single-process mode: warmup=1, iter=10, trials=1, workloads=3, device=cuda:0, compare=flashinfer_wrapper_9sdjf3, correctness_only=False)...
+[1/19] Starting workload b8f4f012... 
+2026-04-25 13:57:46,645 - WARNING - core.py:2740 - flashinfer.jit: the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0.
+[mxfp] using direct B200 step kernels
+[1/19] Finished workload b8f4f012... status=PASSED elapsed=0.62s
+[2/19] Starting workload e05c6c03... 
+[2/19] Finished workload e05c6c03... status=PASSED elapsed=0.15s
+[3/19] Starting workload 6230e838... 
+[3/19] Finished workload 6230e838... status=PASSED elapsed=0.20s
+[4/19] Starting workload 8f1ff9f1... 
+[4/19] Finished workload 8f1ff9f1... status=PASSED elapsed=0.23s
+[5/19] Starting workload 1a4c6ba1... 
+[5/19] Finished workload 1a4c6ba1... status=PASSED elapsed=0.34s
+[6/19] Starting workload a7c2bcfd... 
+[6/19] Finished workload a7c2bcfd... status=PASSED elapsed=0.17s
+[7/19] Starting workload 2e69caee... 
+[7/19] Finished workload 2e69caee... status=PASSED elapsed=0.16s
+[8/19] Starting workload 8cba5890... 
+[8/19] Finished workload 8cba5890... status=PASSED elapsed=0.17s
+[9/19] Starting workload 5e8dc11c... 
+Traceback (most recent call last):
+  File "/home/snu_avq1/miniconda3/envs/fi-bench/lib/python3.12/site-packages/flashinfer_bench/bench/evaluators/lowbit.py", line 53, in check_correctness
+    sol_runnable(*inp, *out)
+  File "/home/snu_avq1/miniconda3/envs/fi-bench/lib/python3.12/site-packages/flashinfer_bench/compile/runnable.py", line 95, in __call__
+    ret = self._callable(*args)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "python/tvm_ffi/cython/function.pxi", line 929, in tvm_ffi.core.Function.__call__
+  File "<unknown>", line 0, in __tvm_ffi_moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
+  File "/home/snu_avq1/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_moe_fp8_cpu_ref_cuda_5c6fa1/moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.cu", line 1032, in void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, int64_t, double, tvm::ffi::TensorView)
+    TVM_FFI_ICHECK_EQ(st2_pre, cudaSuccess)
+    
+RuntimeError: Check failed: st2_pre == cudaSuccess (1 vs. 0) : direct Step2(prequant c_perm) launch failed: invalid argument
+[9/19] Finished workload 5e8dc11c... status=RUNTIME_ERROR elapsed=1.49s
+[10/19] Starting workload 58a34f27... 
+Traceback (most recent call last):
+  File "/home/snu_avq1/miniconda3/envs/fi-bench/lib/python3.12/site-packages/flashinfer_bench/bench/evaluators/lowbit.py", line 53, in check_correctness
+    sol_runnable(*inp, *out)
+  File "/home/snu_avq1/miniconda3/envs/fi-bench/lib/python3.12/site-packages/flashinfer_bench/compile/runnable.py", line 95, in __call__
+    ret = self._callable(*args)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "python/tvm_ffi/cython/function.pxi", line 929, in tvm_ffi.core.Function.__call__
+  File "<unknown>", line 0, in __tvm_ffi_moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
+  File "/home/snu_avq1/.cache/flashinfer_bench/cache/tvm_ffi/tvm_ffi_moe_fp8_cpu_ref_cuda_5c6fa1/moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.cu", line 1032, in void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, tvm::ffi::TensorView, int64_t, double, tvm::ffi::TensorView)
+    TVM_FFI_ICHECK_EQ(st2_pre, cudaSuccess)
+    
+RuntimeError: Check failed: st2_pre == cudaSuccess (1 vs. 0) : direct Step2(prequant c_perm) launch failed: invalid argument
+[10/19] Finished workload 58a34f27... status=RUNTIME_ERROR elapsed=0.47s
+[11/19] Starting workload 5eadab1e... 
+[11/19] Finished workload 5eadab1e... status=PASSED elapsed=0.21s
+[12/19] Starting workload eedc63b2... 
+[12/19] Finished workload eedc63b2... status=PASSED elapsed=0.19s
+[13/19] Starting workload e626d3e6... 
+[13/19] Finished workload e626d3e6... status=PASSED elapsed=0.21s
+[14/19] Starting workload 74d7ff04... 
+[14/19] Finished workload 74d7ff04... status=PASSED elapsed=0.21s
+[15/19] Starting workload 4822167c... 
+[15/19] Finished workload 4822167c... status=PASSED elapsed=0.21s
+[16/19] Starting workload 81955b1e... 
+[16/19] Finished workload 81955b1e... status=PASSED elapsed=0.20s
+[17/19] Starting workload 76010cb4... 
+[17/19] Finished workload 76010cb4... status=PASSED elapsed=0.20s
+[18/19] Starting workload fc378037... 
+[18/19] Finished workload fc378037... status=PASSED elapsed=0.20s
+[19/19] Starting workload f7d6ac7c... 
+[19/19] Finished workload f7d6ac7c... status=PASSED elapsed=0.18s
+
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
+  Workload b8f4f012...: PASSED | 0.373 ms | 0.60x speedup | abs_err=3.12e+04, rel_err=8.77e+02
+  Workload e05c6c03...: PASSED | 0.225 ms | 0.85x speedup | abs_err=1.64e+04, rel_err=5.02e+03
+  Workload 6230e838...: PASSED | 0.695 ms | 0.44x speedup | abs_err=3.07e+04, rel_err=1.59e+11
+  Workload 8f1ff9f1...: PASSED | 0.963 ms | 0.48x speedup | abs_err=2.97e+04, rel_err=7.71e+03
+  Workload 1a4c6ba1...: PASSED | 4.970 ms | 0.09x speedup | abs_err=4.71e+04, rel_err=1.20e+12
+  Workload a7c2bcfd...: PASSED | 0.488 ms | 0.50x speedup | abs_err=2.15e+04, rel_err=6.30e+11
+  Workload 2e69caee...: PASSED | 0.315 ms | 0.64x speedup | abs_err=2.38e+04, rel_err=7.56e+02
+  Workload 8cba5890...: PASSED | 0.463 ms | 0.50x speedup | abs_err=2.05e+04, rel_err=2.30e+03
+  Workload 5e8dc11c...: RUNTIME_ERROR
+  Workload 58a34f27...: RUNTIME_ERROR
+  Workload 5eadab1e...: PASSED | 0.675 ms | 0.42x speedup | abs_err=3.58e+04, rel_err=8.28e+10
+  Workload eedc63b2...: PASSED | 0.656 ms | 0.45x speedup | abs_err=3.49e+04, rel_err=8.45e+11
+  Workload e626d3e6...: PASSED | 0.868 ms | 0.38x speedup | abs_err=3.48e+04, rel_err=7.65e+11
+  Workload 74d7ff04...: PASSED | 0.811 ms | 0.41x speedup | abs_err=2.87e+04, rel_err=3.36e+10
+  Workload 4822167c...: PASSED | 0.841 ms | 0.39x speedup | abs_err=2.64e+04, rel_err=1.13e+12
+  Workload 81955b1e...: PASSED | 0.783 ms | 0.41x speedup | abs_err=2.42e+04, rel_err=1.67e+11
+  Workload 76010cb4...: PASSED | 0.736 ms | 0.42x speedup | abs_err=3.64e+04, rel_err=4.22e+03
+  Workload fc378037...: PASSED | 0.787 ms | 0.41x speedup | abs_err=3.52e+04, rel_err=4.74e+11
+  Workload f7d6ac7c...: PASSED | 0.590 ms | 0.47x speedup | abs_err=2.66e+04, rel_err=1.50e+11

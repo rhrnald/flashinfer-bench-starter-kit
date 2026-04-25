@@ -2424,6 +2424,28 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
 #endif
 }
 
+inline cudaError_t EnsureStep1AllExpertsDirectAttributes() {
+  static bool attrs_set = false;
+  if (attrs_set) return cudaSuccess;
+  const std::size_t smem_bytes = step1_smem_bytes();
+  cudaError_t st = cudaFuncSetAttribute(
+      step1_gemm1_swiglu_direct_kernel<-1>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(smem_bytes));
+  if (st != cudaSuccess) {
+    return st;
+  }
+  st = cudaFuncSetAttribute(
+      step1_gemm1_swiglu_direct_kernel<2>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(smem_bytes));
+  if (st != cudaSuccess) {
+    return st;
+  }
+  attrs_set = true;
+  return cudaSuccess;
+}
+
 inline cudaError_t RunStep1AllExpertsDirect(
     const uint8_t* hidden_fp8_dev,
     const float* hidden_scale_dev,
@@ -2441,26 +2463,15 @@ inline cudaError_t RunStep1AllExpertsDirect(
     cudaStream_t stream,
     bool direct_tma_sw128 = false,
     bool direct_b_sw128 = false,
-    int tcgen_accum_mode = 0) {
+    int tcgen_accum_mode = 0,
+    bool check_launch_error = true) {
   const std::size_t smem_bytes = step1_smem_bytes();
   const bool use_fast_tcgen =
       (w13_tma_desc != nullptr) && direct_tma_sw128 && direct_b_sw128 &&
       debug_output_mode == 0 && tcgen_accum_mode == 2;
 
-  cudaError_t st = cudaFuncSetAttribute(
-      step1_gemm1_swiglu_direct_kernel<-1>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(smem_bytes));
-  if (st != cudaSuccess) {
-    return st;
-  }
-  st = cudaFuncSetAttribute(
-      step1_gemm1_swiglu_direct_kernel<2>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(smem_bytes));
-  if (st != cudaSuccess) {
-    return st;
-  }
+  cudaError_t attr_status = EnsureStep1AllExpertsDirectAttributes();
+  if (attr_status != cudaSuccess) return attr_status;
   const int grid_experts =
       active_expert_count > 0 ? active_expert_count : kStep1LocalExperts;
   dim3 grid(kStep1OutTilesPerExpert, grid_experts, 1);
@@ -2503,7 +2514,7 @@ inline cudaError_t RunStep1AllExpertsDirect(
         c_perm_all_dev);
   }
 
-  return cudaGetLastError();
+  return check_launch_error ? cudaGetLastError() : cudaSuccess;
 }
 
 template <bool kUseTma>
@@ -2613,19 +2624,27 @@ inline cudaError_t RunStep1CommOnlyDirect(
 	          step1_tma_comm_smem_bytes(comm_h_inner_bytes, comm_out_rows, comm_h_tiles,
 	                                    comm_double_buffer);
 
-	  cudaError_t st = cudaFuncSetAttribute(
-	      step1_comm_only_direct_kernel<false>,
-	      cudaFuncAttributeMaxDynamicSharedMemorySize,
-	      static_cast<int>(smem_bytes));
-  if (st != cudaSuccess) {
-    return st;
+  static std::size_t cached_smem_bytes = 0;
+  static std::size_t cached_tma_smem_bytes = 0;
+  if (cached_smem_bytes != smem_bytes) {
+    cudaError_t st = cudaFuncSetAttribute(
+        step1_comm_only_direct_kernel<false>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(smem_bytes));
+    if (st != cudaSuccess) {
+      return st;
+    }
+    cached_smem_bytes = smem_bytes;
   }
-	  st = cudaFuncSetAttribute(
-	      step1_comm_only_direct_kernel<true>,
-	      cudaFuncAttributeMaxDynamicSharedMemorySize,
-	      static_cast<int>(tma_smem_bytes));
-  if (st != cudaSuccess) {
-    return st;
+  if (cached_tma_smem_bytes != tma_smem_bytes) {
+    cudaError_t st = cudaFuncSetAttribute(
+        step1_comm_only_direct_kernel<true>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(tma_smem_bytes));
+    if (st != cudaSuccess) {
+      return st;
+    }
+    cached_tma_smem_bytes = tma_smem_bytes;
   }
 
 	  dim3 grid(kStep1Intermediate / comm_out_rows, kStep1LocalExperts, 1);

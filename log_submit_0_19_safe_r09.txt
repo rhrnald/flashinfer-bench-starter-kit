@@ -1,0 +1,78 @@
+Selected implementation: direct
+Using random seed=1234
+Packing solution from source files...
+Solution packed: /home/snu_avq1/workspace/chaewon/flashinfer-bench-starter-kit/solution.json
+  Name: moe_fp8_cpu_ref_cuda
+  Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
+  Author: kplc
+  Language: cuda
+
+Loading solution...
+Loaded: moe_fp8_cpu_ref_cuda (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+Using TVM_FFI_CUDA_ARCH_LIST=10.0a
+
+Loading comparison solution...
+Loaded comparison: flashinfer_wrapper_9sdjf3 (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+
+Running benchmark (single-process mode: warmup=1, iter=5, trials=1, workloads=3, device=cuda:0, compare=flashinfer_wrapper_9sdjf3, correctness_only=False)...
+[1/19] Starting workload b8f4f012... 
+2026-04-25 11:51:03,089 - WARNING - core.py:2740 - flashinfer.jit: the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0.
+[mxfp] using direct B200 step kernels
+[1/19] Finished workload b8f4f012... status=PASSED elapsed=0.54s
+[2/19] Starting workload e05c6c03... 
+[2/19] Finished workload e05c6c03... status=INCORRECT_NUMERICAL elapsed=0.09s
+[3/19] Starting workload 6230e838... 
+[3/19] Finished workload 6230e838... status=PASSED elapsed=0.12s
+[4/19] Starting workload 8f1ff9f1... 
+[4/19] Finished workload 8f1ff9f1... status=PASSED elapsed=0.14s
+[5/19] Starting workload 1a4c6ba1... 
+[5/19] Finished workload 1a4c6ba1... status=PASSED elapsed=0.29s
+[6/19] Starting workload a7c2bcfd... 
+[6/19] Finished workload a7c2bcfd... status=PASSED elapsed=0.11s
+[7/19] Starting workload 2e69caee... 
+[7/19] Finished workload 2e69caee... status=PASSED elapsed=0.10s
+[8/19] Starting workload 8cba5890... 
+[8/19] Finished workload 8cba5890... status=PASSED elapsed=0.10s
+[9/19] Starting workload 5e8dc11c... 
+[9/19] Finished workload 5e8dc11c... status=PASSED elapsed=0.83s
+[10/19] Starting workload 58a34f27... 
+[10/19] Finished workload 58a34f27... status=PASSED elapsed=0.57s
+[11/19] Starting workload 5eadab1e... 
+[11/19] Finished workload 5eadab1e... status=PASSED elapsed=0.12s
+[12/19] Starting workload eedc63b2... 
+[12/19] Finished workload eedc63b2... status=PASSED elapsed=0.11s
+[13/19] Starting workload e626d3e6... 
+[13/19] Finished workload e626d3e6... status=PASSED elapsed=0.13s
+[14/19] Starting workload 74d7ff04... 
+[14/19] Finished workload 74d7ff04... status=PASSED elapsed=0.12s
+[15/19] Starting workload 4822167c... 
+[15/19] Finished workload 4822167c... status=PASSED elapsed=0.12s
+[16/19] Starting workload 81955b1e... 
+[16/19] Finished workload 81955b1e... status=PASSED elapsed=0.12s
+[17/19] Starting workload 76010cb4... 
+[17/19] Finished workload 76010cb4... status=PASSED elapsed=0.12s
+[18/19] Starting workload fc378037... 
+[18/19] Finished workload fc378037... status=PASSED elapsed=0.12s
+[19/19] Starting workload f7d6ac7c... 
+[19/19] Finished workload f7d6ac7c... status=PASSED elapsed=0.11s
+
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
+  Workload b8f4f012...: PASSED | 0.383 ms | 0.64x speedup | abs_err=4.65e+05, rel_err=8.77e+02
+  Workload e05c6c03...: INCORRECT_NUMERICAL | 0.260 ms | 0.72x speedup | abs_err=2.23e+05, rel_err=5.02e+03
+  Workload 6230e838...: PASSED | 0.795 ms | 0.42x speedup | abs_err=5.65e+05, rel_err=1.59e+11
+  Workload 8f1ff9f1...: PASSED | 1.070 ms | 0.34x speedup | abs_err=5.65e+05, rel_err=7.71e+03
+  Workload 1a4c6ba1...: PASSED | 5.570 ms | 0.08x speedup | abs_err=4.71e+04, rel_err=1.20e+12
+  Workload a7c2bcfd...: PASSED | 0.549 ms | 1.03x speedup | abs_err=4.08e+05, rel_err=6.30e+11
+  Workload 2e69caee...: PASSED | 0.358 ms | 0.59x speedup | abs_err=4.44e+05, rel_err=7.56e+02
+  Workload 8cba5890...: PASSED | 0.523 ms | 0.47x speedup | abs_err=3.93e+05, rel_err=1.34e+03
+  Workload 5e8dc11c...: PASSED | 60.947 ms | 0.04x speedup | abs_err=2.71e+05, rel_err=1.48e+12
+  Workload 58a34f27...: PASSED | 40.561 ms | 0.04x speedup | abs_err=2.09e+05, rel_err=1.21e+12
+  Workload 5eadab1e...: PASSED | 0.758 ms | 0.38x speedup | abs_err=5.12e+05, rel_err=8.28e+10
+  Workload eedc63b2...: PASSED | 0.735 ms | 0.41x speedup | abs_err=6.80e+05, rel_err=8.45e+11
+  Workload e626d3e6...: PASSED | 0.954 ms | 0.34x speedup | abs_err=6.18e+05, rel_err=4.35e+11
+  Workload 74d7ff04...: PASSED | 0.912 ms | 0.36x speedup | abs_err=5.49e+05, rel_err=3.36e+10
+  Workload 4822167c...: PASSED | 0.950 ms | 0.36x speedup | abs_err=2.91e+05, rel_err=1.13e+12
+  Workload 81955b1e...: PASSED | 0.880 ms | 0.37x speedup | abs_err=4.44e+05, rel_err=8.81e+04
+  Workload 76010cb4...: PASSED | 0.851 ms | 0.37x speedup | abs_err=6.80e+05, rel_err=4.22e+03
+  Workload fc378037...: PASSED | 0.883 ms | 0.38x speedup | abs_err=7.00e+05, rel_err=4.74e+11
+  Workload f7d6ac7c...: PASSED | 0.683 ms | 0.40x speedup | abs_err=4.59e+05, rel_err=1.50e+11

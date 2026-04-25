@@ -1,0 +1,27 @@
+Selected implementation: direct
+Using random seed=1234
+Packing solution from source files...
+Solution packed: /home/snu_avq1/workspace/chaewon/flashinfer-bench-starter-kit/solution.json
+  Name: moe_fp8_cpu_ref_cuda
+  Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
+  Author: kplc
+  Language: cuda
+
+Loading solution...
+Loaded: moe_fp8_cpu_ref_cuda (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+Using TVM_FFI_CUDA_ARCH_LIST=10.0a
+
+Loading comparison solution...
+Loaded comparison: flashinfer_wrapper_9sdjf3 (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+
+Running benchmark (single-process mode: warmup=1, iter=10, trials=1, workloads=3, device=cuda:0, compare=flashinfer_wrapper_9sdjf3, correctness_only=False)...
+[1/2] Starting workload 5e8dc11c... 
+2026-04-25 15:04:35,593 - WARNING - core.py:2740 - flashinfer.jit: the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0.
+[mxfp] using direct B200 step kernels
+[1/2] Finished workload 5e8dc11c... status=INCORRECT_NUMERICAL elapsed=1.72s
+[2/2] Starting workload 58a34f27... 
+[2/2] Finished workload 58a34f27... status=INCORRECT_NUMERICAL elapsed=0.88s
+
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
+  Workload 5e8dc11c...: INCORRECT_NUMERICAL | 51.737 ms | 0.05x speedup | abs_err=5.80e+07, rel_err=8.59e+14
+  Workload 58a34f27...: INCORRECT_NUMERICAL | 33.774 ms | 0.05x speedup | abs_err=4.32e+07, rel_err=5.64e+14

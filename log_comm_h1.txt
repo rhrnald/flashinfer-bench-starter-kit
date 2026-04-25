@@ -1,0 +1,28 @@
+Selected implementation: direct
+Using random seed=1234
+Packing solution from source files...
+Solution packed: /home/snu_avq1/workspace/chaewon/flashinfer-bench-starter-kit/solution.json
+  Name: moe_fp8_cpu_ref_cuda
+  Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
+  Author: kplc
+  Language: cuda
+
+Loading solution...
+Loaded: moe_fp8_cpu_ref_cuda (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+Using TVM_FFI_CUDA_ARCH_LIST=10.0a
+
+Loading comparison solution...
+Loaded comparison: flashinfer_wrapper_9sdjf3 (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+
+Running benchmark (single-process mode: warmup=0, iter=1, trials=1, workloads=3, device=cuda:0, compare=flashinfer_wrapper_9sdjf3, correctness_only=False)...
+[1/1] Starting workload e05c6c03... 
+2026-04-24 14:07:21,091 - WARNING - core.py:2740 - flashinfer.jit: the single torch.Tensor return type is deprecated and will be replaced with List[torch.Tensor] in the v0.8.0.
+[mxfp] using direct B200 step kernels
+[moe_step1_comm_timing] impl=direct seq_len=1 step1_comm_only=0.093ms
+[moe_step1_timing] impl=direct seq_len=1 step1=0.270ms
+[moe_step1_comm_timing] impl=direct seq_len=1 step1_comm_only=0.079ms
+[moe_step1_timing] impl=direct seq_len=1 step1=0.231ms
+[1/1] Finished workload e05c6c03... status=PASSED elapsed=0.48s
+
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
+  Workload e05c6c03...: PASSED | 1.490 ms | 0.23x speedup | abs_err=2.00e+04, rel_err=1.22e+03

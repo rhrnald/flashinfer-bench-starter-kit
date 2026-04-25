@@ -34,6 +34,7 @@ enum Step2PipelineVariant : int {
   kStep2PipeM64N16K8DbBatch2 = 2,
   kStep2PipeM64N16K4DbBatch2 = 3,
   kStep2PipeM128N8K8DbBatch2 = 4,
+  kStep2PipeM64N16K8Batch1 = 5,
 };
 
 static_assert(kStep2Hidden % kStep2TcgenM == 0, "Step2 H must divide the tcgen05 M tile.");
@@ -599,6 +600,18 @@ __device__ __forceinline__ void zero_step2_tf32_diag_scale(float* __restrict__ s
   }
 }
 
+template <int N>
+__device__ __forceinline__ void zero_step2_tf32_diag_scale_n(float* __restrict__ smem_diag) {
+  constexpr int kDiagElems = (N / 4) * N * 4;
+  constexpr int kTotalElems = kStep2K32IssuesPerBlock * kDiagElems;
+#pragma unroll
+  for (int iter = 0; iter < (kTotalElems + kStep2Threads - 1) / kStep2Threads; ++iter) {
+    const int linear = threadIdx.x + iter * kStep2Threads;
+    if (linear >= kTotalElems) continue;
+    smem_diag[linear] = 0.0f;
+  }
+}
+
 static __global__ void step2_prequant_cperm_kernel(
     const float* __restrict__ c_perm_all_dev,
     int total_routed,
@@ -643,13 +656,14 @@ static inline cudaError_t LaunchStep2PrequantCperm(
     int total_routed,
     uint8_t* c_perm_q_dev,
     float* c_perm_scale_dev,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    bool check_launch_error = true) {
   if (total_routed <= 0) return cudaSuccess;
   dim3 grid(static_cast<unsigned int>(total_routed * kStep2IntermediateBlocks));
   dim3 threads(32);
   step2_prequant_cperm_kernel<<<grid, threads, 0, stream>>>(
       c_perm_all_dev, total_routed, c_perm_q_dev, c_perm_scale_dev);
-  return cudaGetLastError();
+  return check_launch_error ? cudaGetLastError() : cudaSuccess;
 }
 
 // Stage the prequantized Step1 output as tcgen B and update only the non-zero
@@ -697,6 +711,57 @@ __device__ __forceinline__ void stage_step2_cperm_q_b_fp8_8x128_update_diag_only
   }
 }
 
+template <int N>
+__device__ __forceinline__ void stage_step2_cperm_q_b_fp8_nx128_update_diag_only(
+    uint8_t* __restrict__ smem_B_tcgen,
+    float* __restrict__ smem_diag,
+    const uint8_t* __restrict__ c_perm_q_dev,
+    const float* __restrict__ c_perm_scale_dev,
+    const int* __restrict__ expert_offset,
+    int expert,
+    int row_tile,
+    int n_rows,
+    int k_blk,
+    float w_scale) {
+  static_assert(N % 8 == 0, "Step2 N must be a multiple of 8.");
+  constexpr int kBytesPerLane = 4;
+  constexpr int kN8Groups = N / 8;
+  constexpr int kDiagElemsPerN8 = 2 * kStep2TcgenN * 4;
+  constexpr int kDiagElems = kN8Groups * kDiagElemsPerN8;
+  const int row_start = expert_offset[expert];
+  const int lane = threadIdx.x & 31;
+  const int warp_id = threadIdx.x >> 5;
+  const int issue = lane >> 3;
+  constexpr int kTokensPerWarp = N / 4;
+#pragma unroll
+  for (int token_in_warp = 0; token_in_warp < kTokensPerWarp; ++token_in_warp) {
+    const int n = warp_id * kTokensPerWarp + token_in_warp;
+    if (n >= n_rows) continue;
+    const int slot = row_start + row_tile + n;
+    const float c_scale =
+        c_perm_scale_dev[static_cast<int64_t>(slot) * kStep2IntermediateBlocks *
+                             kStep2K32IssuesPerBlock +
+                         k_blk * kStep2K32IssuesPerBlock + issue];
+    if ((lane & 7) == 0) {
+      const int n8_group = n >> 3;
+      const int n_local = n & 7;
+      const int diag_slice = n_local >> 2;
+      const int diag_k = n_local & 3;
+      smem_diag[issue * kDiagElems + n8_group * kDiagElemsPerN8 +
+                diag_slice * kStep2TcgenN * 4 + n_local * 4 + diag_k] =
+          step2_tf32_rne_prebias(w_scale * c_scale);
+    }
+    const int k_base = lane * kBytesPerLane;
+    const int chunk16 = k_base >> 4;
+    const int byte_base = k_base & 15;
+    const int phys_chunk16 = chunk16 ^ (n & 7);
+    const uint8_t* src = c_perm_q_dev + static_cast<int64_t>(slot) * kStep2Intermediate +
+                         k_blk * kStep2Block + k_base;
+    uint8_t* dst = smem_B_tcgen + n * kStep2Block + phys_chunk16 * 16 + byte_base;
+    *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<const uint32_t*>(src);
+  }
+}
+
 // Issue the FP8xFP8 partial GEMM for one K32 issue into temporary TMEM columns.
 __device__ __forceinline__ void step2_issue_mma_64x8x128_f8f6f4_ss(
     const uint8_t* __restrict__ smem_A_tcgen,
@@ -706,6 +771,28 @@ __device__ __forceinline__ void step2_issue_mma_64x8x128_f8f6f4_ss(
     int issue) {
   constexpr uint32_t kIdesc =
       step2_make_idesc_f8f6f4_f32_dense(kStep2TcgenM, kStep2TcgenN);
+  const int lane = threadIdx.x & 31;
+  const int warp_id = threadIdx.x >> 5;
+  const int slice_base = issue * 2;
+  const uint8_t* a_issue = smem_A_tcgen + slice_base * 16;
+  const uint8_t* b_issue = smem_B_tcgen + slice_base * 16;
+  const uint64_t a_desc = step2_make_core_matrix_desc_group8_k128(a_issue);
+  const uint64_t b_desc = step2_make_core_matrix_desc_group8_k128(b_issue);
+  if (warp_id == 0 && lane == 0) {
+    step2_tcgen05_mma_f8f6f4_cta1_ss(
+        tmem_base, a_desc, b_desc, kIdesc, enable_input_d);
+  }
+}
+
+template <int N>
+__device__ __forceinline__ void step2_issue_mma_64xn_x128_f8f6f4_ss(
+    const uint8_t* __restrict__ smem_A_tcgen,
+    const uint8_t* __restrict__ smem_B_tcgen,
+    uint32_t tmem_base,
+    bool enable_input_d,
+    int issue) {
+  constexpr uint32_t kIdesc =
+      step2_make_idesc_f8f6f4_f32_dense(kStep2TcgenM, N);
   const int lane = threadIdx.x & 31;
   const int warp_id = threadIdx.x >> 5;
   const int slice_base = issue * 2;
@@ -746,6 +833,42 @@ __device__ __forceinline__ void scatter_step2_scaled_tmem_64x8(
       const float token_w = valid_token_w[slot];
       atomicAdd(&out_acc_dev[static_cast<int64_t>(tok) * kStep2Hidden + h],
                 token_w * result_bits[reg]);
+    }
+  }
+}
+
+template <int N>
+__device__ __forceinline__ void scatter_step2_scaled_tmem_64xn(
+    uint32_t scaled_tmem,
+    const int* __restrict__ valid_token_idx,
+    const float* __restrict__ valid_token_w,
+    float* __restrict__ out_acc_dev,
+    int row_start,
+    int row_tile,
+    int n_rows,
+    int h_base) {
+  static_assert(N % 8 == 0, "Step2 N must be a multiple of 8.");
+  const int lane = threadIdx.x & 31;
+  const int warp_id = threadIdx.x >> 5;
+  if (warp_id >= 4) return;
+  const int result_row = warp_id * 16 + (lane >> 2) + ((lane & 1) ? 8 : 0);
+  const int col_parity = (lane >> 1) & 1;
+  const int h = h_base + result_row;
+#pragma unroll
+  for (int col_group = 0; col_group < N / 8; ++col_group) {
+    float result_bits[4];
+    step2_tcgen05_ld_16x64b_x4(result_bits, scaled_tmem + col_group * 8);
+    step2_tcgen05_wait_ld_sync();
+#pragma unroll
+    for (int reg = 0; reg < 4; ++reg) {
+      const int rr = col_group * 8 + 2 * reg + col_parity;
+      if (rr < n_rows) {
+        const int slot = row_start + row_tile + rr;
+        const int tok = valid_token_idx[slot];
+        const float token_w = valid_token_w[slot];
+        atomicAdd(&out_acc_dev[static_cast<int64_t>(tok) * kStep2Hidden + h],
+                  token_w * result_bits[reg]);
+      }
     }
   }
 }
@@ -946,6 +1069,106 @@ __device__ __forceinline__ void compute_step2_loaded_w2_group_row_tile_batch2_kg
     mma_phase_bit ^= 1;
     scaled_has_accum = true;
   }
+}
+
+template <int N, int KGroupBlocks>
+__device__ __forceinline__ void compute_step2_loaded_w2_group_row_tile_batch1_kgroup(
+    const uint8_t* __restrict__ smem_w2_tma,
+    uint8_t* __restrict__ smem_B_tcgen,
+    float* __restrict__ smem_scale_diag,
+    const uint8_t* __restrict__ c_perm_q_dev,
+    const float* __restrict__ c_perm_scale_dev,
+    const float* __restrict__ s2_all_dev,
+    const int* __restrict__ expert_offset,
+    int expert,
+    int row_tile,
+    int n_rows,
+    int k_group,
+    int h_scale_block,
+    int64_t s2_expert_base,
+    uint32_t partial_tmem_base,
+    uint32_t scaled_tmem,
+    bool& scaled_has_accum,
+    uint64_t* tcgen_mma_barrier,
+    int& mma_phase_bit) {
+  static_assert(N % 8 == 0, "Step2 N must be a multiple of 8.");
+  static_assert(5 * N <= 128, "N batch1 path assumes partial+scaled fit in 128 TMEM cols.");
+  constexpr int kN8Groups = N / 8;
+  constexpr int kDiagElemsPerN8 = 2 * kStep2TcgenN * 4;
+  constexpr int kDiagElemsPerIssue = kN8Groups * kDiagElemsPerN8;
+  constexpr int kDiagElemsTotal = kStep2K32IssuesPerBlock * kDiagElemsPerIssue;
+  constexpr uint32_t kTf32Idesc =
+      step2_make_idesc_tf32_ts_f32_dense(kStep2TcgenM, kStep2TcgenN);
+  const int lane = threadIdx.x & 31;
+  const int warp_id = threadIdx.x >> 5;
+
+#pragma unroll
+  for (int k_sub = 0; k_sub < KGroupBlocks; ++k_sub) {
+    const int k_blk = k_group * KGroupBlocks + k_sub;
+    for (int iter = 0; iter < (kDiagElemsTotal + kStep2Threads - 1) / kStep2Threads; ++iter) {
+      const int linear = threadIdx.x + iter * kStep2Threads;
+      if (linear < kDiagElemsTotal) smem_scale_diag[linear] = 0.0f;
+    }
+    const float w_scale =
+        s2_all_dev[s2_expert_base + h_scale_block * kStep2IntermediateBlocks + k_blk];
+    stage_step2_cperm_q_b_fp8_nx128_update_diag_only<N>(
+        smem_B_tcgen, smem_scale_diag, c_perm_q_dev, c_perm_scale_dev,
+        expert_offset, expert, row_tile, n_rows, k_blk, w_scale);
+    __syncthreads();
+
+    const uint8_t* smem_A_for_mma =
+        smem_w2_tma + static_cast<int64_t>(k_sub) * kStep2TcgenACompactBytes;
+#pragma unroll
+    for (int issue = 0; issue < kStep2K32IssuesPerBlock; ++issue) {
+      const uint32_t partial_tmem =
+          partial_tmem_base + static_cast<uint32_t>(issue * N);
+      step2_issue_mma_64xn_x128_f8f6f4_ss<N>(
+          smem_A_for_mma, smem_B_tcgen, partial_tmem, false, issue);
+    }
+    if (warp_id == 0 && lane == 0) {
+      step2_tcgen05_commit_group1(tcgen_mma_barrier);
+    }
+    if (threadIdx.x == 0) {
+      step2_tcgen05_wait_mma_barrier_single(tcgen_mma_barrier, mma_phase_bit);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    }
+    __syncthreads();
+    mma_phase_bit ^= 1;
+
+#pragma unroll
+    for (int issue = 0; issue < kStep2K32IssuesPerBlock; ++issue) {
+      for (int n8_group = 0; n8_group < kN8Groups; ++n8_group) {
+        const uint32_t partial_tmem =
+            partial_tmem_base + static_cast<uint32_t>(issue * N + n8_group * 8);
+        const uint32_t scaled_group_tmem = scaled_tmem + static_cast<uint32_t>(n8_group * 8);
+        const float* diag =
+            smem_scale_diag + issue * kDiagElemsPerIssue + n8_group * kDiagElemsPerN8;
+        const uint64_t diag_desc = step2_make_tf32_diag_desc(diag);
+        if (warp_id == 0 && lane == 0) {
+          step2_tcgen05_mma_tf32_cta1_ts(
+              scaled_group_tmem, partial_tmem, diag_desc, kTf32Idesc,
+              scaled_has_accum || k_sub != 0 || issue != 0);
+        }
+      }
+    }
+    if (warp_id == 0 && lane == 0) {
+      step2_tcgen05_commit_group1(tcgen_mma_barrier);
+    }
+    if (threadIdx.x == 0) {
+      step2_tcgen05_wait_mma_barrier_single(tcgen_mma_barrier, mma_phase_bit);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    }
+    __syncthreads();
+    mma_phase_bit ^= 1;
+    scaled_has_accum = true;
+  }
+  (void)kDiagElemsTotal;
 }
 
 __device__ __forceinline__ void compute_step2_loaded_w2_group_row_tile_batch2(
@@ -1219,6 +1442,114 @@ static __global__ void step2_gemm2_scatter_all_experts_tcgen_kgroup_kernel(
 #endif
 }
 
+template <int N, int KGroupBlocks>
+static __global__ void step2_gemm2_scatter_all_experts_tcgen_n_batch1_kernel(
+    const int* __restrict__ expert_t_valid,
+    const int* __restrict__ expert_offset, const int* __restrict__ valid_token_idx,
+    const float* __restrict__ valid_token_w, const int* __restrict__ active_experts,
+    const uint8_t* __restrict__ c_perm_q_dev, const float* __restrict__ c_perm_scale_dev,
+    const uint8_t* __restrict__ w2_all_dev, const float* __restrict__ s2_all_dev,
+    const void* __restrict__ w2_tma_desc,
+    float* __restrict__ out_acc_dev) {
+  static_assert(N % 8 == 0, "Step2 N must be a multiple of 8.");
+  static_assert(5 * N <= 128, "N batch1 path assumes partial+scaled fit in 128 TMEM cols.");
+  static_assert(kStep2IntermediateBlocks % KGroupBlocks == 0,
+                "Step2 K group must divide K128 blocks.");
+  constexpr int kTmaKGroups = kStep2IntermediateBlocks / KGroupBlocks;
+  constexpr int kW2TmaGroupBytes = kStep2TcgenM * kStep2Block * KGroupBlocks;
+  constexpr int kBCompactBytes = N * kStep2Block;
+  constexpr int kDiagElems = kStep2K32IssuesPerBlock * (N / 4) * N * 4;
+
+  const int h_tile64 = blockIdx.x;
+  const int expert =
+      active_experts != nullptr ? active_experts[blockIdx.y] : static_cast<int>(blockIdx.y);
+  const int lane = threadIdx.x & 31;
+  const int warp_id = threadIdx.x >> 5;
+  if (expert >= kStep2LocalExperts || h_tile64 >= kStep2HiddenTiles64) return;
+  const int t_valid = expert_t_valid[expert];
+  if (t_valid <= 0) return;
+  if (w2_tma_desc == nullptr) return;
+  const int row_start = expert_offset[expert];
+  const int h_base = h_tile64 * kStep2TcgenM;
+  const int h_scale_block = h_base / kStep2Block;
+  const int64_t s2_expert_base =
+      static_cast<int64_t>(expert) * kStep2HiddenScaleBlocks * kStep2IntermediateBlocks;
+  (void)w2_all_dev;
+
+  alignas(1024) __shared__ uint8_t smem_B_tcgen[kBCompactBytes];
+  alignas(1024) __shared__ uint8_t smem_w2_tma[2][kW2TmaGroupBytes];
+  alignas(16) __shared__ float smem_scale_diag[kDiagElems];
+
+#if defined(MXFP_ENABLE_TCGEN05_PTX_ACTIVE) && defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) && \
+    defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  alignas(16) __shared__ uint64_t tcgen_mma_barrier;
+  alignas(16) __shared__ uint64_t w2_tma_barrier[2];
+  alignas(16) __shared__ uint32_t tcgen_tmem_base_ptr;
+  if (threadIdx.x == 0) {
+    step2_tcgen05_mbarrier_init(&tcgen_mma_barrier, 1);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncthreads();
+  if (warp_id == 0) {
+    const uint32_t taddr = step2_tcgen05_alloc_cta1_cols_128(&tcgen_tmem_base_ptr);
+    if (lane == 0) {
+      tcgen_tmem_base_ptr = taddr;
+    }
+  }
+  __syncthreads();
+
+  const uint32_t partial_tmem_base = tcgen_tmem_base_ptr;
+  const uint32_t scaled_tmem = tcgen_tmem_base_ptr + 4 * N;
+  const bool use_w2_tma = issue_step2_w2_tma_sw128_64xkgroup<KGroupBlocks>(
+      smem_w2_tma[0], w2_tma_desc, expert, h_tile64, 0, &w2_tma_barrier[0]);
+  if (!use_w2_tma) return;
+
+  for (int k_group = 0; k_group < kTmaKGroups; ++k_group) {
+    const int cur = k_group & 1;
+    const int next = cur ^ 1;
+    wait_step2_w2_tma(&w2_tma_barrier[cur]);
+    if (k_group + 1 < kTmaKGroups) {
+      issue_step2_w2_tma_sw128_64xkgroup<KGroupBlocks>(
+          smem_w2_tma[next], w2_tma_desc, expert, h_tile64, k_group + 1,
+          &w2_tma_barrier[next]);
+    }
+
+    for (int row_tile = 0; row_tile < t_valid; row_tile += N) {
+      const int n_rows = step2_min_int(t_valid - row_tile, N);
+      int mma_phase_bit = 0;
+      bool scaled_has_accum = false;
+      compute_step2_loaded_w2_group_row_tile_batch1_kgroup<N, KGroupBlocks>(
+          smem_w2_tma[cur], smem_B_tcgen, smem_scale_diag,
+          c_perm_q_dev, c_perm_scale_dev, s2_all_dev, expert_offset,
+          expert, row_tile, n_rows, k_group, h_scale_block, s2_expert_base,
+          partial_tmem_base, scaled_tmem, scaled_has_accum,
+          &tcgen_mma_barrier, mma_phase_bit);
+      scatter_step2_scaled_tmem_64xn<N>(
+          scaled_tmem, valid_token_idx, valid_token_w, out_acc_dev,
+          row_start, row_tile, n_rows, h_base);
+      __syncthreads();
+    }
+  }
+
+  if (warp_id == 0) {
+    step2_tcgen05_dealloc_cta1_cols_128(tcgen_tmem_base_ptr);
+  }
+  __syncthreads();
+  if (warp_id == 0) {
+    step2_tcgen05_relinquish_alloc_permit_cta1();
+  }
+#else
+  (void)c_perm_q_dev;
+  (void)c_perm_scale_dev;
+  (void)expert_t_valid;
+  (void)expert_offset;
+  (void)valid_token_idx;
+  (void)valid_token_w;
+  (void)s2_all_dev;
+  (void)out_acc_dev;
+#endif
+}
+
 static inline cudaError_t LaunchStep2DirectAllExperts(
     const int* expert_t_valid, const int* expert_offset,
     const int* valid_token_idx, const float* valid_token_w, const int* active_experts,
@@ -1226,12 +1557,26 @@ static inline cudaError_t LaunchStep2DirectAllExperts(
     const uint8_t* c_perm_q_dev, const float* c_perm_scale_dev,
     const uint8_t* w2_all_dev, const float* s2_all_dev,
     const void* w2_tma_desc, float* out_acc_dev, cudaStream_t stream,
-    int pipeline_variant) {
+    int pipeline_variant,
+    bool check_launch_error = true) {
   const int grid_experts =
       active_expert_count > 0 ? active_expert_count : kStep2LocalExperts;
   dim3 grid(kStep2HiddenTiles64, grid_experts);
   const bool can_use_k4 = w2_tma_desc != nullptr;
   switch (pipeline_variant) {
+    case kStep2PipeM64N16K8Batch1:
+      if (w2_tma_desc != nullptr) {
+        step2_gemm2_scatter_all_experts_tcgen_n_batch1_kernel<16, kStep2TmaKGroupBlocks>
+            <<<grid, dim3(kStep2Threads), 0, stream>>>(
+                expert_t_valid, expert_offset, valid_token_idx, valid_token_w, active_experts,
+                c_perm_q_dev, c_perm_scale_dev, w2_all_dev, s2_all_dev, w2_tma_desc, out_acc_dev);
+      } else {
+        step2_gemm2_scatter_all_experts_tcgen_kgroup_kernel<kStep2TmaKGroupBlocks>
+            <<<grid, dim3(kStep2Threads), 0, stream>>>(
+                expert_t_valid, expert_offset, valid_token_idx, valid_token_w, active_experts,
+                c_perm_q_dev, c_perm_scale_dev, w2_all_dev, s2_all_dev, nullptr, out_acc_dev);
+      }
+      break;
     case kStep2PipeM64N8K4DbBatch2:
     case kStep2PipeM64N16K4DbBatch2:
       // The N16 selector is an alias for the real K4 experiment until a wider
@@ -1260,7 +1605,7 @@ static inline cudaError_t LaunchStep2DirectAllExperts(
               c_perm_q_dev, c_perm_scale_dev, w2_all_dev, s2_all_dev, w2_tma_desc, out_acc_dev);
       break;
   }
-  return cudaGetLastError();
+  return check_launch_error ? cudaGetLastError() : cudaSuccess;
 }
 
 static inline cudaError_t LaunchStep2DirectAllExperts(
