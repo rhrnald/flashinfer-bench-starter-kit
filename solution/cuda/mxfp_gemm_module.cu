@@ -151,12 +151,8 @@ bool use_vec16_hidden_gather(int rows) {
 using detail::launch_flashinfer_grouped_blockscaled_gemm1_sm100;
 #endif
 using detail::launch_cutlass_blockscaled_group_gemm_sm100;
-  using detail::launch_cutlass_blockscaled_group_gemm_tn_sm100;
-  using detail::launch_cutlass_blockscaled_grouped_ptr_gemm_sm100;
-  using detail::launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_g1_paired_b_value_tma_remap;
-  using detail::launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_g1_paired_b_value_tma_remap_interleaved_sfb;
-  using detail::launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_g1_paired_fork;
-  using detail::launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_g1_swiglu_fused_poc;
+using detail::launch_cutlass_blockscaled_group_gemm_tn_sm100;
+using detail::launch_cutlass_blockscaled_grouped_ptr_gemm_sm100;
 using detail::launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_select_epilogue;
 using detail::launch_cutlass_dense_gemm_sm100;
 using detail::launch_cutlass_dense_grouped_ptr_gemm_sm100;
@@ -1300,147 +1296,6 @@ __global__ void grouped_swiglu_quantize_to_fp8_col_blocks_per_cta_kernel(
   }
 }
 
-template <typename G1Type, bool Interleaved>
-__global__ void grouped_swiglu_activation_to_float_kernel(
-    const G1Type* __restrict__ g1, int intermediate, int padded_total_rows,
-    const int* __restrict__ expert_offsets, const int* __restrict__ padded_offsets,
-    float* __restrict__ activation) {
-  int padded_row = blockIdx.x;
-  int ib = blockIdx.y;
-  int tid = threadIdx.x;
-  if (padded_row >= padded_total_rows) return;
-
-  __shared__ int compact_row_sh;
-  __shared__ int valid_row_sh;
-  if (tid == 0) {
-    int le = 0;
-#pragma unroll
-    for (int i = 0; i < 32; ++i) {
-      if (padded_row >= padded_offsets[i]) le = i;
-    }
-    int local_row = padded_row - padded_offsets[le];
-    int n_rows = expert_offsets[le + 1] - expert_offsets[le];
-    compact_row_sh = expert_offsets[le] + local_row;
-    valid_row_sh = (local_row < n_rows) ? 1 : 0;
-  }
-  __syncthreads();
-
-  int i = ib * 128 + tid;
-  float v = 0.0f;
-  if (tid < 128 && i < intermediate && valid_row_sh != 0) {
-    const G1Type* g1_row = g1 + static_cast<int64_t>(compact_row_sh) * (2 * intermediate);
-    float x1 = load_g1_middle_value(g1_row + g1_gate_col<Interleaved>(i, intermediate));
-    float x2 = load_g1_middle_value(g1_row + g1_up_col<Interleaved>(i, intermediate));
-    v = x1 * siluf_device(x2);
-  }
-  if (tid < 128 && i < intermediate) {
-    activation[static_cast<int64_t>(padded_row) * intermediate + i] = v;
-  }
-}
-
-__global__ void quantize_float_rows_to_fp8_kernel(const float* __restrict__ in_f32, int cols,
-                                                  int n_rows, int padded_rows,
-                                                  uint8_t* __restrict__ out_fp8,
-                                                  float* __restrict__ out_scale,
-                                                  bool scale_major_k) {
-  int row = blockIdx.x;
-  int cb = blockIdx.y;
-  int tid = threadIdx.x;
-  if (row >= padded_rows) return;
-
-  extern __shared__ float smem[];
-  float v = 0.0f;
-  int col = cb * 128 + tid;
-  if (tid < 128 && col < cols && row < n_rows) {
-    v = in_f32[static_cast<int64_t>(row) * cols + col];
-  }
-  smem[tid] = fabsf(v);
-  __syncthreads();
-
-  for (int offset = 64; offset > 0; offset >>= 1) {
-    if (tid < offset) smem[tid] = fmaxf(smem[tid], smem[tid + offset]);
-    __syncthreads();
-  }
-
-  float scale = fmaxf(smem[0] / 448.0f, 1.0e-8f);
-  if (tid == 0) {
-    int col_blocks = cols / 128;
-    if (scale_major_k) {
-      out_scale[static_cast<int64_t>(row) * col_blocks + cb] = scale;
-    } else {
-      out_scale[static_cast<int64_t>(cb) * padded_rows + row] = scale;
-    }
-  }
-  if (tid < 128 && col < cols) {
-    out_fp8[static_cast<int64_t>(row) * cols + col] =
-        (row < n_rows) ? float_to_e4m3_device(v / scale) : 0;
-  }
-}
-
-__global__ void quantize_float_rows_to_fp8_mse_kernel(const float* __restrict__ in_f32, int cols,
-                                                      int n_rows, int padded_rows,
-                                                      uint8_t* __restrict__ out_fp8,
-                                                      float* __restrict__ out_scale,
-                                                      bool scale_major_k) {
-  int row = blockIdx.x;
-  int cb = blockIdx.y;
-  int tid = threadIdx.x;
-  if (row >= padded_rows) return;
-
-  __shared__ float vals[128];
-  __shared__ float best_scale;
-  int col = cb * 128 + tid;
-  float v = 0.0f;
-  if (tid < 128 && col < cols && row < n_rows) {
-    v = in_f32[static_cast<int64_t>(row) * cols + col];
-  }
-  vals[tid] = v;
-  __syncthreads();
-
-  if (tid == 0) {
-    float absmax = 0.0f;
-    for (int i = 0; i < 128; ++i) {
-      float av = fabsf(vals[i]);
-      absmax = fmaxf(absmax, av);
-    }
-
-    float base_scale = fmaxf(absmax / 448.0f, 1.0e-8f);
-    float chosen_scale = base_scale;
-    float best_err = INFINITY;
-
-    // Search a small logarithmic window around absmax scaling and keep the
-    // scale that minimizes actual FP8 encode/decode MSE for this 1x128 block.
-    for (int step = -12; step <= 12; ++step) {
-      float cand_scale = base_scale * exp2f(static_cast<float>(step) * 0.25f);
-      cand_scale = fmaxf(cand_scale, 1.0e-8f);
-      float err = 0.0f;
-      for (int i = 0; i < 128; ++i) {
-        uint8_t q = float_to_e4m3_device(vals[i] / cand_scale);
-        float dq = fp8_native_to_float_device(q) * cand_scale;
-        float diff = vals[i] - dq;
-        err += diff * diff;
-      }
-      if (err < best_err) {
-        best_err = err;
-        chosen_scale = cand_scale;
-      }
-    }
-    best_scale = chosen_scale;
-    int col_blocks = cols / 128;
-    if (scale_major_k) {
-      out_scale[static_cast<int64_t>(row) * col_blocks + cb] = chosen_scale;
-    } else {
-      out_scale[static_cast<int64_t>(cb) * padded_rows + row] = chosen_scale;
-    }
-  }
-  __syncthreads();
-
-  if (tid < 128 && col < cols) {
-    out_fp8[static_cast<int64_t>(row) * cols + col] =
-        (row < n_rows) ? float_to_e4m3_device(vals[tid] / best_scale) : 0;
-  }
-}
-
 __global__ void compute_block_scale_128x128_kernel(const float* __restrict__ in_f32, int cols,
                                                    int n_rows, int padded_rows,
                                                    int row_blocks, int col_blocks,
@@ -2161,74 +2016,6 @@ __global__ void compare_g1_stats_kernel(const float* __restrict__ cur,
   atomicMax(reinterpret_cast<int*>(max_out), __float_as_int(diff));
 }
 
-__global__ void compare_fp8_activation_stats_kernel(
-    const uint8_t* __restrict__ cur_c, const uint8_t* __restrict__ ref_c,
-    const float* __restrict__ cur_scale, const float* __restrict__ ref_scale,
-    int64_t c_elems, int64_t scale_elems, int* __restrict__ bad_c,
-    int* __restrict__ bad_scale, float* __restrict__ max_scale_diff,
-    uint8_t* __restrict__ sample_c, float* __restrict__ sample_scale) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx < c_elems) {
-    uint8_t a = cur_c[idx];
-    uint8_t b = ref_c[idx];
-    if (idx < 16) {
-      sample_c[idx] = a;
-      sample_c[16 + idx] = b;
-    }
-    if (a != b) atomicAdd(bad_c, 1);
-  }
-  if (idx < scale_elems) {
-    float a = cur_scale[idx];
-    float b = ref_scale[idx];
-    if (idx < 16) {
-      sample_scale[idx] = a;
-      sample_scale[16 + idx] = b;
-    }
-    float diff = fabsf(a - b);
-    if (diff > 1.0e-12f) atomicAdd(bad_scale, 1);
-    atomicMax(reinterpret_cast<int*>(max_scale_diff), __float_as_int(diff));
-  }
-}
-
-__global__ void interleave_gemm1_weight_blocks_kernel(const uint8_t* __restrict__ in,
-                                                      uint8_t* __restrict__ out,
-                                                      int experts, int intermediate,
-                                                      int hidden) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  int64_t n_cols = static_cast<int64_t>(2) * intermediate;
-  int64_t total = static_cast<int64_t>(experts) * n_cols * hidden;
-  if (idx >= total) return;
-
-  int k = static_cast<int>(idx % hidden);
-  int out_n = static_cast<int>((idx / hidden) % n_cols);
-  int expert = static_cast<int>(idx / (hidden * n_cols));
-  int block = out_n / 256;
-  int lane = out_n - block * 256;
-  int in_n = (lane < 128) ? block * 128 + lane
-                          : intermediate + block * 128 + (lane - 128);
-  out[(static_cast<int64_t>(expert) * n_cols + out_n) * hidden + k] =
-      in[(static_cast<int64_t>(expert) * n_cols + in_n) * hidden + k];
-}
-
-__global__ void interleave_gemm1_scale_blocks_kernel(const float* __restrict__ in,
-                                                     float* __restrict__ out,
-                                                     int experts, int intermediate_blocks,
-                                                     int hidden_blocks) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int n_blocks = 2 * intermediate_blocks;
-  int total = experts * n_blocks * hidden_blocks;
-  if (idx >= total) return;
-
-  int kb = idx % hidden_blocks;
-  int out_nb = (idx / hidden_blocks) % n_blocks;
-  int expert = idx / (hidden_blocks * n_blocks);
-  int block = out_nb / 2;
-  int in_pair = out_nb - block * 2;
-  int in_nb = (in_pair == 0) ? block : intermediate_blocks + block;
-  out[(expert * n_blocks + out_nb) * hidden_blocks + kb] =
-      in[(expert * n_blocks + in_nb) * hidden_blocks + kb];
-}
-
 }  // namespace
 
 DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int block)
@@ -2253,8 +2040,6 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
       tc_a_scale_dev_(nullptr),
       tc_b_scale_dev_(nullptr),
       tc_g1_f32_dev_(nullptr),
-      tc_act_f32_dev_(nullptr),
-      tc_act_max_rows_(0),
       tc_c_fp8_dev_(nullptr),
       tc_c_scale_dev_(nullptr),
       tc_d_f32_dev_(nullptr),
@@ -2264,9 +2049,7 @@ DeviceMxfpGemmModule::DeviceMxfpGemmModule(int hidden, int intermediate, int blo
       tc_int_workspace_dev_(nullptr),
       tc_float_workspace_dev_(nullptr),
       tc_group_int_workspace_dev_(nullptr),
-      tc_group_float_workspace_dev_(nullptr),
-      tc_g1_interleaved_w_dev_(nullptr),
-      tc_g1_interleaved_s_dev_(nullptr) {
+      tc_group_float_workspace_dev_(nullptr) {
   const char* env = std::getenv("FIB_EMULATE_FP8_UNIT");
   emulate_fp8_unit_ = (env != nullptr && env[0] == '1');
   const char* env_fp16_op = std::getenv("FIB_EMULATE_FP16_OPERANDS");
@@ -2318,7 +2101,6 @@ DeviceMxfpGemmModule::~DeviceMxfpGemmModule() {
   if (tc_a_scale_dev_ != nullptr) cudaFree(tc_a_scale_dev_);
   if (tc_b_scale_dev_ != nullptr) cudaFree(tc_b_scale_dev_);
   if (tc_g1_f32_dev_ != nullptr) cudaFree(tc_g1_f32_dev_);
-  if (tc_act_f32_dev_ != nullptr) cudaFree(tc_act_f32_dev_);
   if (tc_c_fp8_dev_ != nullptr) cudaFree(tc_c_fp8_dev_);
   if (tc_c_scale_dev_ != nullptr) cudaFree(tc_c_scale_dev_);
   if (tc_d_f32_dev_ != nullptr) cudaFree(tc_d_f32_dev_);
@@ -2329,8 +2111,6 @@ DeviceMxfpGemmModule::~DeviceMxfpGemmModule() {
   if (tc_float_workspace_dev_ != nullptr) cudaFree(tc_float_workspace_dev_);
   if (tc_group_int_workspace_dev_ != nullptr) cudaFree(tc_group_int_workspace_dev_);
   if (tc_group_float_workspace_dev_ != nullptr) cudaFree(tc_group_float_workspace_dev_);
-  if (tc_g1_interleaved_w_dev_ != nullptr) cudaFree(tc_g1_interleaved_w_dev_);
-  if (tc_g1_interleaved_s_dev_ != nullptr) cudaFree(tc_g1_interleaved_s_dev_);
 }
 
 void DeviceMxfpGemmModule::EnsureWorkspace(int64_t t, cudaStream_t stream) {
@@ -2356,41 +2136,6 @@ void DeviceMxfpGemmModule::EnsureWorkspace(int64_t t, cudaStream_t stream) {
 
 bool DeviceMxfpGemmModule::SupportsTcPath() const {
   return tc_path_enabled_ && FIB_HAS_DIRECT_CUTLASS_SM100;
-}
-
-bool DeviceMxfpGemmModule::BuildInterleavedGemm1Runtime(const uint8_t* gemm1_w_dev,
-                                                        const float* gemm1_s_dev,
-                                                        cudaStream_t stream) {
-  const char* env_debug = std::getenv("FIB_MOE_TC_INTERLEAVED_DEBUG");
-  if (env_debug != nullptr && env_debug[0] == '1') {
-    std::fprintf(stderr, "[mxfp] interleaved_g1_runtime_build w=%p s=%p\n",
-                 static_cast<const void*>(gemm1_w_dev), static_cast<const void*>(gemm1_s_dev));
-  }
-
-  if (tc_g1_interleaved_w_dev_ == nullptr) {
-    size_t w_elems = static_cast<size_t>(32) * gemm1_out_ * hidden_;
-    cudaError_t e = cudaMalloc(&tc_g1_interleaved_w_dev_, w_elems * sizeof(uint8_t));
-    if (e != cudaSuccess) return false;
-  }
-  if (tc_g1_interleaved_s_dev_ == nullptr) {
-    size_t s_elems = static_cast<size_t>(32) * gemm1_out_blocks_ * hidden_blocks_;
-    cudaError_t e = cudaMalloc(&tc_g1_interleaved_s_dev_, s_elems * sizeof(float));
-    if (e != cudaSuccess) return false;
-  }
-
-  constexpr int kThreads = 256;
-  int64_t w_elems = static_cast<int64_t>(32) * gemm1_out_ * hidden_;
-  interleave_gemm1_weight_blocks_kernel<<<static_cast<int>((w_elems + kThreads - 1) / kThreads),
-                                          kThreads, 0, stream>>>(
-      gemm1_w_dev, tc_g1_interleaved_w_dev_, 32, intermediate_, hidden_);
-  if (cudaGetLastError() != cudaSuccess) return false;
-  int s_elems = 32 * gemm1_out_blocks_ * hidden_blocks_;
-  interleave_gemm1_scale_blocks_kernel<<<(s_elems + kThreads - 1) / kThreads, kThreads, 0,
-                                         stream>>>(
-      gemm1_s_dev, tc_g1_interleaved_s_dev_, 32, intermediate_blocks_, hidden_blocks_);
-  if (cudaGetLastError() != cudaSuccess) return false;
-
-  return true;
 }
 
 void DeviceMxfpGemmModule::EnsureTcWorkspace(int rows) {
@@ -2450,22 +2195,6 @@ void DeviceMxfpGemmModule::EnsureTcWorkspace(int rows) {
   if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_group_int_workspace_dev_");
   e = cudaMalloc(&tc_group_float_workspace_dev_, kCutlassWorkspaceBytes);
   if (e != cudaSuccess) throw std::runtime_error("cudaMalloc failed for tc_group_float_workspace_dev_");
-}
-
-void DeviceMxfpGemmModule::EnsureTcActivationWorkspace(int rows) {
-  int padded_rows = (rows + 3) & ~3;
-  if (padded_rows <= tc_act_max_rows_ && tc_act_f32_dev_ != nullptr) return;
-  if (tc_act_f32_dev_ != nullptr) {
-    cudaFree(tc_act_f32_dev_);
-    tc_act_f32_dev_ = nullptr;
-  }
-  tc_act_max_rows_ = padded_rows;
-  cudaError_t e = cudaMalloc(&tc_act_f32_dev_,
-                             static_cast<size_t>(padded_rows) * intermediate_ * sizeof(float));
-  if (e != cudaSuccess) {
-    tc_act_max_rows_ = 0;
-    throw std::runtime_error("cudaMalloc failed for tc_act_f32_dev_");
-  }
 }
 
 void DeviceMxfpGemmModule::RunExpert(const float* a_dev, int64_t t, const float* local_weight_dev,
@@ -3082,26 +2811,9 @@ bool DeviceMxfpGemmModule::RunGroupedGemm1ThenExpertGemm2Tc(
   void* grouped_arg_workspace = tc_group_int_workspace_dev_;
   void* grouped_gemm_workspace = tc_group_float_workspace_dev_;
   constexpr int kThreads = 256;
-  const char* env_grouped_g1_swiglu_fused_poc =
-      std::getenv("FIB_MOE_TC_GROUPED_G1_SWIGLU_FUSED_POC");
-  const bool grouped_g1_swiglu_fused_poc =
-      env_grouped_g1_swiglu_fused_poc != nullptr &&
-      env_grouped_g1_swiglu_fused_poc[0] == '1';
-  int grouped_g1_swiglu_fused_pair_offset =
-      env_int_or_default("FIB_MOE_TC_GROUPED_G1_SWIGLU_FUSED_PAIR_OFFSET", 16);
-  if (grouped_g1_swiglu_fused_pair_offset < 0) grouped_g1_swiglu_fused_pair_offset = 0;
-  if (grouped_g1_swiglu_fused_pair_offset > 127) grouped_g1_swiglu_fused_pair_offset = 127;
-  const char* env_grouped_g1_swiglu_fused_shfl =
-      std::getenv("FIB_MOE_TC_GROUPED_G1_SWIGLU_FUSED_SHFL_POC");
-  const int grouped_g1_swiglu_fused_mode =
-      (env_grouped_g1_swiglu_fused_shfl == nullptr ||
-       env_grouped_g1_swiglu_fused_shfl[0] != '0')
-          ? 1
-          : 0;
   const char* env_device_group_args = std::getenv("FIB_MOE_TC_DEVICE_GROUP_ARGS");
   const bool device_group_args =
-      (env_device_group_args == nullptr || env_device_group_args[0] != '0') &&
-      !grouped_g1_swiglu_fused_poc;
+      env_device_group_args == nullptr || env_device_group_args[0] != '0';
   int g1_num_groups = device_group_args ? 32 : active_groups;
   const int* g1_offsets_host = device_group_args ? nullptr : compact_offsets.data();
   const int* g1_group_ids_host = device_group_args ? nullptr : active_expert_ids.data();
@@ -3130,30 +2842,8 @@ bool DeviceMxfpGemmModule::RunGroupedGemm1ThenExpertGemm2Tc(
   if (grouped_g1_mma_sm_override == 1 || grouped_g1_mma_sm_override == 2) {
     g1_mma_sm = grouped_g1_mma_sm_override;
   }
-  if (grouped_g1_swiglu_fused_poc) g1_mma_sm = 1;
   int grouped_g1_tile_m = select_tile_m_from_env(
       "FIB_MOE_GROUPED_G1_TILE_M", g1_mma_sm == 2 ? 256 : 64);
-  if (grouped_g1_swiglu_fused_poc) grouped_g1_tile_m = 64;
-  const char* env_grouped_g1_paired_tile_poc =
-      std::getenv("FIB_MOE_TC_GROUPED_G1_PAIRED_TILE_POC");
-  const bool grouped_g1_paired_tile_poc =
-      env_grouped_g1_paired_tile_poc != nullptr && env_grouped_g1_paired_tile_poc[0] == '1';
-  const char* env_grouped_g1_paired_b_value_tma_remap =
-      std::getenv("FIB_MOE_TC_GROUPED_G1_PAIRED_B_VALUE_TMA_REMAP");
-  const bool grouped_g1_paired_b_value_tma_remap =
-      grouped_g1_swiglu_fused_poc ||
-      (env_grouped_g1_paired_b_value_tma_remap != nullptr &&
-       env_grouped_g1_paired_b_value_tma_remap[0] == '1');
-  const char* env_grouped_g1_paired_b_value_interleaved_sfb =
-      std::getenv("FIB_MOE_TC_GROUPED_G1_PAIRED_B_VALUE_INTERLEAVED_SFB");
-  const bool grouped_g1_paired_b_value_interleaved_sfb =
-      grouped_g1_paired_b_value_tma_remap &&
-      env_grouped_g1_paired_b_value_interleaved_sfb != nullptr &&
-      env_grouped_g1_paired_b_value_interleaved_sfb[0] == '1';
-  int grouped_g1_tile_n = env_int_or_default("FIB_MOE_GROUPED_G1_TILE_N",
-                                             (grouped_g1_paired_tile_poc ||
-                                              grouped_g1_paired_b_value_tma_remap) ? 256 : 128);
-  if (grouped_g1_tile_n != 128 && grouped_g1_tile_n != 256) grouped_g1_tile_n = 128;
   const char* env_group_flashinfer = std::getenv("FIB_MOE_TC_GROUPED_G1_FLASHINFER");
   const bool group_flashinfer =
       (env_group_flashinfer != nullptr && env_group_flashinfer[0] == '1' && active_groups == 32);
@@ -3173,13 +2863,6 @@ bool DeviceMxfpGemmModule::RunGroupedGemm1ThenExpertGemm2Tc(
   const bool grouped_g1_f16_output = env_grouped_g1_f16_output != nullptr &&
                                      env_grouped_g1_f16_output[0] == '1' &&
                                      !group_scale_mn && grouped_g2_after_g1_candidate;
-  const char* env_grouped_g1_interleaved = std::getenv("FIB_MOE_TC_GROUPED_G1_INTERLEAVED");
-  const bool grouped_g1_interleaved =
-      (grouped_g1_paired_tile_poc || grouped_g1_paired_b_value_tma_remap ||
-       (env_grouped_g1_interleaved != nullptr && env_grouped_g1_interleaved[0] == '1')) &&
-      !group_scale_mn && !grouped_g1_f16_output && grouped_g2_after_g1_candidate;
-  if ((grouped_g1_paired_tile_poc || grouped_g1_paired_b_value_tma_remap) &&
-      grouped_g1_tile_n != 256) grouped_g1_tile_n = 256;
   std::array<int, 33> padded_offsets_fallback{};
   int* padded_offsets =
       tc_m_indptr_host_ == nullptr ? padded_offsets_fallback.data() : tc_m_indptr_host_;
@@ -3188,36 +2871,8 @@ bool DeviceMxfpGemmModule::RunGroupedGemm1ThenExpertGemm2Tc(
     padded_offsets[le + 1] = padded_offsets[le] + ((expert_counts_host[le] + 3) & ~3);
   }
   int padded_total_rows = padded_offsets[32];
-  if (grouped_g1_paired_tile_poc || grouped_g1_paired_b_value_tma_remap) {
-    static bool warned_paired_tile_poc = false;
-    if (!warned_paired_tile_poc) {
-      if (grouped_g1_paired_b_value_tma_remap) {
-        std::fprintf(stderr,
-                     "[mxfp] FIB_MOE_TC_GROUPED_G1_PAIRED_B_VALUE_TMA_REMAP=1 uses the "
-                     "vendored CUTLASS G1 mainloop to TMA-load gate/up half tiles from the "
-                     "original GEMM1 weights into one MmaTileN=256 CTA.\n");
-      } else {
-        std::fprintf(stderr,
-                     "[mxfp] FIB_MOE_TC_GROUPED_G1_PAIRED_TILE_POC=1 uses runtime interleaved "
-                     "GEMM1 weights with MmaTileN=256. This is a correctness scaffold for the "
-                     "paired-CTA epilogue path, not a production-speed path.\n");
-      }
-      warned_paired_tile_poc = true;
-    }
-  }
-  const char* env_grouped_g1_use_paired_fork =
-      std::getenv("FIB_MOE_TC_GROUPED_G1_USE_PAIRED_FORK");
-  const bool grouped_g1_use_paired_fork =
-      grouped_g1_paired_tile_poc ||
-      (env_grouped_g1_use_paired_fork != nullptr && env_grouped_g1_use_paired_fork[0] == '1');
   const uint8_t* g1_w_dev = gemm1_w_dev;
   const float* g1_s_dev = gemm1_s_dev;
-  if (grouped_g1_interleaved &&
-      (!grouped_g1_paired_b_value_tma_remap || grouped_g1_paired_b_value_interleaved_sfb)) {
-    if (!BuildInterleavedGemm1Runtime(gemm1_w_dev, gemm1_s_dev, stream)) return false;
-    if (!grouped_g1_paired_b_value_tma_remap) g1_w_dev = tc_g1_interleaved_w_dev_;
-    g1_s_dev = tc_g1_interleaved_s_dev_;
-  }
   cudaError_t st1 = cudaSuccess;
 #if FIB_HAS_FLASHINFER_GROUP_GEMM_FP8_SM100
   if (group_flashinfer) {
@@ -3319,111 +2974,6 @@ bool DeviceMxfpGemmModule::RunGroupedGemm1ThenExpertGemm2Tc(
           const_cast<float*>(g1_s_dev), reinterpret_cast<cutlass::half_t*>(tc_g1_f32_dev_),
           const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
           g1_num_groups, stream, g1_offsets_host, g1_group_ids_host);
-    } else if (grouped_g1_interleaved && grouped_g1_tile_n == 256 && g1_mma_sm == 2) {
-      if (grouped_g1_use_paired_fork) {
-        st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_g1_paired_fork<
-            1, true, 256, 2, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, 256>(
-            grouped_g1_tma_epilogue, grouped_arg_workspace, 32ull * 1024ull * 1024ull,
-            grouped_gemm_workspace,
-            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
-            const_cast<FP8*>(reinterpret_cast<const FP8*>(g1_w_dev)), tc_a_scale_dev_,
-            const_cast<float*>(g1_s_dev), tc_g1_f32_dev_,
-            const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
-            g1_num_groups, stream, g1_offsets_host, g1_group_ids_host);
-      } else {
-        st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_select_epilogue<
-            1, true, 256, 2, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, 256>(
-            grouped_g1_tma_epilogue, grouped_arg_workspace, 32ull * 1024ull * 1024ull,
-            grouped_gemm_workspace,
-            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
-            const_cast<FP8*>(reinterpret_cast<const FP8*>(g1_w_dev)), tc_a_scale_dev_,
-            const_cast<float*>(g1_s_dev), tc_g1_f32_dev_,
-            const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
-            g1_num_groups, stream, g1_offsets_host, g1_group_ids_host);
-      }
-    } else if (grouped_g1_interleaved && grouped_g1_tile_n == 256 &&
-               grouped_g1_tile_m == 64) {
-      if (grouped_g1_swiglu_fused_poc) {
-        cudaMemcpyAsync(tc_m_indptr_dev_, padded_offsets, 33 * sizeof(int),
-                        cudaMemcpyHostToDevice, stream);
-        zero_grouped_padding_activation_rows_kernel<<<32, 256, 0, stream>>>(
-            expert_offsets_dev, tc_m_indptr_dev_, intermediate_, intermediate_blocks_,
-            tc_c_fp8_dev_, tc_c_scale_dev_);
-        st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_g1_swiglu_fused_poc<
-            1, true, 64, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, 256>(
-            grouped_arg_workspace, 32ull * 1024ull * 1024ull, grouped_gemm_workspace,
-            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
-            const_cast<FP8*>(reinterpret_cast<const FP8*>(g1_w_dev)), tc_a_scale_dev_,
-            const_cast<float*>(g1_s_dev), tc_g1_f32_dev_, const_cast<int*>(expert_offsets_dev),
-            total_rows, gemm1_out_, hidden_, g1_num_groups, stream, g1_offsets_host,
-            g1_group_ids_host, tc_c_fp8_dev_, tc_c_scale_dev_, padded_offsets, intermediate_,
-            grouped_g1_swiglu_fused_pair_offset, grouped_g1_swiglu_fused_mode);
-      } else if (grouped_g1_paired_b_value_tma_remap) {
-        if (grouped_g1_paired_b_value_interleaved_sfb) {
-          st1 =
-              launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_g1_paired_b_value_tma_remap_interleaved_sfb<
-                  1, true, 64, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, 256>(
-                  grouped_g1_tma_epilogue, grouped_arg_workspace, 32ull * 1024ull * 1024ull,
-                  grouped_gemm_workspace,
-                  32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
-                  const_cast<FP8*>(reinterpret_cast<const FP8*>(g1_w_dev)), tc_a_scale_dev_,
-                  const_cast<float*>(g1_s_dev), tc_g1_f32_dev_,
-                  const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
-                  g1_num_groups, stream, g1_offsets_host, g1_group_ids_host);
-        } else {
-          st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_g1_paired_b_value_tma_remap<
-              1, true, 64, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, 256>(
-              grouped_g1_tma_epilogue, grouped_arg_workspace, 32ull * 1024ull * 1024ull,
-              grouped_gemm_workspace,
-              32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
-              const_cast<FP8*>(reinterpret_cast<const FP8*>(g1_w_dev)), tc_a_scale_dev_,
-              const_cast<float*>(g1_s_dev), tc_g1_f32_dev_,
-              const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
-              g1_num_groups, stream, g1_offsets_host, g1_group_ids_host);
-        }
-      } else if (grouped_g1_use_paired_fork) {
-        st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_g1_paired_fork<
-            1, true, 64, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, 256>(
-            grouped_g1_tma_epilogue, grouped_arg_workspace, 32ull * 1024ull * 1024ull,
-            grouped_gemm_workspace,
-            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
-            const_cast<FP8*>(reinterpret_cast<const FP8*>(g1_w_dev)), tc_a_scale_dev_,
-            const_cast<float*>(g1_s_dev), tc_g1_f32_dev_,
-            const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
-            g1_num_groups, stream, g1_offsets_host, g1_group_ids_host);
-      } else {
-        st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_select_epilogue<
-            1, true, 64, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, 256>(
-            grouped_g1_tma_epilogue, grouped_arg_workspace, 32ull * 1024ull * 1024ull,
-            grouped_gemm_workspace,
-            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
-            const_cast<FP8*>(reinterpret_cast<const FP8*>(g1_w_dev)), tc_a_scale_dev_,
-            const_cast<float*>(g1_s_dev), tc_g1_f32_dev_,
-            const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
-            g1_num_groups, stream, g1_offsets_host, g1_group_ids_host);
-      }
-    } else if (grouped_g1_interleaved && grouped_g1_tile_n == 256) {
-      if (grouped_g1_use_paired_fork) {
-        st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_g1_paired_fork<
-            1, true, 128, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, 256>(
-            grouped_g1_tma_epilogue, grouped_arg_workspace, 32ull * 1024ull * 1024ull,
-            grouped_gemm_workspace,
-            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
-            const_cast<FP8*>(reinterpret_cast<const FP8*>(g1_w_dev)), tc_a_scale_dev_,
-            const_cast<float*>(g1_s_dev), tc_g1_f32_dev_,
-            const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
-            g1_num_groups, stream, g1_offsets_host, g1_group_ids_host);
-      } else {
-        st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_select_epilogue<
-            1, true, 128, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, 256>(
-            grouped_g1_tma_epilogue, grouped_arg_workspace, 32ull * 1024ull * 1024ull,
-            grouped_gemm_workspace,
-            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_a_fp8_dev_),
-            const_cast<FP8*>(reinterpret_cast<const FP8*>(g1_w_dev)), tc_a_scale_dev_,
-            const_cast<float*>(g1_s_dev), tc_g1_f32_dev_,
-            const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
-            g1_num_groups, stream, g1_offsets_host, g1_group_ids_host);
-      }
     } else if (g1_mma_sm == 2) {
       st1 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_select_epilogue<
           1, true, 256, 2, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>(
@@ -3458,59 +3008,8 @@ bool DeviceMxfpGemmModule::RunGroupedGemm1ThenExpertGemm2Tc(
   }
   if (st1 != cudaSuccess) return false;
 
-  const char* env_paired_compare = std::getenv("FIB_MOE_TC_GROUPED_G1_PAIRED_COMPARE");
-  if (grouped_g1_paired_b_value_tma_remap && env_paired_compare != nullptr &&
-      env_paired_compare[0] == '1') {
-    if (!BuildInterleavedGemm1Runtime(gemm1_w_dev, gemm1_s_dev, stream)) return false;
-    EnsureWorkspace(total_rows, stream);
-    cudaError_t st_ref =
-        launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_g1_paired_fork<
-            1, true, 64, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, 256>(
-            grouped_g1_tma_epilogue, grouped_arg_workspace, 32ull * 1024ull * 1024ull,
-            grouped_gemm_workspace, 32ull * 1024ull * 1024ull,
-            reinterpret_cast<FP8*>(tc_a_fp8_dev_),
-            reinterpret_cast<FP8*>(tc_g1_interleaved_w_dev_), tc_a_scale_dev_,
-            tc_g1_interleaved_s_dev_, g1_dev_, const_cast<int*>(expert_offsets_dev),
-            total_rows, gemm1_out_, hidden_, g1_num_groups, stream, g1_offsets_host,
-            g1_group_ids_host);
-    if (st_ref == cudaSuccess) {
-      float* max_diff_dev = nullptr;
-      int* bad_count_dev = nullptr;
-      float* samples_dev = nullptr;
-      cudaMalloc(&max_diff_dev, sizeof(float));
-      cudaMalloc(&bad_count_dev, sizeof(int));
-      cudaMalloc(&samples_dev, 32 * sizeof(float));
-      cudaMemsetAsync(max_diff_dev, 0, sizeof(float), stream);
-      cudaMemsetAsync(bad_count_dev, 0, sizeof(int), stream);
-      int64_t g1_elems = static_cast<int64_t>(total_rows) * gemm1_out_;
-      compare_g1_stats_kernel<<<static_cast<int>((g1_elems + kThreads - 1) / kThreads),
-                                kThreads, 0, stream>>>(
-          tc_g1_f32_dev_, g1_dev_, g1_elems, max_diff_dev, bad_count_dev, samples_dev);
-      float max_diff = 0.0f;
-      int bad_count = 0;
-      float samples[32];
-      cudaMemcpyAsync(&max_diff, max_diff_dev, sizeof(float), cudaMemcpyDeviceToHost, stream);
-      cudaMemcpyAsync(&bad_count, bad_count_dev, sizeof(int), cudaMemcpyDeviceToHost, stream);
-      cudaMemcpyAsync(samples, samples_dev, sizeof(samples), cudaMemcpyDeviceToHost, stream);
-      cudaStreamSynchronize(stream);
-      cudaFree(max_diff_dev);
-      cudaFree(bad_count_dev);
-      cudaFree(samples_dev);
-      std::fprintf(stderr,
-                   "[mxfp] paired_b_remap_compare elems=%lld bad=%d finite_max_abs_diff=%g\n",
-                   static_cast<long long>(g1_elems), bad_count, max_diff);
-      for (int i = 0; i < 16; ++i) {
-        std::fprintf(stderr, "[mxfp] paired_b_remap_sample[%d] cur=%g ref=%g\n", i,
-                     samples[i], samples[16 + i]);
-      }
-    } else {
-      std::fprintf(stderr, "[mxfp] paired_b_remap reference launch failed: %s\n",
-                   cudaGetErrorString(st_ref));
-    }
-  }
-
   const char* env_compare_grouped_g1 = std::getenv("FIB_MOE_TC_COMPARE_GROUPED_G1");
-  if (!grouped_g1_f16_output && !grouped_g1_interleaved && env_compare_grouped_g1 != nullptr &&
+  if (!grouped_g1_f16_output && env_compare_grouped_g1 != nullptr &&
       env_compare_grouped_g1[0] == '1') {
     EnsureWorkspace(total_rows, stream);
     for (int le = 0; le < 32; ++le) {
@@ -3604,342 +3103,164 @@ bool DeviceMxfpGemmModule::RunGroupedGemm1ThenExpertGemm2Tc(
                       cudaMemcpyHostToDevice, stream);
     }
 
-    const char* env_fused_compare =
-        std::getenv("FIB_MOE_TC_GROUPED_G1_SWIGLU_FUSED_COMPARE");
-    if (grouped_g1_swiglu_fused_poc && env_fused_compare != nullptr &&
-        env_fused_compare[0] == '1') {
-      uint8_t* ref_c_fp8 = nullptr;
-      float* ref_c_scale = nullptr;
-      cudaMalloc(&ref_c_fp8, static_cast<size_t>(padded_total_rows) * intermediate_);
-      cudaMalloc(&ref_c_scale,
-                 static_cast<size_t>(padded_total_rows) * intermediate_blocks_ * sizeof(float));
-      cudaMemsetAsync(ref_c_fp8, 0,
-                      static_cast<size_t>(padded_total_rows) * intermediate_, stream);
-      cudaMemsetAsync(ref_c_scale, 0,
-                      static_cast<size_t>(padded_total_rows) * intermediate_blocks_ *
-                          sizeof(float),
-                      stream);
-      cudaError_t st_ref =
-          launch_cutlass_blockscaled_grouped_ptr_gemm_sm100_g1_paired_b_value_tma_remap<
-              1, true, 64, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, 256>(
-              grouped_g1_tma_epilogue, grouped_arg_workspace, 32ull * 1024ull * 1024ull,
-              grouped_gemm_workspace, 32ull * 1024ull * 1024ull,
-              reinterpret_cast<FP8*>(tc_a_fp8_dev_),
-              const_cast<FP8*>(reinterpret_cast<const FP8*>(g1_w_dev)), tc_a_scale_dev_,
-              const_cast<float*>(g1_s_dev), tc_g1_f32_dev_,
-              const_cast<int*>(expert_offsets_dev), total_rows, gemm1_out_, hidden_,
-              g1_num_groups, stream, g1_offsets_host, g1_group_ids_host);
-      if (st_ref == cudaSuccess) {
-        dim3 ref_grid(padded_total_rows, intermediate_blocks_);
-        grouped_swiglu_quantize_to_fp8_kernel<float, true>
-            <<<ref_grid, 128, 4 * sizeof(float), stream>>>(
-                tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
-                tc_m_indptr_dev_, ref_c_fp8, ref_c_scale);
-        int* bad_c_dev = nullptr;
-        int* bad_scale_dev = nullptr;
-        float* max_scale_diff_dev = nullptr;
-        uint8_t* sample_c_dev = nullptr;
-        float* sample_scale_dev = nullptr;
-        cudaMalloc(&bad_c_dev, sizeof(int));
-        cudaMalloc(&bad_scale_dev, sizeof(int));
-        cudaMalloc(&max_scale_diff_dev, sizeof(float));
-        cudaMalloc(&sample_c_dev, 32 * sizeof(uint8_t));
-        cudaMalloc(&sample_scale_dev, 32 * sizeof(float));
-        cudaMemsetAsync(bad_c_dev, 0, sizeof(int), stream);
-        cudaMemsetAsync(bad_scale_dev, 0, sizeof(int), stream);
-        cudaMemsetAsync(max_scale_diff_dev, 0, sizeof(float), stream);
-        int64_t c_elems = static_cast<int64_t>(padded_total_rows) * intermediate_;
-        int64_t scale_elems =
-            static_cast<int64_t>(padded_total_rows) * intermediate_blocks_;
-        compare_fp8_activation_stats_kernel<<<
-            static_cast<int>((std::max(c_elems, scale_elems) + kThreads - 1) / kThreads),
-            kThreads, 0, stream>>>(tc_c_fp8_dev_, ref_c_fp8, tc_c_scale_dev_, ref_c_scale,
-                                   c_elems, scale_elems, bad_c_dev, bad_scale_dev,
-                                   max_scale_diff_dev, sample_c_dev, sample_scale_dev);
-        int bad_c = 0;
-        int bad_scale = 0;
-        float max_scale_diff = 0.0f;
-        uint8_t sample_c[32];
-        float sample_scale[32];
-        cudaMemcpyAsync(&bad_c, bad_c_dev, sizeof(int), cudaMemcpyDeviceToHost, stream);
-        cudaMemcpyAsync(&bad_scale, bad_scale_dev, sizeof(int), cudaMemcpyDeviceToHost,
-                        stream);
-        cudaMemcpyAsync(&max_scale_diff, max_scale_diff_dev, sizeof(float),
-                        cudaMemcpyDeviceToHost, stream);
-        cudaMemcpyAsync(sample_c, sample_c_dev, sizeof(sample_c), cudaMemcpyDeviceToHost,
-                        stream);
-        cudaMemcpyAsync(sample_scale, sample_scale_dev, sizeof(sample_scale),
-                        cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
-        std::fprintf(stderr,
-                     "[mxfp] fused_swiglu_compare c_elems=%lld scale_elems=%lld "
-                     "bad_c=%d bad_scale=%d max_scale_diff=%g\n",
-                     static_cast<long long>(c_elems), static_cast<long long>(scale_elems),
-                     bad_c, bad_scale, max_scale_diff);
-        for (int i = 0; i < 16; ++i) {
-          std::fprintf(stderr,
-                       "[mxfp] fused_swiglu_sample[%d] c_cur=%u c_ref=%u "
-                       "scale_cur=%g scale_ref=%g\n",
-                       i, static_cast<unsigned>(sample_c[i]),
-                       static_cast<unsigned>(sample_c[16 + i]), sample_scale[i],
-                       sample_scale[16 + i]);
-        }
-        cudaFree(bad_c_dev);
-        cudaFree(bad_scale_dev);
-        cudaFree(max_scale_diff_dev);
-        cudaFree(sample_c_dev);
-        cudaFree(sample_scale_dev);
-      } else {
-        std::fprintf(stderr, "[mxfp] fused_swiglu reference launch failed: %s\n",
-                     cudaGetErrorString(st_ref));
-      }
-      cudaFree(ref_c_fp8);
-      cudaFree(ref_c_scale);
-    }
-
-    if (!grouped_g1_swiglu_fused_poc) {
+    {
       const char* env_grouped_swiglu = std::getenv("FIB_MOE_TC_GROUPED_SWIGLU");
       const bool grouped_swiglu =
           env_grouped_swiglu == nullptr || env_grouped_swiglu[0] != '0';
-      if ((grouped_g1_f16_output || grouped_g1_interleaved) && !grouped_swiglu) return false;
-      const char* env_g2_input_quant_poc = std::getenv("FIB_MOE_TC_G2_INPUT_QUANT_POC");
-      const bool g2_input_quant_poc =
-          grouped_swiglu && env_g2_input_quant_poc != nullptr && env_g2_input_quant_poc[0] == '1';
-      if (g2_input_quant_poc) {
-      EnsureTcActivationWorkspace(padded_total_rows);
-      dim3 agrid(padded_total_rows, intermediate_blocks_);
-      if (grouped_g1_f16_output) {
-        grouped_swiglu_activation_to_float_kernel<uint16_t, false>
-            <<<agrid, 128, 0, stream>>>(reinterpret_cast<const uint16_t*>(tc_g1_f32_dev_),
-                                        intermediate_, padded_total_rows, expert_offsets_dev,
-                                        tc_m_indptr_dev_, tc_act_f32_dev_);
-      } else if (grouped_g1_interleaved) {
-        grouped_swiglu_activation_to_float_kernel<float, true>
-            <<<agrid, 128, 0, stream>>>(tc_g1_f32_dev_, intermediate_, padded_total_rows,
-                                        expert_offsets_dev, tc_m_indptr_dev_, tc_act_f32_dev_);
-      } else {
-        grouped_swiglu_activation_to_float_kernel<float, false>
-            <<<agrid, 128, 0, stream>>>(tc_g1_f32_dev_, intermediate_, padded_total_rows,
-                                        expert_offsets_dev, tc_m_indptr_dev_, tc_act_f32_dev_);
-      }
-      quantize_float_rows_to_fp8_kernel<<<agrid, 128, 128 * sizeof(float), stream>>>(
-          tc_act_f32_dev_, intermediate_, padded_total_rows, padded_total_rows, tc_c_fp8_dev_,
-          tc_c_scale_dev_, true);
-      } else if (grouped_swiglu) {
-      int col_blocks_per_cta =
-          select_grouped_swiglu_col_blocks_per_cta(total_rows, padded_total_rows);
-      if (col_blocks_per_cta == 4) {
-        dim3 qgrid(padded_total_rows, (intermediate_blocks_ + 3) / 4);
-        if (grouped_g1_f16_output) {
-          grouped_swiglu_quantize_to_fp8_col_blocks_per_cta_kernel<4, uint16_t, false>
-              <<<qgrid, 512, 4 * 128 * sizeof(float), stream>>>(
-                  reinterpret_cast<const uint16_t*>(tc_g1_f32_dev_), intermediate_,
-                  padded_total_rows, expert_offsets_dev, tc_m_indptr_dev_, tc_c_fp8_dev_,
-                  tc_c_scale_dev_);
-        } else if (grouped_g1_interleaved) {
-          grouped_swiglu_quantize_to_fp8_col_blocks_per_cta_kernel<4, float, true>
-              <<<qgrid, 512, 4 * 128 * sizeof(float), stream>>>(
-                  tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
-                  tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
-        } else {
-          grouped_swiglu_quantize_to_fp8_col_blocks_per_cta_kernel<4, float, false>
-              <<<qgrid, 512, 4 * 128 * sizeof(float), stream>>>(
-                  tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
-                  tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
-        }
-      } else if (col_blocks_per_cta == 2) {
-        dim3 qgrid(padded_total_rows, (intermediate_blocks_ + 1) / 2);
-        if (grouped_g1_f16_output) {
-          grouped_swiglu_quantize_to_fp8_col_blocks_per_cta_kernel<2, uint16_t, false>
-              <<<qgrid, 256, 2 * 128 * sizeof(float), stream>>>(
-                  reinterpret_cast<const uint16_t*>(tc_g1_f32_dev_), intermediate_,
-                  padded_total_rows, expert_offsets_dev, tc_m_indptr_dev_, tc_c_fp8_dev_,
-                  tc_c_scale_dev_);
-        } else if (grouped_g1_interleaved) {
-          grouped_swiglu_quantize_to_fp8_col_blocks_per_cta_kernel<2, float, true>
-              <<<qgrid, 256, 2 * 128 * sizeof(float), stream>>>(
-                  tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
-                  tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
-        } else {
-          grouped_swiglu_quantize_to_fp8_col_blocks_per_cta_kernel<2, float, false>
-              <<<qgrid, 256, 2 * 128 * sizeof(float), stream>>>(
-                  tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
-                  tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
-        }
-      } else {
-        int rows_per_cta = select_grouped_swiglu_rows_per_cta(total_rows, padded_total_rows);
-        dim3 qgrid((padded_total_rows + rows_per_cta - 1) / rows_per_cta, intermediate_blocks_);
-        int row_map_min_rows =
-            std::max(0, env_int_or_default("FIB_MOE_TC_GROUPED_SWIGLU_ROW_MAP_MIN_ROWS", 4096));
-        bool use_row_map =
-            rows_per_cta == 1 && row_map_min_rows > 0 && padded_total_rows >= row_map_min_rows;
-        if (rows_per_cta == 4) {
+      if (grouped_g1_f16_output && !grouped_swiglu) return false;
+      if (grouped_swiglu) {
+        int col_blocks_per_cta =
+            select_grouped_swiglu_col_blocks_per_cta(total_rows, padded_total_rows);
+        if (col_blocks_per_cta == 4) {
+          dim3 qgrid(padded_total_rows, (intermediate_blocks_ + 3) / 4);
           if (grouped_g1_f16_output) {
-            grouped_swiglu_quantize_to_fp8_rows_per_cta_kernel<4, uint16_t, false>
-                <<<qgrid, 128, 4 * 128 * sizeof(float), stream>>>(
+            grouped_swiglu_quantize_to_fp8_col_blocks_per_cta_kernel<4, uint16_t, false>
+                <<<qgrid, 512, 4 * 128 * sizeof(float), stream>>>(
                     reinterpret_cast<const uint16_t*>(tc_g1_f32_dev_), intermediate_,
                     padded_total_rows, expert_offsets_dev, tc_m_indptr_dev_, tc_c_fp8_dev_,
                     tc_c_scale_dev_);
-          } else if (grouped_g1_interleaved) {
-            grouped_swiglu_quantize_to_fp8_rows_per_cta_kernel<4, float, true>
-                <<<qgrid, 128, 4 * 128 * sizeof(float), stream>>>(
-                    tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
-                    tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
           } else {
-            grouped_swiglu_quantize_to_fp8_rows_per_cta_kernel<4, float, false>
-                <<<qgrid, 128, 4 * 128 * sizeof(float), stream>>>(
+            grouped_swiglu_quantize_to_fp8_col_blocks_per_cta_kernel<4, float, false>
+                <<<qgrid, 512, 4 * 128 * sizeof(float), stream>>>(
                     tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
                     tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
           }
-        } else if (rows_per_cta == 2) {
+        } else if (col_blocks_per_cta == 2) {
+          dim3 qgrid(padded_total_rows, (intermediate_blocks_ + 1) / 2);
           if (grouped_g1_f16_output) {
-            grouped_swiglu_quantize_to_fp8_rows_per_cta_kernel<2, uint16_t, false>
+            grouped_swiglu_quantize_to_fp8_col_blocks_per_cta_kernel<2, uint16_t, false>
+                <<<qgrid, 256, 2 * 128 * sizeof(float), stream>>>(
+                    reinterpret_cast<const uint16_t*>(tc_g1_f32_dev_), intermediate_,
+                    padded_total_rows, expert_offsets_dev, tc_m_indptr_dev_, tc_c_fp8_dev_,
+                    tc_c_scale_dev_);
+          } else {
+            grouped_swiglu_quantize_to_fp8_col_blocks_per_cta_kernel<2, float, false>
+                <<<qgrid, 256, 2 * 128 * sizeof(float), stream>>>(
+                    tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
+                    tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
+          }
+        } else {
+          int rows_per_cta = select_grouped_swiglu_rows_per_cta(total_rows, padded_total_rows);
+          dim3 qgrid((padded_total_rows + rows_per_cta - 1) / rows_per_cta,
+                     intermediate_blocks_);
+          int row_map_min_rows =
+              std::max(0, env_int_or_default("FIB_MOE_TC_GROUPED_SWIGLU_ROW_MAP_MIN_ROWS", 4096));
+          bool use_row_map =
+              rows_per_cta == 1 && row_map_min_rows > 0 && padded_total_rows >= row_map_min_rows;
+          if (rows_per_cta == 4) {
+            if (grouped_g1_f16_output) {
+              grouped_swiglu_quantize_to_fp8_rows_per_cta_kernel<4, uint16_t, false>
+                  <<<qgrid, 128, 4 * 128 * sizeof(float), stream>>>(
+                      reinterpret_cast<const uint16_t*>(tc_g1_f32_dev_), intermediate_,
+                      padded_total_rows, expert_offsets_dev, tc_m_indptr_dev_, tc_c_fp8_dev_,
+                      tc_c_scale_dev_);
+            } else {
+              grouped_swiglu_quantize_to_fp8_rows_per_cta_kernel<4, float, false>
+                  <<<qgrid, 128, 4 * 128 * sizeof(float), stream>>>(
+                      tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
+                      tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
+            }
+          } else if (rows_per_cta == 2) {
+            if (grouped_g1_f16_output) {
+              grouped_swiglu_quantize_to_fp8_rows_per_cta_kernel<2, uint16_t, false>
+                  <<<qgrid, 128, 2 * 128 * sizeof(float), stream>>>(
+                      reinterpret_cast<const uint16_t*>(tc_g1_f32_dev_), intermediate_,
+                      padded_total_rows, expert_offsets_dev, tc_m_indptr_dev_, tc_c_fp8_dev_,
+                      tc_c_scale_dev_);
+            } else {
+              grouped_swiglu_quantize_to_fp8_rows_per_cta_kernel<2, float, false>
+                  <<<qgrid, 128, 2 * 128 * sizeof(float), stream>>>(
+                      tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
+                      tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
+            }
+          } else if (use_row_map) {
+            build_padded_compact_row_map_kernel<<<32, 128, 0, stream>>>(
+                expert_offsets_dev, tc_m_indptr_dev_, tc_padded_compact_rows_dev_);
+            if (grouped_g1_f16_output) {
+              grouped_swiglu_quantize_to_fp8_mapped_kernel<uint16_t, false>
+                  <<<qgrid, 128, 4 * sizeof(float), stream>>>(
+                      reinterpret_cast<const uint16_t*>(tc_g1_f32_dev_), intermediate_,
+                      padded_total_rows, tc_padded_compact_rows_dev_, tc_c_fp8_dev_,
+                      tc_c_scale_dev_);
+            } else {
+              grouped_swiglu_quantize_to_fp8_mapped_kernel<float, false>
+                  <<<qgrid, 128, 4 * sizeof(float), stream>>>(
+                      tc_g1_f32_dev_, intermediate_, padded_total_rows,
+                      tc_padded_compact_rows_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
+            }
+          } else {
+            if (grouped_g1_f16_output) {
+              grouped_swiglu_quantize_to_fp8_kernel<uint16_t, false>
+                  <<<qgrid, 128, 4 * sizeof(float), stream>>>(
+                      reinterpret_cast<const uint16_t*>(tc_g1_f32_dev_), intermediate_,
+                      padded_total_rows, expert_offsets_dev, tc_m_indptr_dev_, tc_c_fp8_dev_,
+                      tc_c_scale_dev_);
+            } else {
+              grouped_swiglu_quantize_to_fp8_kernel<float, false>
+                  <<<qgrid, 128, 4 * sizeof(float), stream>>>(
+                      tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
+                      tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
+            }
+          }
+        }
+      } else {
+        for (int le = 0; le < 32; ++le) {
+          int n_rows = expert_counts_host[le];
+          if (n_rows == 0) continue;
+          int start = expert_offsets_host[le];
+          int padded_start = padded_offsets[le];
+          int padded_rows = (n_rows + 3) & ~3;
+          int swiglu_rows_per_cta = select_swiglu_rows_per_cta(total_rows, padded_rows);
+          dim3 qgrid((padded_rows + swiglu_rows_per_cta - 1) / swiglu_rows_per_cta,
+                     intermediate_blocks_);
+          float* g1_ptr = tc_g1_f32_dev_ + static_cast<int64_t>(start) * gemm1_out_;
+          uint8_t* c_ptr = tc_c_fp8_dev_ + static_cast<int64_t>(padded_start) * intermediate_;
+          float* c_scale_ptr =
+              tc_c_scale_dev_ + static_cast<int64_t>(padded_start) * intermediate_blocks_;
+          if (swiglu_rows_per_cta == 4) {
+            swiglu_quantize_float_to_fp8_rows_per_cta_kernel<4>
+                <<<qgrid, 128, 4 * 128 * sizeof(float), stream>>>(
+                    g1_ptr, intermediate_, n_rows, padded_rows, c_ptr, c_scale_ptr, true);
+          } else if (swiglu_rows_per_cta == 2) {
+            swiglu_quantize_float_to_fp8_rows_per_cta_kernel<2>
                 <<<qgrid, 128, 2 * 128 * sizeof(float), stream>>>(
-                    reinterpret_cast<const uint16_t*>(tc_g1_f32_dev_), intermediate_,
-                    padded_total_rows, expert_offsets_dev, tc_m_indptr_dev_, tc_c_fp8_dev_,
-                    tc_c_scale_dev_);
-          } else if (grouped_g1_interleaved) {
-            grouped_swiglu_quantize_to_fp8_rows_per_cta_kernel<2, float, true>
-                <<<qgrid, 128, 2 * 128 * sizeof(float), stream>>>(
-                    tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
-                    tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
+                    g1_ptr, intermediate_, n_rows, padded_rows, c_ptr, c_scale_ptr, true);
           } else {
-            grouped_swiglu_quantize_to_fp8_rows_per_cta_kernel<2, float, false>
-              <<<qgrid, 128, 2 * 128 * sizeof(float), stream>>>(
-                  tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
-                  tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
-          }
-        } else if (use_row_map) {
-          build_padded_compact_row_map_kernel<<<32, 128, 0, stream>>>(
-              expert_offsets_dev, tc_m_indptr_dev_, tc_padded_compact_rows_dev_);
-          if (grouped_g1_f16_output) {
-            grouped_swiglu_quantize_to_fp8_mapped_kernel<uint16_t, false>
-                <<<qgrid, 128, 4 * sizeof(float), stream>>>(
-                    reinterpret_cast<const uint16_t*>(tc_g1_f32_dev_), intermediate_,
-                    padded_total_rows, tc_padded_compact_rows_dev_, tc_c_fp8_dev_,
-                    tc_c_scale_dev_);
-          } else if (grouped_g1_interleaved) {
-            grouped_swiglu_quantize_to_fp8_mapped_kernel<float, true>
-                <<<qgrid, 128, 4 * sizeof(float), stream>>>(
-                    tc_g1_f32_dev_, intermediate_, padded_total_rows,
-                    tc_padded_compact_rows_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
-          } else {
-            grouped_swiglu_quantize_to_fp8_mapped_kernel<float, false>
-                <<<qgrid, 128, 4 * sizeof(float), stream>>>(
-                    tc_g1_f32_dev_, intermediate_, padded_total_rows,
-                    tc_padded_compact_rows_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
-          }
-        } else {
-          if (grouped_g1_f16_output) {
-            grouped_swiglu_quantize_to_fp8_kernel<uint16_t, false>
-                <<<qgrid, 128, 4 * sizeof(float), stream>>>(
-                    reinterpret_cast<const uint16_t*>(tc_g1_f32_dev_), intermediate_,
-                    padded_total_rows, expert_offsets_dev, tc_m_indptr_dev_, tc_c_fp8_dev_,
-                    tc_c_scale_dev_);
-          } else if (grouped_g1_interleaved) {
-            grouped_swiglu_quantize_to_fp8_kernel<float, true>
-                <<<qgrid, 128, 4 * sizeof(float), stream>>>(
-                    tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
-                    tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
-          } else {
-            grouped_swiglu_quantize_to_fp8_kernel<float, false>
-                <<<qgrid, 128, 4 * sizeof(float), stream>>>(
-                    tc_g1_f32_dev_, intermediate_, padded_total_rows, expert_offsets_dev,
-                    tc_m_indptr_dev_, tc_c_fp8_dev_, tc_c_scale_dev_);
+            swiglu_quantize_float_to_fp8_kernel<<<qgrid, 128, 128 * sizeof(float), stream>>>(
+                g1_ptr, intermediate_, n_rows, padded_rows, c_ptr, c_scale_ptr, true);
           }
         }
-      }
-      } else {
-      for (int le = 0; le < 32; ++le) {
-        int n_rows = expert_counts_host[le];
-        if (n_rows == 0) continue;
-        int start = expert_offsets_host[le];
-        int padded_start = padded_offsets[le];
-        int padded_rows = (n_rows + 3) & ~3;
-        int swiglu_rows_per_cta = select_swiglu_rows_per_cta(total_rows, padded_rows);
-        dim3 qgrid((padded_rows + swiglu_rows_per_cta - 1) / swiglu_rows_per_cta,
-                   intermediate_blocks_);
-        float* g1_ptr = tc_g1_f32_dev_ + static_cast<int64_t>(start) * gemm1_out_;
-        uint8_t* c_ptr = tc_c_fp8_dev_ + static_cast<int64_t>(padded_start) * intermediate_;
-        float* c_scale_ptr =
-            tc_c_scale_dev_ + static_cast<int64_t>(padded_start) * intermediate_blocks_;
-        if (swiglu_rows_per_cta == 4) {
-          swiglu_quantize_float_to_fp8_rows_per_cta_kernel<4>
-              <<<qgrid, 128, 4 * 128 * sizeof(float), stream>>>(
-                  g1_ptr, intermediate_, n_rows, padded_rows, c_ptr, c_scale_ptr, true);
-        } else if (swiglu_rows_per_cta == 2) {
-          swiglu_quantize_float_to_fp8_rows_per_cta_kernel<2>
-              <<<qgrid, 128, 2 * 128 * sizeof(float), stream>>>(
-                  g1_ptr, intermediate_, n_rows, padded_rows, c_ptr, c_scale_ptr, true);
-        } else {
-          swiglu_quantize_float_to_fp8_kernel<<<qgrid, 128, 128 * sizeof(float), stream>>>(
-              g1_ptr, intermediate_, n_rows, padded_rows, c_ptr, c_scale_ptr, true);
-        }
-      }
       }
     }
 
     TcGemmDispatch g2_dispatch = select_trtllm_like_gemm2_dispatch(total_rows, 64);
     int g2_tile_m = select_tile_m_from_env("FIB_MOE_GROUPED_G2_TILE_M", g2_dispatch.tile_m);
     int g2_mma_sm = select_mma_sm_from_env("FIB_MOE_GROUPED_G2_MMA_SM", g2_dispatch.mma_sms);
-    const char* env_g2_input_quant_shell = std::getenv("FIB_MOE_TC_G2_INPUT_QUANT_SHELL");
-    const bool g2_input_quant_shell =
-        env_g2_input_quant_shell != nullptr && env_g2_input_quant_shell[0] == '1';
     cudaError_t st_g2 = cudaSuccess;
     if (g2_mma_sm == 2) {
-      if (g2_input_quant_shell) {
-        st_g2 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
-            1, true, 256, 2, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, false, true>(
-            tc_group_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_group_float_workspace_dev_,
-            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
-            const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
-            const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
-            hidden_, intermediate_, 32, stream, device_group_args ? nullptr : padded_offsets);
-      } else {
-        st_g2 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
-            1, true, 256, 2, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>(
-            tc_group_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_group_float_workspace_dev_,
-            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
-            const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
-            const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
-            hidden_, intermediate_, 32, stream, device_group_args ? nullptr : padded_offsets);
-      }
+      st_g2 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
+          1, true, 256, 2, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>(
+          tc_group_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_group_float_workspace_dev_,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
+          const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
+          hidden_, intermediate_, 32, stream, device_group_args ? nullptr : padded_offsets);
     } else if (g2_tile_m == 128) {
-      if (g2_input_quant_shell) {
-        st_g2 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
-            1, true, 128, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, false, true>(
-            tc_group_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_group_float_workspace_dev_,
-            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
-            const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
-            const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
-            hidden_, intermediate_, 32, stream, device_group_args ? nullptr : padded_offsets);
-      } else {
-        st_g2 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
-            1, true, 128, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>(
-            tc_group_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_group_float_workspace_dev_,
-            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
-            const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
-            const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
-            hidden_, intermediate_, 32, stream, device_group_args ? nullptr : padded_offsets);
-      }
+      st_g2 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
+          1, true, 128, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>(
+          tc_group_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_group_float_workspace_dev_,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
+          const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
+          hidden_, intermediate_, 32, stream, device_group_args ? nullptr : padded_offsets);
     } else {
-      if (g2_input_quant_shell) {
-        st_g2 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
-            1, true, 64, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, false, true>(
-            tc_group_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_group_float_workspace_dev_,
-            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
-            const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
-            const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
-            hidden_, intermediate_, 32, stream, device_group_args ? nullptr : padded_offsets);
-      } else {
-        st_g2 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
-            1, true, 64, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>(
-            tc_group_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_group_float_workspace_dev_,
-            32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
-            const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
-            const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
-            hidden_, intermediate_, 32, stream, device_group_args ? nullptr : padded_offsets);
-      }
+      st_g2 = launch_cutlass_blockscaled_grouped_ptr_gemm_sm100<
+          1, true, 64, 1, cutlass::float_e4m3_t, cutlass::float_e4m3_t, float>(
+          tc_group_int_workspace_dev_, 32ull * 1024ull * 1024ull, tc_group_float_workspace_dev_,
+          32ull * 1024ull * 1024ull, reinterpret_cast<FP8*>(tc_c_fp8_dev_),
+          const_cast<FP8*>(reinterpret_cast<const FP8*>(gemm2_w_dev)), tc_c_scale_dev_,
+          const_cast<float*>(gemm2_s_dev), tc_d_f32_dev_, tc_m_indptr_dev_, padded_total_rows,
+          hidden_, intermediate_, 32, stream, device_group_args ? nullptr : padded_offsets);
     }
     if (st_g2 == cudaSuccess) {
       if (routed_positions_dev == nullptr || routed_local_experts_dev == nullptr ||

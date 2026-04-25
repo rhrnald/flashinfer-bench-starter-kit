@@ -86,9 +86,6 @@ class DeviceMxfpGemmModule {
 
  private:
   void EnsureTcWorkspace(int rows);
-  void EnsureTcActivationWorkspace(int rows);
-  bool BuildInterleavedGemm1Runtime(const uint8_t* gemm1_w_dev, const float* gemm1_s_dev,
-                                    cudaStream_t stream);
   void RunExpertGemm2TcFromG1(int64_t t, int total_rows, int n_rows, int g1_row_offset,
                               int scratch_row_offset, const int* permuted_tok_e,
                               const float* permuted_w_e,
@@ -123,8 +120,6 @@ class DeviceMxfpGemmModule {
   float* tc_a_scale_dev_;
   float* tc_b_scale_dev_;
   float* tc_g1_f32_dev_;
-  float* tc_act_f32_dev_;
-  int tc_act_max_rows_;
   uint8_t* tc_c_fp8_dev_;
   float* tc_c_scale_dev_;
   float* tc_d_f32_dev_;
@@ -135,8 +130,6 @@ class DeviceMxfpGemmModule {
   void* tc_float_workspace_dev_;
   void* tc_group_int_workspace_dev_;
   void* tc_group_float_workspace_dev_;
-  uint8_t* tc_g1_interleaved_w_dev_;
-  float* tc_g1_interleaved_s_dev_;
 };
 
 }  // namespace mxfp
