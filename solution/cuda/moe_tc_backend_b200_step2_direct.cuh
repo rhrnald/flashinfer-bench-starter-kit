@@ -604,8 +604,9 @@ static __global__ void step2_prequant_cperm_kernel(
     int total_routed,
     uint8_t* __restrict__ c_perm_q_dev,
     float* __restrict__ c_perm_scale_dev) {
-  const int k_blk = blockIdx.x;
-  const int slot = blockIdx.y;
+  const int linear_block = static_cast<int>(blockIdx.x);
+  const int k_blk = linear_block % kStep2IntermediateBlocks;
+  const int slot = linear_block / kStep2IntermediateBlocks;
   if (slot >= total_routed) return;
   const int lane = threadIdx.x & 31;
   if (threadIdx.x >= 32) return;
@@ -644,7 +645,7 @@ static inline cudaError_t LaunchStep2PrequantCperm(
     float* c_perm_scale_dev,
     cudaStream_t stream) {
   if (total_routed <= 0) return cudaSuccess;
-  dim3 grid(kStep2IntermediateBlocks, total_routed);
+  dim3 grid(static_cast<unsigned int>(total_routed * kStep2IntermediateBlocks));
   dim3 threads(32);
   step2_prequant_cperm_kernel<<<grid, threads, 0, stream>>>(
       c_perm_all_dev, total_routed, c_perm_q_dev, c_perm_scale_dev);

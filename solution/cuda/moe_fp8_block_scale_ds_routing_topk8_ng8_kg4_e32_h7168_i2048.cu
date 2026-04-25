@@ -46,6 +46,10 @@ void* g_step1_comm_w13_tma_desc_dev = nullptr;
 void* g_step1_direct_w13_tma_desc_dev = nullptr;
 void* g_step2_w2_tma_desc_dev = nullptr;
 void* g_step2_w2_tma_desc_k4_dev = nullptr;
+void* g_cached_direct_gemm1_ptr = nullptr;
+void* g_cached_direct_gemm2_ptr = nullptr;
+bool g_cached_direct_tma = false;
+bool g_cached_direct_tma_sw128 = false;
 
 int ParseStep2PipelineVariant() {
   const char* env = std::getenv("FIB_STEP2_PIPELINE_VARIANT");
@@ -242,6 +246,23 @@ inline void UploadDirectTmaDescriptors(const TensorView& gemm1_weights,
                                        const TensorView& gemm2_weights,
                                        bool use_direct_tma,
                                        bool use_direct_tma_sw128) {
+  void* gemm1_ptr = gemm1_weights.data_ptr();
+  void* gemm2_ptr = gemm2_weights.data_ptr();
+  if (g_cached_direct_gemm1_ptr == gemm1_ptr &&
+      g_cached_direct_gemm2_ptr == gemm2_ptr &&
+      g_cached_direct_tma == use_direct_tma &&
+      g_cached_direct_tma_sw128 == use_direct_tma_sw128 &&
+      (!use_direct_tma || !use_direct_tma_sw128 ||
+       (g_step1_direct_w13_tma_desc_dev != nullptr &&
+        g_step2_w2_tma_desc_dev != nullptr &&
+        g_step2_w2_tma_desc_k4_dev != nullptr))) {
+    return;
+  }
+  g_cached_direct_gemm1_ptr = gemm1_ptr;
+  g_cached_direct_gemm2_ptr = gemm2_ptr;
+  g_cached_direct_tma = use_direct_tma;
+  g_cached_direct_tma_sw128 = use_direct_tma_sw128;
+
   const CUtensorMapSwizzle direct_smem_swizzle =
       use_direct_tma_sw128 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE;
   CUtensorMap direct_w13_tmap =
@@ -734,6 +755,8 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   float* permuted_weights_dev = ws.permuted_weights_dev;
   cudaMemsetAsync(expert_counts_dev, 0, kNumLocalExperts * sizeof(int), stream);
   cudaMemsetAsync(running_counter_dev, 0, kNumLocalExperts * sizeof(int), stream);
+  const bool use_direct_impl = UseDirectImplementation();
+  const bool need_step1_debug_dump = std::getenv("FIB_DEBUG_DUMP_STEP1_DIR") != nullptr;
 
   std::chrono::high_resolution_clock::time_point t0_routing, t1_routing;
   std::chrono::high_resolution_clock::time_point t0_dequant, t1_dequant;
@@ -774,19 +797,26 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
       local_weight_dev, t, expert_offsets_dev, running_counter_dev, permuted_token_ids_dev,
       permuted_weights_dev);
 
-  cudaMemcpyAsync(expert_counts_host.data(), expert_counts_dev,
-                  kNumLocalExperts * sizeof(int), cudaMemcpyDeviceToHost, stream);
-  cudaMemcpyAsync(expert_offsets_host.data(), expert_offsets_dev,
-                  (kNumLocalExperts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
-  cudaError_t meta_sync = cudaStreamSynchronize(stream);
-  TVM_FFI_ICHECK_EQ(meta_sync, cudaSuccess)
-      << "grouped-metadata sync failed before direct backend launch: "
-      << cudaGetErrorString(meta_sync);
+  const bool use_device_metadata_direct =
+      use_direct_impl && !need_step1_debug_dump && t <= 128;
+  const bool need_metadata_host = !use_device_metadata_direct;
+  if (need_metadata_host) {
+    cudaMemcpyAsync(expert_counts_host.data(), expert_counts_dev,
+                    kNumLocalExperts * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(expert_offsets_host.data(), expert_offsets_dev,
+                    (kNumLocalExperts + 1) * sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaError_t meta_sync = cudaStreamSynchronize(stream);
+    TVM_FFI_ICHECK_EQ(meta_sync, cudaSuccess)
+        << "grouped-metadata sync failed before backend launch: "
+        << cudaGetErrorString(meta_sync);
+  }
 
-  const int total_routed = expert_offsets_host[kNumLocalExperts];
+  const int total_routed =
+      need_metadata_host ? expert_offsets_host[kNumLocalExperts]
+                         : static_cast<int>(t * kTopK);
   const int active_expert_count =
-      BuildActiveExpertList(expert_counts_host, active_experts_dev, stream);
-  if (UseDirectImplementation() && total_routed > 0) {
+      need_metadata_host ? BuildActiveExpertList(expert_counts_host, active_experts_dev, stream) : 0;
+  if (use_direct_impl && total_routed > 0) {
     const bool kUseDirectTma = std::getenv("FIB_MOE_COMM_USE_TMA") != nullptr;
     const bool kUseDirectTmaSw128 = std::getenv("FIB_MOE_DIRECT_TMA_SW128") != nullptr;
     const bool kUseDirectBSw128 = std::getenv("FIB_MOE_DIRECT_B_SW128") != nullptr;
@@ -968,8 +998,8 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
         expert_counts_dev,
         expert_offsets_dev,
         permuted_token_ids_dev,
-        active_experts_dev,
-        active_expert_count,
+        need_metadata_host ? active_experts_dev : nullptr,
+        need_metadata_host ? active_expert_count : 0,
         static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
         static_cast<const float*>(gemm1_weights_scale.data_ptr()),
         kUseDirectTma ? g_step1_direct_w13_tma_desc_dev : nullptr,
@@ -982,21 +1012,20 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
     TVM_FFI_ICHECK_EQ(st1, cudaSuccess)
         << "direct Step1(all experts) launch failed: " << cudaGetErrorString(st1);
     step1_timer.End();
-    cudaError_t step1_sync = cudaStreamSynchronize(stream);
-    TVM_FFI_ICHECK_EQ(step1_sync, cudaSuccess)
-        << "direct Step1 stream sync failed: " << cudaGetErrorString(step1_sync);
 
-    maybe_dump_step1_debug(
-        std::getenv("FIB_DEBUG_DUMP_STEP1_DIR"),
-        t,
-        total_routed,
-        expert_counts_host,
-        expert_offsets_host,
-        permuted_token_ids_dev,
-        permuted_weights_dev,
-        step1_debug_output_mode,
-        ws.c_perm_all_dev,
-        stream);
+    if (need_step1_debug_dump) {
+      maybe_dump_step1_debug(
+          std::getenv("FIB_DEBUG_DUMP_STEP1_DIR"),
+          t,
+          total_routed,
+          expert_counts_host,
+          expert_offsets_host,
+          permuted_token_ids_dev,
+          permuted_weights_dev,
+          step1_debug_output_mode,
+          ws.c_perm_all_dev,
+          stream);
+    }
 
     CudaStageTimer step2_timer;
     step2_timer.Begin(kProfile, "moe_step2_timing", t, stream);
@@ -1012,16 +1041,15 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
                       : nullptr;
     cudaError_t st2 = direct_backend::LaunchStep2DirectAllExperts(
         expert_counts_dev, expert_offsets_dev, permuted_token_ids_dev,
-        permuted_weights_dev, active_experts_dev, active_expert_count,
+        permuted_weights_dev,
+        need_metadata_host ? active_experts_dev : nullptr,
+        need_metadata_host ? active_expert_count : 0,
         ws.c_perm_q_dev, ws.c_perm_scale_dev, static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
         static_cast<const float*>(gemm2_weights_scale.data_ptr()),
         step2_tma_desc, out_acc_dev, stream, step2_pipeline_variant);
     TVM_FFI_ICHECK_EQ(st2, cudaSuccess)
         << "direct Step2(all experts) launch failed: " << cudaGetErrorString(st2);
     step2_timer.End();
-    cudaError_t step2_sync = cudaStreamSynchronize(stream);
-    TVM_FFI_ICHECK_EQ(step2_sync, cudaSuccess)
-        << "direct Step2 stream sync failed: " << cudaGetErrorString(step2_sync);
   } else {
     gemm_mod.EnsureWorkspace(t, stream);
     for (int le = 0; le < kNumLocalExperts; ++le) {
