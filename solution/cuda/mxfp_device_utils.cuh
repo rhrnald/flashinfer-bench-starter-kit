@@ -37,7 +37,7 @@ __device__ __forceinline__ float fp8_e4m3fn_to_float_device(uint8_t x) {
   return sign * ldexpf(frac, exp - 7);
 }
 
-__device__ __forceinline__ float siluf_device(float x) { return x / (1.0f + expf(-x)); }
+__device__ __forceinline__ float siluf_device(float x) { return x / (1.0f + __expf(-x)); }
 
 __device__ __forceinline__ float bf16_to_float_device(uint16_t bits) {
   uint32_t u32 = static_cast<uint32_t>(bits) << 16;

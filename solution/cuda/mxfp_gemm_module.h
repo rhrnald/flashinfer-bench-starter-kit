@@ -77,9 +77,18 @@ class DeviceMxfpGemmModule {
       const int* permuted_expert_dev, const float* permuted_w_dev, const uint8_t* gemm1_w_dev,
       const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
       const float* gemm2_s_dev, float* out_acc_dev, cudaStream_t stream);
+  bool RunAllExpertsDenseTc(const uint8_t* hidden_fp8_dev, const float* hidden_scale_dev,
+                            int64_t t, const int* routed_local_experts_dev,
+                            const float* routed_weights_dev, const uint8_t* gemm1_w_dev,
+                            const float* gemm1_s_dev, const uint8_t* gemm2_w_dev,
+                            const float* gemm2_s_dev, uint16_t* output_dev,
+                            cudaStream_t stream);
 
  private:
   void EnsureTcWorkspace(int rows);
+  void EnsureTcActivationWorkspace(int rows);
+  bool BuildInterleavedGemm1Runtime(const uint8_t* gemm1_w_dev, const float* gemm1_s_dev,
+                                    cudaStream_t stream);
   void RunExpertGemm2TcFromG1(int64_t t, int total_rows, int n_rows, int g1_row_offset,
                               int scratch_row_offset, const int* permuted_tok_e,
                               const float* permuted_w_e,
@@ -114,14 +123,20 @@ class DeviceMxfpGemmModule {
   float* tc_a_scale_dev_;
   float* tc_b_scale_dev_;
   float* tc_g1_f32_dev_;
+  float* tc_act_f32_dev_;
+  int tc_act_max_rows_;
   uint8_t* tc_c_fp8_dev_;
   float* tc_c_scale_dev_;
   float* tc_d_f32_dev_;
   int* tc_m_indptr_dev_;
+  int* tc_m_indptr_host_;
+  int* tc_padded_compact_rows_dev_;
   void* tc_int_workspace_dev_;
   void* tc_float_workspace_dev_;
   void* tc_group_int_workspace_dev_;
   void* tc_group_float_workspace_dev_;
+  uint8_t* tc_g1_interleaved_w_dev_;
+  float* tc_g1_interleaved_s_dev_;
 };
 
 }  // namespace mxfp
