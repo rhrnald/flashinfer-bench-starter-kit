@@ -11,6 +11,15 @@ solution.json
 *.fatbin
 *.ptx
 
+# Benchmark and profiling artifacts
+*.csv
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+*.tar.gz
+.nsys_tmp/
+ncu_baseline_*/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

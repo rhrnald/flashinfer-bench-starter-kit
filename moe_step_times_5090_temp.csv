@@ -1,4 +1,0 @@
-mode,case,workload_index,workload_uuid,seq_len,samples,routing_ms,dequant_ms,expert_ms,out_ms,total_ms
-tc5090_tma_stage,min,1,e05c6c03-5603-4a1c-b34c-dcce0ecaeea4,1,2,0.882500,0.019500,122.349500,0.029000,123.321000
-tc5090_tma_stage,mid,15,81955b1e-086f-49c1-9f40-a18a5aaf509d,55,2,0.158500,0.015500,977.837000,0.121500,978.274000
-tc5090_tma_stage,max,8,5e8dc11c-f2a9-42d5-8dce-9419cbf34d5d,14107,2,0.404500,0.642500,3551.354500,0.527500,3553.209000
