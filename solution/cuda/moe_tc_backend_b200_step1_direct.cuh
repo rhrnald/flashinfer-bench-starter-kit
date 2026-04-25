@@ -1749,6 +1749,7 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
     const int* __restrict__ expert_t_valid,
     const int* __restrict__ expert_offset,
     const int* __restrict__ valid_token_idx,
+    const int* __restrict__ active_experts,
     const uint8_t* __restrict__ w13_all_dev,
     const float* __restrict__ s13_all_dev,
     const void* __restrict__ hidden_tma_desc,
@@ -1761,7 +1762,7 @@ static __global__ __launch_bounds__(kStep1CommThreads, 2) void step1_gemm1_swigl
   (void)hidden_tma_desc;
 
   const int out_tile32 = blockIdx.x;  // 0..63
-  const int expert = blockIdx.y;      // 0..31
+  const int expert = active_experts != nullptr ? active_experts[blockIdx.y] : blockIdx.y;
   const int lane = threadIdx.x & 31;
   const int warp_id = threadIdx.x >> 5;
 
@@ -2430,6 +2431,8 @@ inline cudaError_t RunStep1AllExpertsDirect(
     const int* expert_counts_dev,
     const int* expert_offsets_dev,
     const int* permuted_token_ids_dev,
+    const int* active_experts_dev,
+    int active_expert_count,
     const uint8_t* w13_all_dev,
     const float* s13_all_dev,
     const void* w13_tma_desc,
@@ -2458,7 +2461,9 @@ inline cudaError_t RunStep1AllExpertsDirect(
   if (st != cudaSuccess) {
     return st;
   }
-  dim3 grid(kStep1OutTilesPerExpert, kStep1LocalExperts, 1);
+  const int grid_experts =
+      active_expert_count > 0 ? active_expert_count : kStep1LocalExperts;
+  dim3 grid(kStep1OutTilesPerExpert, grid_experts, 1);
   dim3 block(kStep1CommThreads, 1, 1);
   if (use_fast_tcgen) {
     step1_gemm1_swiglu_direct_kernel<2><<<grid, block, smem_bytes, stream>>>(
@@ -2468,6 +2473,7 @@ inline cudaError_t RunStep1AllExpertsDirect(
         expert_counts_dev,
         expert_offsets_dev,
         permuted_token_ids_dev,
+        active_experts_dev,
         w13_all_dev,
         s13_all_dev,
         nullptr,
@@ -2485,6 +2491,7 @@ inline cudaError_t RunStep1AllExpertsDirect(
         expert_counts_dev,
         expert_offsets_dev,
         permuted_token_ids_dev,
+        active_experts_dev,
         w13_all_dev,
         s13_all_dev,
         nullptr,

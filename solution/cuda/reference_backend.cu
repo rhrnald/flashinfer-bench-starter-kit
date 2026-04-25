@@ -575,7 +575,7 @@ cudaError_t ReferenceGemmModule::RunStep1AllExpertsDirect(const uint8_t* hidden_
   const bool use_step1_tma = std::getenv("FIB_MOE_COMM_USE_TMA") != nullptr;
   cudaError_t st = direct_backend::RunStep1AllExpertsDirect(
       hidden_fp8_dev, hidden_scale_dev, t, expert_t_valid, expert_offset, valid_token_idx,
-      gemm1_w_dev, gemm1_s_dev, use_step1_tma ? step1_w13_tma_desc_dev_ : nullptr,
+      nullptr, 0, gemm1_w_dev, gemm1_s_dev, use_step1_tma ? step1_w13_tma_desc_dev_ : nullptr,
       0,
       c_perm_all_dev, stream);
   if (st != cudaSuccess) return st;

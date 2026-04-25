@@ -44,6 +44,33 @@ constexpr int kTopK = 8;
 
 void* g_step1_comm_w13_tma_desc_dev = nullptr;
 void* g_step1_direct_w13_tma_desc_dev = nullptr;
+void* g_step2_w2_tma_desc_dev = nullptr;
+void* g_step2_w2_tma_desc_k4_dev = nullptr;
+
+int ParseStep2PipelineVariant() {
+  const char* env = std::getenv("FIB_STEP2_PIPELINE_VARIANT");
+  if (env == nullptr || std::strcmp(env, "m64n8_k8_db_batch2") == 0) {
+    return direct_backend::kStep2PipeM64N8K8DbBatch2;
+  }
+  if (std::strcmp(env, "m64n8_k4_db_batch2") == 0) {
+    return direct_backend::kStep2PipeM64N8K4DbBatch2;
+  }
+  if (std::strcmp(env, "m64n16_k8_db_batch2") == 0) {
+    // N16 is kept as a selector alias for sweep bookkeeping. A real N16 path
+    // needs wider partial/scaled TMEM than the current safe Step2 allocation.
+    return direct_backend::kStep2PipeM64N16K8DbBatch2;
+  }
+  if (std::strcmp(env, "m64n16_k4_db_batch2") == 0) {
+    // See N16 note above; this currently exercises the K4 pipeline shape.
+    return direct_backend::kStep2PipeM64N16K4DbBatch2;
+  }
+  if (std::strcmp(env, "m128n8_k8_db_batch2") == 0) {
+    // M128 is kept as a selector alias. A real path would exceed the current
+    // double-buffered W2 shared-memory budget without a separate design.
+    return direct_backend::kStep2PipeM128N8K8DbBatch2;
+  }
+  return direct_backend::kStep2PipeM64N8K8DbBatch2;
+}
 
 inline void CheckCuLocal(CUresult status, const char* where) {
   if (status == CUDA_SUCCESS) return;
@@ -156,6 +183,147 @@ inline void UploadTensorMapLocal(const CUtensorMap& map, void** dev_ptr) {
   }
   CheckCudaLocal(cudaMemcpy(*dev_ptr, &map, sizeof(CUtensorMap), cudaMemcpyHostToDevice),
                  "UploadTensorMapLocal cudaMemcpy");
+}
+
+struct CudaStageTimer {
+  bool enabled = false;
+  const char* tag = nullptr;
+  int64_t t = 0;
+  cudaStream_t stream = nullptr;
+  cudaEvent_t start = nullptr;
+  cudaEvent_t end = nullptr;
+
+  void Begin(bool enabled_in, const char* tag_in, int64_t t_in, cudaStream_t stream_in) {
+    enabled = enabled_in;
+    tag = tag_in;
+    t = t_in;
+    stream = stream_in;
+    if (!enabled) return;
+    CheckCudaLocal(cudaEventCreate(&start), "CudaStageTimer start create");
+    CheckCudaLocal(cudaEventCreate(&end), "CudaStageTimer end create");
+    CheckCudaLocal(cudaEventRecord(start, stream), "CudaStageTimer start record");
+  }
+
+  void End() {
+    if (!enabled) return;
+    CheckCudaLocal(cudaEventRecord(end, stream), "CudaStageTimer end record");
+    CheckCudaLocal(cudaEventSynchronize(end), "CudaStageTimer end sync");
+    float elapsed_ms = 0.0f;
+    CheckCudaLocal(cudaEventElapsedTime(&elapsed_ms, start, end), "CudaStageTimer elapsed");
+    const char* field = std::strcmp(tag, "moe_step1_timing") == 0 ? "step1" : "step2";
+    std::fprintf(stderr, "[%s] impl=direct seq_len=%lld %s=%.3fms\n",
+                 tag, static_cast<long long>(t), field, elapsed_ms);
+    std::fflush(stderr);
+    cudaEventDestroy(start);
+    cudaEventDestroy(end);
+  }
+};
+
+inline int BuildActiveExpertList(const std::vector<int>& expert_counts_host,
+                                 int* active_experts_dev,
+                                 cudaStream_t stream) {
+  int active_experts_host[kNumLocalExperts];
+  int active_expert_count = 0;
+  for (int le = 0; le < kNumLocalExperts; ++le) {
+    if (expert_counts_host[le] > 0) {
+      active_experts_host[active_expert_count++] = le;
+    }
+  }
+  if (active_expert_count > 0) {
+    CheckCudaLocal(cudaMemcpyAsync(active_experts_dev, active_experts_host,
+                                   active_expert_count * sizeof(int),
+                                   cudaMemcpyHostToDevice, stream),
+                   "copy active experts");
+  }
+  return active_expert_count;
+}
+
+inline void UploadDirectTmaDescriptors(const TensorView& gemm1_weights,
+                                       const TensorView& gemm2_weights,
+                                       bool use_direct_tma,
+                                       bool use_direct_tma_sw128) {
+  const CUtensorMapSwizzle direct_smem_swizzle =
+      use_direct_tma_sw128 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE;
+  CUtensorMap direct_w13_tmap =
+      use_direct_tma_sw128
+          ? EncodeTensorMap5DUint8Local(
+                static_cast<uint8_t*>(gemm1_weights.data_ptr()),
+                kBlock,
+                kIntermediate,
+                2,
+                kHidden / kBlock,
+                kNumLocalExperts,
+                kHidden,
+                static_cast<uint64_t>(kIntermediate) * static_cast<uint64_t>(kHidden),
+                kBlock,
+                static_cast<uint64_t>(2 * kIntermediate) * static_cast<uint64_t>(kHidden),
+                kBlock,
+                32,
+                2,
+                4,
+                1,
+                direct_smem_swizzle)
+          : EncodeTensorMap5DUint8Local(
+                static_cast<uint8_t*>(gemm1_weights.data_ptr()),
+                kBlock,
+                kHidden / kBlock,
+                kIntermediate,
+                2,
+                kNumLocalExperts,
+                kBlock,
+                kHidden,
+                static_cast<uint64_t>(kIntermediate) * static_cast<uint64_t>(kHidden),
+                static_cast<uint64_t>(2 * kIntermediate) * static_cast<uint64_t>(kHidden),
+                kBlock,
+                8,
+                32,
+                2,
+                1,
+                direct_smem_swizzle);
+  UploadTensorMapLocal(direct_w13_tmap, &g_step1_direct_w13_tma_desc_dev);
+
+  if (!use_direct_tma || !use_direct_tma_sw128) {
+    if (g_step2_w2_tma_desc_dev != nullptr) {
+      CheckCudaLocal(cudaFree(g_step2_w2_tma_desc_dev), "free stale step2 w2 tma desc");
+      g_step2_w2_tma_desc_dev = nullptr;
+    }
+    if (g_step2_w2_tma_desc_k4_dev != nullptr) {
+      CheckCudaLocal(cudaFree(g_step2_w2_tma_desc_k4_dev), "free stale step2 w2 k4 tma desc");
+      g_step2_w2_tma_desc_k4_dev = nullptr;
+    }
+    return;
+  }
+  CUtensorMap step2_w2_tmap = EncodeTensorMap4DUint8Local(
+      static_cast<uint8_t*>(gemm2_weights.data_ptr()),
+      kBlock,
+      kHidden,
+      kIntermediate / kBlock,
+      kNumLocalExperts,
+      kIntermediate,
+      kBlock,
+      static_cast<uint64_t>(kHidden) * static_cast<uint64_t>(kIntermediate),
+      kBlock,
+      64,
+      8,
+      1,
+      CU_TENSOR_MAP_SWIZZLE_128B);
+  UploadTensorMapLocal(step2_w2_tmap, &g_step2_w2_tma_desc_dev);
+
+  CUtensorMap step2_w2_tmap_k4 = EncodeTensorMap4DUint8Local(
+      static_cast<uint8_t*>(gemm2_weights.data_ptr()),
+      kBlock,
+      kHidden,
+      kIntermediate / kBlock,
+      kNumLocalExperts,
+      kIntermediate,
+      kBlock,
+      static_cast<uint64_t>(kHidden) * static_cast<uint64_t>(kIntermediate),
+      kBlock,
+      64,
+      4,
+      1,
+      CU_TENSOR_MAP_SWIZZLE_128B);
+  UploadTensorMapLocal(step2_w2_tmap_k4, &g_step2_w2_tma_desc_k4_dev);
 }
 
 inline float bf16_to_float(uint16_t bits) {
@@ -443,8 +611,11 @@ struct MoeWorkspace {
   int* expert_offsets_dev = nullptr;
   int* running_counter_dev = nullptr;
   int* permuted_token_ids_dev = nullptr;
+  int* active_experts_dev = nullptr;
   float* permuted_weights_dev = nullptr;
   float* c_perm_all_dev = nullptr;
+  uint8_t* c_perm_q_dev = nullptr;
+  float* c_perm_scale_dev = nullptr;
 
   void ensure_core(int64_t t) {
     if (t <= cap_t && local_weight_dev != nullptr) return;
@@ -461,6 +632,7 @@ struct MoeWorkspace {
     if (expert_offsets_dev) cudaFree(expert_offsets_dev);
     if (running_counter_dev) cudaFree(running_counter_dev);
     if (permuted_token_ids_dev) cudaFree(permuted_token_ids_dev);
+    if (active_experts_dev) cudaFree(active_experts_dev);
     if (permuted_weights_dev) cudaFree(permuted_weights_dev);
     cap_t_grouped = t;
     const int64_t max_routed = t * kTopK;
@@ -468,16 +640,26 @@ struct MoeWorkspace {
     cudaMalloc(&expert_offsets_dev, (kNumLocalExperts + 1) * sizeof(int));
     cudaMalloc(&running_counter_dev, kNumLocalExperts * sizeof(int));
     cudaMalloc(&permuted_token_ids_dev, static_cast<size_t>(max_routed) * sizeof(int));
+    cudaMalloc(&active_experts_dev, kNumLocalExperts * sizeof(int));
     cudaMalloc(&permuted_weights_dev, static_cast<size_t>(max_routed) * sizeof(float));
   }
 
   void ensure_routed_step1(int64_t routed_rows) {
-    if (routed_rows <= cap_routed && c_perm_all_dev != nullptr) return;
+    if (routed_rows <= cap_routed && c_perm_all_dev != nullptr &&
+        c_perm_q_dev != nullptr && c_perm_scale_dev != nullptr) {
+      return;
+    }
     if (c_perm_all_dev) cudaFree(c_perm_all_dev);
+    if (c_perm_q_dev) cudaFree(c_perm_q_dev);
+    if (c_perm_scale_dev) cudaFree(c_perm_scale_dev);
     cap_routed = routed_rows;
     if (routed_rows > 0) {
       cudaMalloc(&c_perm_all_dev,
                  static_cast<size_t>(routed_rows) * kIntermediate * sizeof(float));
+      cudaMalloc(&c_perm_q_dev,
+                 static_cast<size_t>(routed_rows) * kIntermediate * sizeof(uint8_t));
+      cudaMalloc(&c_perm_scale_dev,
+                 static_cast<size_t>(routed_rows) * (kIntermediate / kBlock) * 4 * sizeof(float));
     }
   }
 };
@@ -548,6 +730,7 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   int* expert_offsets_dev = ws.expert_offsets_dev;
   int* running_counter_dev = ws.running_counter_dev;
   int* permuted_token_ids_dev = ws.permuted_token_ids_dev;
+  int* active_experts_dev = ws.active_experts_dev;
   float* permuted_weights_dev = ws.permuted_weights_dev;
   cudaMemsetAsync(expert_counts_dev, 0, kNumLocalExperts * sizeof(int), stream);
   cudaMemsetAsync(running_counter_dev, 0, kNumLocalExperts * sizeof(int), stream);
@@ -601,52 +784,14 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
       << cudaGetErrorString(meta_sync);
 
   const int total_routed = expert_offsets_host[kNumLocalExperts];
-
+  const int active_expert_count =
+      BuildActiveExpertList(expert_counts_host, active_experts_dev, stream);
   if (UseDirectImplementation() && total_routed > 0) {
     const bool kUseDirectTma = std::getenv("FIB_MOE_COMM_USE_TMA") != nullptr;
     const bool kUseDirectTmaSw128 = std::getenv("FIB_MOE_DIRECT_TMA_SW128") != nullptr;
     const bool kUseDirectBSw128 = std::getenv("FIB_MOE_DIRECT_B_SW128") != nullptr;
-    {
-      const CUtensorMapSwizzle direct_smem_swizzle =
-          kUseDirectTmaSw128 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE;
-      CUtensorMap direct_w13_tmap =
-          kUseDirectTmaSw128
-              ? EncodeTensorMap5DUint8Local(
-                    static_cast<uint8_t*>(gemm1_weights.data_ptr()),
-                    kBlock,
-                    kIntermediate,
-                    2,
-                    kHidden / kBlock,
-                    kNumLocalExperts,
-                    kHidden,
-                    static_cast<uint64_t>(kIntermediate) * static_cast<uint64_t>(kHidden),
-                    kBlock,
-                    static_cast<uint64_t>(2 * kIntermediate) * static_cast<uint64_t>(kHidden),
-                    kBlock,
-                    32,
-                    2,
-                    4,
-                    1,
-                    direct_smem_swizzle)
-              : EncodeTensorMap5DUint8Local(
-                    static_cast<uint8_t*>(gemm1_weights.data_ptr()),
-                    kBlock,
-                    kHidden / kBlock,
-                    kIntermediate,
-                    2,
-                    kNumLocalExperts,
-                    kBlock,
-                    kHidden,
-                    static_cast<uint64_t>(kIntermediate) * static_cast<uint64_t>(kHidden),
-                    static_cast<uint64_t>(2 * kIntermediate) * static_cast<uint64_t>(kHidden),
-                    kBlock,
-                    8,
-                    32,
-                    2,
-                    1,
-                    direct_smem_swizzle);
-      UploadTensorMapLocal(direct_w13_tmap, &g_step1_direct_w13_tma_desc_dev);
-    }
+    const int step2_pipeline_variant = ParseStep2PipelineVariant();
+    UploadDirectTmaDescriptors(gemm1_weights, gemm2_weights, kUseDirectTma, kUseDirectTmaSw128);
 
     const bool kMeasureStep1CommOnly = std::getenv("FIB_MEASURE_STEP1_COMM_ONLY") != nullptr;
     if (kMeasureStep1CommOnly) {
@@ -779,11 +924,8 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
       cudaEventDestroy(comm_end);
     }
 
-    cudaEvent_t step1_start = nullptr;
-    cudaEvent_t step1_end = nullptr;
-    cudaEventCreate(&step1_start);
-    cudaEventCreate(&step1_end);
-    cudaEventRecord(step1_start, stream);
+    CudaStageTimer step1_timer;
+    step1_timer.Begin(kProfile, "moe_step1_timing", t, stream);
 
     // GEMM1 emits one compact intermediate row per routed (token, local-expert)
     // pair. The flat buffer is therefore [sum_e expert_counts[e], I], where
@@ -826,6 +968,8 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
         expert_counts_dev,
         expert_offsets_dev,
         permuted_token_ids_dev,
+        active_experts_dev,
+        active_expert_count,
         static_cast<const uint8_t*>(gemm1_weights.data_ptr()),
         static_cast<const float*>(gemm1_weights_scale.data_ptr()),
         kUseDirectTma ? g_step1_direct_w13_tma_desc_dev : nullptr,
@@ -837,15 +981,10 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
         step1_tcgen_accum_mode);
     TVM_FFI_ICHECK_EQ(st1, cudaSuccess)
         << "direct Step1(all experts) launch failed: " << cudaGetErrorString(st1);
-    cudaEventRecord(step1_end, stream);
-    cudaEventSynchronize(step1_end);
-    float step1_ms = 0.0f;
-    cudaEventElapsedTime(&step1_ms, step1_start, step1_end);
-    std::fprintf(stderr, "[moe_step1_timing] impl=direct seq_len=%lld step1=%.3fms\n",
-                 static_cast<long long>(t), step1_ms);
-    std::fflush(stderr);
-    cudaEventDestroy(step1_start);
-    cudaEventDestroy(step1_end);
+    step1_timer.End();
+    cudaError_t step1_sync = cudaStreamSynchronize(stream);
+    TVM_FFI_ICHECK_EQ(step1_sync, cudaSuccess)
+        << "direct Step1 stream sync failed: " << cudaGetErrorString(step1_sync);
 
     maybe_dump_step1_debug(
         std::getenv("FIB_DEBUG_DUMP_STEP1_DIR"),
@@ -859,26 +998,30 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
         ws.c_perm_all_dev,
         stream);
 
-    cudaEvent_t step2_start = nullptr;
-    cudaEvent_t step2_end = nullptr;
-    cudaEventCreate(&step2_start);
-    cudaEventCreate(&step2_end);
-    cudaEventRecord(step2_start, stream);
+    CudaStageTimer step2_timer;
+    step2_timer.Begin(kProfile, "moe_step2_timing", t, stream);
+    cudaError_t st2_pre = direct_backend::LaunchStep2PrequantCperm(
+        ws.c_perm_all_dev, total_routed, ws.c_perm_q_dev, ws.c_perm_scale_dev, stream);
+    TVM_FFI_ICHECK_EQ(st2_pre, cudaSuccess)
+        << "direct Step2(prequant c_perm) launch failed: " << cudaGetErrorString(st2_pre);
+    const bool step2_k4_variant =
+        step2_pipeline_variant == direct_backend::kStep2PipeM64N8K4DbBatch2 ||
+        step2_pipeline_variant == direct_backend::kStep2PipeM64N16K4DbBatch2;
+    const void* step2_tma_desc =
+        kUseDirectTma ? (step2_k4_variant ? g_step2_w2_tma_desc_k4_dev : g_step2_w2_tma_desc_dev)
+                      : nullptr;
     cudaError_t st2 = direct_backend::LaunchStep2DirectAllExperts(
-        ws.c_perm_all_dev, expert_counts_dev, expert_offsets_dev, permuted_token_ids_dev,
-        permuted_weights_dev, static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
-        static_cast<const float*>(gemm2_weights_scale.data_ptr()), nullptr, out_acc_dev, stream);
+        expert_counts_dev, expert_offsets_dev, permuted_token_ids_dev,
+        permuted_weights_dev, active_experts_dev, active_expert_count,
+        ws.c_perm_q_dev, ws.c_perm_scale_dev, static_cast<const uint8_t*>(gemm2_weights.data_ptr()),
+        static_cast<const float*>(gemm2_weights_scale.data_ptr()),
+        step2_tma_desc, out_acc_dev, stream, step2_pipeline_variant);
     TVM_FFI_ICHECK_EQ(st2, cudaSuccess)
         << "direct Step2(all experts) launch failed: " << cudaGetErrorString(st2);
-    cudaEventRecord(step2_end, stream);
-    cudaEventSynchronize(step2_end);
-    float step2_ms = 0.0f;
-    cudaEventElapsedTime(&step2_ms, step2_start, step2_end);
-    std::fprintf(stderr, "[moe_step2_timing] impl=direct seq_len=%lld step2=%.3fms\n",
-                 static_cast<long long>(t), step2_ms);
-    std::fflush(stderr);
-    cudaEventDestroy(step2_start);
-    cudaEventDestroy(step2_end);
+    step2_timer.End();
+    cudaError_t step2_sync = cudaStreamSynchronize(stream);
+    TVM_FFI_ICHECK_EQ(step2_sync, cudaSuccess)
+        << "direct Step2 stream sync failed: " << cudaGetErrorString(step2_sync);
   } else {
     gemm_mod.EnsureWorkspace(t, stream);
     for (int le = 0; le < kNumLocalExperts; ++le) {
@@ -905,10 +1048,13 @@ void moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_impl(
   int out_blocks = static_cast<int>((n_hidden + kOutThreads - 1) / kOutThreads);
   f32_to_bf16_kernel<<<out_blocks, kOutThreads, 0, stream>>>(
       out_acc_dev, n_hidden, static_cast<uint16_t*>(output.data_ptr()));
-  // Workspace is now persistent — no cudaFree here, so the previously-required
-  // pre-free sync is only needed when profile timing is on.
+  // The direct path reuses raw static workspace and global TMA descriptors across
+  // invocations. Complete the stream before returning so the next workload cannot
+  // overwrite those resources while kernels from this call are still reading them.
+  cudaError_t final_sync = cudaStreamSynchronize(stream);
+  TVM_FFI_ICHECK_EQ(final_sync, cudaSuccess)
+      << "direct MoE final stream sync failed: " << cudaGetErrorString(final_sync);
   if (kProfile) {
-    cudaStreamSynchronize(stream);
     t1_out = std::chrono::high_resolution_clock::now();
     const auto t1_total = t1_out;
     auto ms = [](const auto& a, const auto& b) {
